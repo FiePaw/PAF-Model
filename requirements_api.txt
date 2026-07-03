@@ -1,0 +1,13 @@
+# PAF-Model — VPS unified gateway (PublicForward/ForVPS/vps_server.py)
+# Install on the VPS. This is the OpenAI-compatible API + WebSocket bridge.
+
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0       # ASGI server (includes websockets, httptools)
+pydantic>=2.7.0                 # data validation (FastAPI dependency)
+websockets>=12.0
+python-dotenv>=1.0.1
+
+# Optional: for client examples
+openai>=1.30.0
+requests>=2.31.0
+httpx>=0.27.0

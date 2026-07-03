@@ -1,0 +1,24 @@
+# Secrets — never commit real credentials or sessions
+cookies/auth.json
+cookies/*.cookies.json
+cookies/*.localstorage.json
+!cookies/*.example
+.env
+
+# Persistent browser profiles hold live sessions — never commit
+profiles/
+
+# Runtime artifacts
+dataSession/
+debug/
+logs/
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Context
+Context.txt
