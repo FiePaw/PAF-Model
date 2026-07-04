@@ -50,13 +50,14 @@ PAF-Model/
 ```
 CLIENT → VPS   POST /v1/chat/completions
                Header: X-Session-ID: sess-abc123   (optional — CONTINUE only)
-               Body:   { "model": "deepseek" | "qwen", "messages": [...],
+               Body:   { "model": "deepseek(account1)" | "qwen(account1)", "messages": [...],
                          "think_mode": "...", "tools": [...], "attachments": [...] }
 
 VPS (vps_server.py):
-  1. resolve_backend(model)          → "deepseek" | "qwen"
+  1. resolve_backend_and_account(model) → ("deepseek"|"qwen", account_id|None)
   2. session_id = X-Session-ID header (else generate)   → mode = continue|new
-  3. dispatch(backend=…) → pick a worker whose backend matches
+  3. dispatch(backend=…, preferred_account=…) → pick a worker whose backend
+     matches, filtered to the requested account when one was given
   4. Session affinity: a CONTINUE request routes back to the same worker
   5. Send the task in that worker's native wire protocol:
        deepseek → {"type":"task","task_id",  "request": {...}}
@@ -69,9 +70,11 @@ VPS → CLIENT   OpenAI chat.completion + x_meta.backend + headers
                X-Session-ID, X-Backend, X-Account-Name, X-Conversation-URL
 ```
 
-Model aliases accepted: `deepseek`, `deepseek-chat`, `deepseek-reasoner`,
-`deepseek-vision`, `deepseek-coder`, `qwen`, `qwen-turbo`, `qwen-plus`,
-`qwen-max` (and anything starting with `deepseek`/`qwen`).
+Model ids accepted: a bare backend name — `deepseek` or `qwen` (routes to
+any available account for that backend) — or an account-specific id in the
+form `<backend>(<account_id>)`, e.g. `deepseek(account1)`, `qwen(account1)`.
+Call `GET /v1/models` to see the exact ids for accounts currently connected
+via a worker.
 
 `think_mode`:
 - **deepseek** → resolved to `(model_tab, deep_think, web_search)` via aliases.

@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -60,41 +61,38 @@ THINK_MODE_ALIASES = {
     "vision": {"model_tab": "vision", "deep_think": False, "web_search": False},
 }
 
-MODEL_ALIASES = {
-    # OpenAI-style model id -> (model_tab, deep_think)
-    "deepseek-chat": {"model_tab": "instant", "deep_think": False},
-    "deepseek-reasoner": {"model_tab": "expert", "deep_think": True},
-    "deepseek-vision": {"model_tab": "vision", "deep_think": False},
-}
-
 # =========================================================================== #
-# Model → backend routing (unified gateway)
+# Model → backend + account routing (unified gateway)
 # =========================================================================== #
-# The `model` field in the request body selects the backend. Session continuity
-# is driven exclusively by the X-Session-ID header (see chat_completions).
-DEEPSEEK_MODELS = {
-    "deepseek", "deepseek-chat", "deepseek-reasoner",
-    "deepseek-vision", "deepseek-coder",
-}
-QWEN_MODELS = {
-    "qwen", "qwen-turbo", "qwen-plus", "qwen-max",
-}
+# The `model` field in the request body selects both the backend and,
+# optionally, a specific connected account, using the format:
+#   "<backend>(<account_id>)"   e.g. "deepseek(account1)", "qwen(account1)"
+# A bare backend name ("deepseek" / "qwen") is also accepted and means
+# "any available account for that backend". Session continuity is driven
+# exclusively by the X-Session-ID header (see chat_completions). See
+# GET /v1/models for the list of currently connected account-based ids.
+MODEL_ID_RE = re.compile(r"^(deepseek|qwen)(?:\(([^)]+)\))?$")
 
 
-def resolve_backend(model: str) -> str:
-    """Map a request `model` string to a backend id ('deepseek' | 'qwen')."""
-    m = (model or "").lower().strip()
-    if m in DEEPSEEK_MODELS or m.startswith("deepseek"):
-        return "deepseek"
-    if m in QWEN_MODELS or m.startswith("qwen"):
-        return "qwen"
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            f"Unknown model: {model!r}. Use 'deepseek' or 'qwen' "
-            "(or their aliases like deepseek-chat, qwen-max)."
-        ),
-    )
+def resolve_backend_and_account(model: str) -> tuple[str, Optional[str]]:
+    """Parse a `model` string like 'deepseek(account1)' into (backend, account).
+
+    Returns (backend, account_id); account_id is None for a bare backend
+    name (e.g. 'qwen'), meaning "any available account for that backend".
+    """
+    m = (model or "").strip()
+    match = MODEL_ID_RE.match(m)
+    if not match:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown model: {model!r}. Use 'deepseek', 'qwen', or "
+                "'<backend>(<account_id>)' e.g. 'deepseek(account1)', "
+                "'qwen(account1)'. See GET /v1/models for connected accounts."
+            ),
+        )
+    backend, account_id = match.group(1), match.group(2)
+    return backend, account_id
 
 
 # =========================================================================== #
@@ -129,7 +127,7 @@ class AttachmentPayload(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "deepseek-chat"
+    model: str = "deepseek"
     messages: list[ChatMessage]
     stream: bool = False
     temperature: Optional[float] = None
@@ -558,21 +556,29 @@ async def health():
 
 @app.get("/v1/models")
 async def list_models():
-    """List models: the two backend ids plus live per-account entries."""
+    """List models: one entry per live account, named '<backend>(<account>)'.
+
+    Use the returned `id` verbatim as the `model` field in
+    /v1/chat/completions to target that specific account, e.g.
+    "deepseek(account1)" or "qwen(account1)". Bare backend ids
+    ("deepseek" / "qwen") are also listed as a fallback meaning "any
+    available account for that backend".
+    """
     # Which backends currently have at least one worker connected.
     live_backends = sorted({w.backend for w in worker_mgr.workers.values()})
     data = [
         {"id": b, "object": "model", "owned_by": "PAF-ai", "x_backend": b}
         for b in live_backends
     ]
-    # Per-account entries (each tagged with its backend).
+    # Per-account entries, named "<backend>(<account_id>)".
     for acc in worker_mgr.list_all_accounts():
         data.append(
             {
-                "id": acc["id"],
+                "id": f"{acc['backend']}({acc['id']})",
                 "object": "model",
                 "owned_by": "PAF-ai",
                 "x_backend": acc["backend"],
+                "x_account": acc["id"],
             }
         )
     return {"object": "list", "data": data}
@@ -588,7 +594,10 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
     start_time = time.time()
 
     try:
-        backend = resolve_backend(req.model)
+        backend, model_account = resolve_backend_and_account(req.model)
+        # An account named in the `model` field (e.g. "deepseek(account1)")
+        # takes priority over the legacy `preferred_account` body field.
+        preferred_account = model_account or req.preferred_account
 
         # ── Session: X-Session-ID header is the standard (body session_id is
         #    accepted as a fallback for old clients). mode is derived purely
@@ -627,12 +636,6 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
                 req.web_search if req.web_search is not None
                 else think_mode_params.get("web_search", False)
             )
-            if not model_tab:
-                alias = MODEL_ALIASES.get(req.model)
-                if alias:
-                    model_tab = alias["model_tab"]
-                    if req.deep_think is None:
-                        deep_think = alias["deep_think"]
             model_tab = model_tab or "instant"
 
             system_prompt = "\n\n".join(
@@ -654,7 +657,7 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
                 "prompt": req.last_user_message(),
                 "mode": mode,
                 "session_id": session_id,
-                "preferred_account": req.preferred_account,
+                "preferred_account": preferred_account,
                 "model_tab": model_tab,
                 "deep_think": deep_think,
                 "web_search": web_search,
@@ -679,7 +682,7 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
                 "tools": tools_payload,
                 "tool_choice": req.tool_choice if req.tools else None,
                 "attachments": attachments or [],
-                "preferred_cookie": req.preferred_account,
+                "preferred_cookie": preferred_account,
             }
 
         # ── Dispatch to a worker of the resolved backend ──
@@ -688,7 +691,7 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             task_fields=task_fields,
             mode=mode,
             session_id=session_id,
-            preferred_account=req.preferred_account,
+            preferred_account=preferred_account,
         )
 
         # ── Normalise the two worker result shapes into one ──
