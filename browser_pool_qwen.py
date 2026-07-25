@@ -28,8 +28,9 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import AsyncIterator
 
+from config import QWEN_AUTH_CONFIG
 from scrapers.qwen_scraper import QwenScraper
-from scrapers.utils import discover_cookie_files, setup_logger
+from scrapers.utils import AuthStore, discover_cookie_files, setup_logger
 
 logger = setup_logger("browser_pool")
 
@@ -48,7 +49,11 @@ class SlotStatus(Enum):
 @dataclass
 class BrowserSlot:
     slot_id: int
-    cookie_file: Path
+    # cookie_file: digunakan di legacy mode (cookie-file auth)
+    # account_name: digunakan di email+password mode (auth.json)
+    # Salah satu dari keduanya harus ada.
+    cookie_file: Path | None = None
+    account_name: str | None = None
     scraper: QwenScraper | None = None
     status: SlotStatus = SlotStatus.STARTING
     last_used: float = field(default_factory=time.time)
@@ -97,6 +102,18 @@ class BrowserPool:
         self.headless    = headless
         self.think_mode  = think_mode
 
+        # Deteksi mode auth: prioritaskan email+password (auth.json) jika ada
+        auth_store = AuthStore(QWEN_AUTH_CONFIG["auth_file"])
+        self._auth_accounts: list[str] = auth_store.account_names()
+        self._use_auth_mode: bool = len(self._auth_accounts) > 0
+        if self._use_auth_mode:
+            logger.info(
+                "BrowserPool: email+password mode (%d account(s) dari auth.json): %s",
+                len(self._auth_accounts), self._auth_accounts,
+            )
+        else:
+            logger.info("BrowserPool: legacy cookie-file mode")
+
         self._slots: list[BrowserSlot] = []
         # Kumpulan slot_id yang sedang berjalan dalam mode no-headless.
         # Dipakai oleh restart_slot_no_headless() dan stop_all_no_headless().
@@ -112,20 +129,34 @@ class BrowserPool:
         if self._started:
             return
 
-        cookie_files = discover_cookie_files(self.cookies_dir)
-        if not cookie_files:
-            raise RuntimeError(f"Tidak ada cookie file di {self.cookies_dir}")
-
-        logger.info(
-            "BrowserPool: memulai %d slot (cookie file tersedia: %d)",
-            self.pool_size, len(cookie_files),
-        )
-
-        # Assign cookie ke slot; wrap round-robin jika cookie < pool_size
-        for i in range(self.pool_size):
-            cf = cookie_files[i % len(cookie_files)]
-            slot = BrowserSlot(slot_id=i, cookie_file=cf)
-            self._slots.append(slot)
+        if self._use_auth_mode:
+            # ── Email+password mode: 1 slot per account (wrap round-robin) ──
+            accounts = self._auth_accounts
+            logger.info(
+                "BrowserPool: memulai %d slot (auth.json accounts: %d)",
+                self.pool_size, len(accounts),
+            )
+            for i in range(self.pool_size):
+                acct = accounts[i % len(accounts)]
+                slot = BrowserSlot(slot_id=i, account_name=acct)
+                self._slots.append(slot)
+        else:
+            # ── Legacy cookie-file mode ──────────────────────────────────────
+            cookie_files = discover_cookie_files(self.cookies_dir)
+            if not cookie_files:
+                raise RuntimeError(
+                    f"Tidak ada cookie file di {self.cookies_dir} dan "
+                    f"tidak ada account di auth.json ({QWEN_AUTH_CONFIG['auth_file']}). "
+                    f"Tambahkan credentials ke salah satu."
+                )
+            logger.info(
+                "BrowserPool: memulai %d slot (cookie file tersedia: %d)",
+                self.pool_size, len(cookie_files),
+            )
+            for i in range(self.pool_size):
+                cf = cookie_files[i % len(cookie_files)]
+                slot = BrowserSlot(slot_id=i, cookie_file=cf)
+                self._slots.append(slot)
 
         # Spawn semua browser paralel
         await asyncio.gather(*[self._init_slot(slot) for slot in self._slots])
@@ -160,42 +191,67 @@ class BrowserPool:
     # ── Slot initialization ───────────────────────────────────────────────────
 
     async def _init_slot(self, slot: BrowserSlot) -> None:
-        """Buat scraper baru untuk slot, navigasi ke halaman chat."""
+        """Buat scraper baru untuk slot, navigasi ke halaman chat.
+
+        Mendukung dua mode:
+          • Email+password (slot.account_name set): launch profile by account,
+            lalu panggil ensure_authenticated() untuk login jika perlu.
+          • Legacy cookie-file (slot.cookie_file set): seed cookie lama.
+        """
         slot.status = SlotStatus.STARTING
         try:
-            scraper = QwenScraper(
-                headless=self.headless,
-                cookies_path=slot.cookie_file,
-                cookies_dir=self.cookies_dir,
-                think_mode=self.think_mode,
-            )
-            # Bootstrap: discover accounts + launch browser (with cookie seeding)
-            scraper._discover_accounts()
-
-            # FIX: set _cookie_index ke posisi slot.cookie_file di dalam list.
-            # Tanpa ini, _cookie_index selalu 0 sehingga scrape() selalu log
-            # "account1" meskipun browser-nya pakai cookie yang berbeda.
-            try:
-                idx = scraper._cookie_files.index(slot.cookie_file)
-                scraper._cookie_index = idx
-            except ValueError:
-                # Edge case: path tidak cocok persis di list. Set cookies_path
-                # sebagai fallback agar _current_cookie_file tidak salah baca.
-                scraper.cookies_path = slot.cookie_file
-                logger.warning(
-                    "Slot#%d: %s tidak ditemukan di _cookie_files, fallback cookies_path",
-                    slot.slot_id, slot.cookie_file.name,
+            if slot.account_name:
+                # ── Email+password mode ──────────────────────────────────────
+                scraper = QwenScraper(
+                    headless=self.headless,
+                    cookies_dir=self.cookies_dir,
+                    think_mode=self.think_mode,
+                    account=slot.account_name,
                 )
+                scraper._discover_accounts()
+                await scraper.launch_browser(account=slot.account_name)
 
-            await scraper.launch_browser(cookie_file=slot.cookie_file)
+                # Login jika session belum ada / expired
+                ok = await scraper.ensure_authenticated()
+                if not ok:
+                    raise RuntimeError(
+                        f"ensure_authenticated() gagal untuk account '{slot.account_name}'"
+                    )
+
+                logger.info(
+                    "Slot#%d ✅ siap (account: %s, auth: email+password)",
+                    slot.slot_id, slot.account_name,
+                )
+            else:
+                # ── Legacy cookie-file mode ──────────────────────────────────
+                scraper = QwenScraper(
+                    headless=self.headless,
+                    cookies_path=slot.cookie_file,
+                    cookies_dir=self.cookies_dir,
+                    think_mode=self.think_mode,
+                )
+                scraper._discover_accounts()
+
+                # Set _cookie_index ke posisi slot.cookie_file yang benar
+                try:
+                    idx = scraper._cookie_files.index(slot.cookie_file)
+                    scraper._cookie_index = idx
+                except ValueError:
+                    scraper.cookies_path = slot.cookie_file
+                    logger.warning(
+                        "Slot#%d: %s tidak ditemukan di _cookie_files, fallback cookies_path",
+                        slot.slot_id, slot.cookie_file.name if slot.cookie_file else "?",
+                    )
+
+                await scraper.launch_browser(cookie_file=slot.cookie_file)
+                logger.info(
+                    "Slot#%d ✅ siap (cookie: %s, auth: legacy)",
+                    slot.slot_id, slot.cookie_file.name if slot.cookie_file else "?",
+                )
 
             slot.scraper = scraper
             slot.mark_idle()
             self._idle_event.set()
-            logger.info(
-                "Slot#%d ✅ siap (cookie: %s)",
-                slot.slot_id, slot.cookie_file.name,
-            )
         except Exception as e:
             slot.mark_dead()
             logger.error("Slot#%d ❌ gagal init: %s", slot.slot_id, e, exc_info=True)

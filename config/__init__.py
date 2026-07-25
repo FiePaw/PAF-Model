@@ -36,7 +36,7 @@ from config.deepseek import (
     AUTH_CONFIG,
     JSON_API_CONFIG,
 )
-from config.qwen import QWEN_CONFIG
+from config.qwen import QWEN_CONFIG, QWEN_AUTH_CONFIG
 
 __all__ = [
     # paths
@@ -64,4 +64,5 @@ __all__ = [
     "JSON_API_CONFIG",
     # qwen
     "QWEN_CONFIG",
+    "QWEN_AUTH_CONFIG",
 ]

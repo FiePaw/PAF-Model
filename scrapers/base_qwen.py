@@ -51,9 +51,11 @@ from config import (
     OUTPUT_CONFIG,
     PERSISTENT_CONTEXT_CONFIG,
     PROFILES_DIR,
+    QWEN_AUTH_CONFIG,
     ROTATION_CONFIG,
 )
 from scrapers.utils import (
+    AuthStore,
     contains_any,
     detect_file_type,
     discover_cookie_files,
@@ -95,14 +97,39 @@ class BaseAIChatScraper(ABC):
         cookies_path: Path | str | None = None,
         *,
         cookies_dir: Path | str | None = None,
+        # ── Email+password auth (mirip DeepSeek) ──────────────────────────
+        account: str | None = None,
+        email: str | None = None,
+        password: str | None = None,
     ) -> None:
         self.logger = setup_logger(self.__class__.__name__)
         self.headless = headless
 
+        # ── Legacy cookie-file support (backward compat) ───────────────────
         self.cookies_path: Path | None = Path(cookies_path) if cookies_path else None
         self.cookies_dir: Path = Path(cookies_dir) if cookies_dir else COOKIES_DIR
         self._cookie_files: list[Path] = []
         self._cookie_index: int = 0
+
+        # ── Email+password auth (new, mirrors DeepSeek) ────────────────────
+        # Explicit credential overrides (e.g. from CLI --email/--password).
+        self.email: str | None = email
+        self.password: str | None = password
+        self._authenticated: bool = False
+
+        # Load all Qwen accounts from cookies/auth.json (same file as DeepSeek,
+        # or a separate one — whichever QWEN_AUTH_CONFIG["auth_file"] points to).
+        self.auth = AuthStore(QWEN_AUTH_CONFIG["auth_file"])
+        self._qwen_accounts: list[str] = self.auth.account_names()
+
+        # Resolve account name: explicit arg > first in auth.json > "account1"
+        self.account: str = account or (
+            self._qwen_accounts[0] if self._qwen_accounts else "account1"
+        )
+        self._account_index: int = (
+            self._qwen_accounts.index(self.account)
+            if self.account in self._qwen_accounts else 0
+        )
 
         self._playwright = None
         self._browser: Browser | None = None       # None in persistent mode
@@ -113,8 +140,16 @@ class BaseAIChatScraper(ABC):
 
     # ── Profile path helpers ──────────────────────────────────────────────────
 
-    def _profile_dir_for(self, cookie_file: Path | None) -> Path:
-        """Return the profile directory that corresponds to *cookie_file*."""
+    def _profile_dir_for(self, cookie_file: Path | None = None, account: str | None = None) -> Path:
+        """Return the profile directory.
+
+        Priority (new email+password mode first, then legacy cookie-file mode):
+          1. account name  → profiles/<account>/
+          2. cookie_file   → profiles/<cookie_stem>/   (legacy)
+          3. fallback      → profiles/<default_profile>/
+        """
+        if account:
+            return PROFILES_DIR / account
         if cookie_file:
             return PROFILES_DIR / cookie_file.stem
         return PROFILES_DIR / PERSISTENT_CONTEXT_CONFIG["default_profile"]
@@ -132,32 +167,48 @@ class BaseAIChatScraper(ABC):
 
     # ── Browser lifecycle ─────────────────────────────────────────────────────
 
-    async def launch_browser(self, cookie_file: Path | None = None) -> None:
+    async def launch_browser(
+        self,
+        cookie_file: Path | None = None,
+        account: str | None = None,
+    ) -> None:
         """
         Start Playwright and either:
-          • Open a persistent context for *cookie_file*'s profile (default), or
-          • Launch an ephemeral browser + context (legacy mode).
+          • Open a persistent context bound to *account*'s profile (email+password mode), or
+          • Open a persistent context for *cookie_file*'s profile (legacy cookie mode), or
+          • Launch an ephemeral browser + context (non-persistent mode).
 
-        *cookie_file* is used only to determine which profile directory to open;
-        if None the default profile is used.
+        When *account* is given it takes priority over *cookie_file*.
         """
         self.logger.info(
-            "Launching browser (headless=%s, persistent=%s)",
-            self.headless, self._persistent_mode,
+            "Launching browser (headless=%s, persistent=%s, account=%s)",
+            self.headless, self._persistent_mode, account or "legacy-cookie",
         )
         self._playwright = await async_playwright().start()
 
         if self._persistent_mode:
-            await self._launch_persistent(cookie_file)
+            await self._launch_persistent(cookie_file=cookie_file, account=account)
         else:
             await self._launch_ephemeral()
 
         self.logger.debug("Browser launched successfully")
 
-    async def _launch_persistent(self, cookie_file: Path | None) -> None:
-        """Launch a persistent browser context, seeding cookies on first run."""
+    async def _launch_persistent(
+        self,
+        cookie_file: Path | None = None,
+        account: str | None = None,
+    ) -> None:
+        """Launch a persistent browser context.
+
+        Two modes:
+          • Email+password mode (new): account name → profiles/<account>/
+            No cookie seeding — authentication happens via ensure_authenticated()
+            which navigates to the login page and fills credentials.
+          • Legacy cookie-file mode: cookie_file → profiles/<stem>/
+            Seeds cookies from the file on the first run.
+        """
         cfg = PERSISTENT_CONTEXT_CONFIG
-        profile_dir = self._profile_dir_for(cookie_file)
+        profile_dir = self._profile_dir_for(cookie_file=cookie_file, account=account)
         profile_dir.mkdir(parents=True, exist_ok=True)
 
         first_run = not self._profile_seeded(profile_dir)
@@ -176,20 +227,29 @@ class BaseAIChatScraper(ABC):
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
         self._browser = None  # not used in persistent mode
 
-        # Seed cookies into the profile on the very first run.
-        # Navigate to the base domain first so cookies are accepted by the browser.
-        if first_run and cookie_file and cookie_file.exists():
-            self.logger.info("First run for profile '%s' – seeding cookies", profile_dir.name)
-            await self._page.goto("https://chat.qwen.ai", wait_until="domcontentloaded", timeout=30_000)
-            seeded = await self.load_cookies(cookie_file)
-            if seeded:
-                # Write sentinel so we know cookies were successfully injected
-                (profile_dir / "cookies_seeded").write_text("1", encoding="utf-8")
-                self.logger.info("Cookie seeding complete for profile '%s'", profile_dir.name)
-            # Reload so the seeded cookies take effect
-            await self._page.reload(wait_until="domcontentloaded", timeout=30_000)
-        elif not first_run:
-            self.logger.info("Reusing existing profile '%s'", profile_dir.name)
+        if account:
+            # ── Email+password mode ──────────────────────────────────────────
+            # Profile menyimpan sesi browser setelah login pertama.
+            # Tidak perlu seed cookie — ensure_authenticated() akan login jika perlu.
+            if first_run:
+                self.logger.info(
+                    "New profile '%s' – authentication will happen via ensure_authenticated()",
+                    profile_dir.name,
+                )
+            else:
+                self.logger.info("Reusing existing profile '%s'", profile_dir.name)
+        else:
+            # ── Legacy cookie-file mode ──────────────────────────────────────
+            if first_run and cookie_file and cookie_file.exists():
+                self.logger.info("First run for profile '%s' – seeding cookies", profile_dir.name)
+                await self._page.goto("https://chat.qwen.ai", wait_until="domcontentloaded", timeout=30_000)
+                seeded = await self.load_cookies(cookie_file)
+                if seeded:
+                    (profile_dir / "cookies_seeded").write_text("1", encoding="utf-8")
+                    self.logger.info("Cookie seeding complete for profile '%s'", profile_dir.name)
+                await self._page.reload(wait_until="domcontentloaded", timeout=30_000)
+            elif not first_run:
+                self.logger.info("Reusing existing profile '%s'", profile_dir.name)
 
     async def _launch_ephemeral(self) -> None:
         """Original ephemeral browser + context launch."""
@@ -353,15 +413,61 @@ class BaseAIChatScraper(ABC):
     # ── Multi-account rotation ────────────────────────────────────────────────
 
     def _discover_accounts(self) -> None:
-        self._cookie_files = discover_cookie_files(self.cookies_dir)
-        if not self._cookie_files:
-            self.logger.warning("No cookie files found in %s", self.cookies_dir)
-        else:
+        """Discover accounts from auth.json (new) and/or cookie files (legacy).
+
+        New mode  : reads account names from self.auth (AuthStore → auth.json).
+        Legacy mode: discovers .json cookie files in cookies_dir.
+        Both can coexist — new mode is preferred when auth.json has entries.
+        """
+        # Refresh auth.json accounts
+        self._qwen_accounts = self.auth.account_names()
+        if self._qwen_accounts:
             self.logger.info(
-                "Discovered %d account cookie file(s): %s",
-                len(self._cookie_files),
+                "Qwen auth.json: %d account(s): %s",
+                len(self._qwen_accounts),
+                self._qwen_accounts,
+            )
+
+        # Also discover legacy cookie files (for backward compat)
+        self._cookie_files = discover_cookie_files(self.cookies_dir)
+        if self._cookie_files:
+            self.logger.info(
+                "Qwen legacy cookie file(s): %s",
                 [f.name for f in self._cookie_files],
             )
+
+        if not self._qwen_accounts and not self._cookie_files:
+            self.logger.warning(
+                "No Qwen accounts found. Add credentials to cookies/auth.json "
+                "or place cookie files in %s", self.cookies_dir,
+            )
+
+    def _resolve_credentials(
+        self, email: str | None = None, password: str | None = None
+    ) -> tuple[str | None, str | None]:
+        """Resolve (email, password) for the current Qwen account.
+
+        Priority:
+          1. Explicit args / self.email, self.password (CLI override)
+          2. cookies/auth.json entry for self.account
+          3. QWEN_EMAIL / QWEN_PASSWORD env vars (or .env)
+        """
+        import os
+
+        email = email or self.email
+        password = password or self.password
+
+        if not email or not password:
+            creds = self.auth.get(self.account)
+            if creds:
+                email = email or creds.get("email")
+                password = password or creds.get("password")
+
+        if not email:
+            email = os.environ.get(QWEN_AUTH_CONFIG["env_email"])
+        if not password:
+            password = os.environ.get(QWEN_AUTH_CONFIG["env_password"])
+        return email, password
 
     @property
     def _current_cookie_file(self) -> Path | None:
@@ -1152,15 +1258,22 @@ class BaseAIChatScraper(ABC):
     # ── Context manager ───────────────────────────────────────────────────────
 
     async def __aenter__(self) -> "BaseAIChatScraper":
-        # Discover accounts FIRST so _cookie_files is populated before launch
+        # Discover accounts FIRST so both auth.json and cookie files are loaded
         self._discover_accounts()
-        # Pass the initial cookie file so the correct profile is opened
-        initial_cookie = self.cookies_path or (
-            self._cookie_files[self._cookie_index]
-            if self._cookie_files
-            else None
-        )
-        await self.launch_browser(cookie_file=initial_cookie)
+
+        # ── Pilih mode: email+password (baru) atau legacy cookie file ──────
+        if self._qwen_accounts:
+            # Email+password mode: buka profile berdasarkan account name.
+            # Authentication (login) ditangani oleh ensure_authenticated().
+            await self.launch_browser(account=self.account)
+        else:
+            # Legacy cookie-file mode (backward compat)
+            initial_cookie = self.cookies_path or (
+                self._cookie_files[self._cookie_index]
+                if self._cookie_files
+                else None
+            )
+            await self.launch_browser(cookie_file=initial_cookie)
         return self
 
     async def __aexit__(self, *_) -> None:

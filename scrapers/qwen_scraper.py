@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
-from config import QWEN_CONFIG, ROTATION_CONFIG
+from config import QWEN_AUTH_CONFIG, QWEN_CONFIG, ROTATION_CONFIG
 from scrapers.base_qwen import BaseAIChatScraper
 from scrapers.utils import contains_any, discover_cookie_files
 
@@ -156,11 +156,18 @@ class QwenScraper(BaseAIChatScraper):
         cookies_path: Path | str | None = None,
         cookies_dir: Path | str | None = None,
         think_mode: ThinkMode | None = None,
+        # ── Email+password auth (new, mirrors DeepSeek) ────────────────────
+        account: str | None = None,
+        email: str | None = None,
+        password: str | None = None,
     ) -> None:
         super().__init__(
             headless=headless,
             cookies_path=cookies_path,
             cookies_dir=cookies_dir,
+            account=account,
+            email=email,
+            password=password,
         )
         self._conversation_started = False
         self._last_prompt = ""
@@ -231,6 +238,229 @@ class QwenScraper(BaseAIChatScraper):
                 self.logger.debug(
                     "Continue mode: think-mode UI not available in conversation page – skipping"
                 )
+
+    # ── Authentication (email + password, mirip DeepSeek) ────────────────────
+
+    async def _is_unauthenticated(self) -> bool:
+        """Return True jika halaman menampilkan tombol Login atau Sign Up.
+
+        Ini menandakan session belum ada atau sudah expired. Dua cara deteksi:
+          1. URL mengandung pola login (e.g. /auth, /login)
+          2. Tombol "Log in" / "Sign up" ada di DOM
+        """
+        if self._page is None:
+            return True
+        try:
+            url = self._page.url or ""
+            # Cek URL patterns
+            for pat in QWEN_AUTH_CONFIG["login_url_patterns"]:
+                if pat in url.lower():
+                    return True
+            # Cek keberadaan tombol Login/Sign Up di DOM (screenshot menunjukkan
+            # tombol "Log in" di kanan atas dan "Sign up" di samping kanannya)
+            for sel in QWEN_AUTH_CONFIG["unauthenticated_selectors"]:
+                try:
+                    el = await self._page.query_selector(sel)
+                    if el and await el.is_visible():
+                        return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False
+
+    async def ensure_authenticated(self) -> bool:
+        """Idempotent auth check untuk Qwen.
+
+        Flow:
+          1. Jika profile session masih valid → selesai (return True).
+          2. Jika terdeteksi tombol Login/Sign Up → arahkan ke login page
+             dan login dengan email + password dari cookies/auth.json.
+          3. Session berhasil → simpan ke persistent profile.
+        """
+        if self._page is None:
+            return False
+
+        # Jika sudah login, tidak perlu apa-apa
+        if not await self._is_unauthenticated():
+            self._authenticated = True
+            return True
+
+        self.logger.info(
+            "Tombol Login/Sign Up terdeteksi untuk account '%s' → memulai login",
+            self.account,
+        )
+        ok = await self.login()
+        self._authenticated = ok
+        return ok
+
+    async def login(
+        self,
+        email: str | None = None,
+        password: str | None = None,
+    ) -> bool:
+        """Login ke Qwen dengan email + password.
+
+        Alur:
+          1. Navigasi ke https://chat.qwen.ai/auth
+          2. Isi form email + password
+          3. Klik "Sign in"
+          4. Tunggu redirect ke chat UI (session valid)
+          5. Simpan cookies ke profile (persistent profile sudah menyimpannya)
+
+        Jika captcha muncul: headless tidak bisa selesaikan →
+        jalankan ulang dengan --no-headless sekali; profile akan mengingat sesi.
+        """
+        if self._page is None:
+            await self.launch_browser(account=self.account)
+        assert self._page is not None
+
+        email, password = self._resolve_credentials(email, password)
+        if not email or not password:
+            self.logger.error(
+                "Tidak ada credentials untuk account '%s'. "
+                "Tambahkan ke cookies/auth.json, atau set env %s / %s.",
+                self.account,
+                QWEN_AUTH_CONFIG["env_email"],
+                QWEN_AUTH_CONFIG["env_password"],
+            )
+            return False
+
+        self.logger.info("Login ke Qwen sebagai %s (account: %s)", email, self.account)
+
+        # Navigasi ke halaman login
+        await self._page.goto(
+            QWEN_AUTH_CONFIG["login_url"],
+            wait_until="domcontentloaded",
+            timeout=30_000,
+        )
+        await asyncio.sleep(1.5)
+
+        login_sel = QWEN_CONFIG["selectors"]["login"]
+
+        # Cari field email
+        email_loc = None
+        for sel in login_sel["email_input"]:
+            try:
+                el = await self._page.wait_for_selector(sel, timeout=6_000, state="visible")
+                if el:
+                    email_loc = el
+                    break
+            except Exception:
+                continue
+
+        # Cari field password
+        pwd_loc = None
+        for sel in login_sel["password_input"]:
+            try:
+                el = await self._page.wait_for_selector(sel, timeout=4_000, state="visible")
+                if el:
+                    pwd_loc = el
+                    break
+            except Exception:
+                continue
+
+        if email_loc is None or pwd_loc is None:
+            self.logger.error(
+                "Form login tidak ditemukan di %s. "
+                "Mungkin sudah login atau selector perlu diperbarui.",
+                QWEN_AUTH_CONFIG["login_url"],
+            )
+            # Mungkin sudah di-redirect ke chat
+            return not await self._is_unauthenticated()
+
+        # Isi email dan password
+        try:
+            await email_loc.click()
+            await email_loc.fill(email)
+            await asyncio.sleep(0.4)
+            await pwd_loc.click()
+            await pwd_loc.fill(password)
+            await asyncio.sleep(0.6)
+        except Exception as exc:
+            self.logger.error("Gagal mengisi form login: %s", exc)
+            return False
+
+        # Klik tombol Sign in
+        clicked = False
+        for sel in login_sel["signin_button"]:
+            try:
+                btn = await self._page.wait_for_selector(sel, timeout=3_000, state="visible")
+                if btn:
+                    await btn.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            # Fallback: tekan Enter di field password
+            self.logger.info("Tombol Sign in tidak ditemukan, mencoba Enter")
+            try:
+                await pwd_loc.press("Enter")
+                clicked = True
+            except Exception as exc:
+                self.logger.error("Tidak bisa submit form: %s", exc)
+                return False
+
+        return await self._wait_for_login_result()
+
+    async def _wait_for_login_result(self) -> bool:
+        """Poll sampai login berhasil (chat UI muncul) atau gagal/timeout."""
+        assert self._page is not None
+        import time as _time_mod
+
+        deadline = _time_mod.monotonic() + QWEN_AUTH_CONFIG["login_wait"]
+        login_sel = QWEN_CONFIG["selectors"]["login"]
+
+        while _time_mod.monotonic() < deadline:
+            # Cek error inline (password salah, dll.)
+            for sel in login_sel["error_message"]:
+                try:
+                    el = await self._page.query_selector(sel)
+                    if el and await el.is_visible():
+                        txt = (await el.inner_text()).strip()
+                        if txt:
+                            self.logger.error("Error login Qwen: %s", txt)
+                            await self.take_debug_screenshot("login_error")
+                            return False
+                except Exception:
+                    pass
+
+            # Cek apakah sudah berhasil: tidak lagi di halaman auth DAN
+            # input chat sudah muncul
+            is_still_on_auth = await self._is_unauthenticated()
+            if not is_still_on_auth:
+                try:
+                    # Konfirmasi: chat input sudah bisa dipakai
+                    await self._page.wait_for_selector(
+                        self._SEL_TEXTAREA, timeout=3_000, state="visible"
+                    )
+                    await asyncio.sleep(QWEN_AUTH_CONFIG["post_login_settle"])
+                    self.logger.info(
+                        "Login Qwen berhasil — session disimpan di profile '%s'",
+                        self.account,
+                    )
+                    self._authenticated = True
+                    # Simpan backup cookie (best-effort)
+                    try:
+                        await self.save_cookies()
+                    except Exception:
+                        pass
+                    # Tandai profile sudah di-seed agar tidak dianggap fresh
+                    profile_dir = self._profile_dir_for(account=self.account)
+                    sentinel = profile_dir / "cookies_seeded"
+                    if not sentinel.exists():
+                        sentinel.write_text("1", encoding="utf-8")
+                    return True
+                except Exception:
+                    pass  # chat input belum muncul, lanjut polling
+
+            await asyncio.sleep(1.5)
+
+        self.logger.error("Login Qwen timeout setelah %ss", QWEN_AUTH_CONFIG["login_wait"])
+        await self.take_debug_screenshot("login_timeout")
+        return False
 
     # ── Think mode ────────────────────────────────────────────────────────────
 
@@ -1977,11 +2207,17 @@ class QwenScraper(BaseAIChatScraper):
             return False
 
     async def is_session_expired(self) -> bool:
+        """Return True jika sesi tidak valid (halaman login atau tombol Login terdeteksi)."""
         try:
-            url = self._page.url
-            body = await self._page.inner_text("body")
-            if "login" in url.lower() or "signin" in url.lower():
+            url = self._page.url or ""
+            # Cek URL patterns
+            for pat in QWEN_AUTH_CONFIG["login_url_patterns"]:
+                if pat in url.lower():
+                    return True
+            # Cek tombol Login/Sign Up di DOM
+            if await self._is_unauthenticated():
                 return True
+            body = await self._page.inner_text("body")
             return contains_any(body, ROTATION_CONFIG["session_expired_phrases"])
         except Exception:
             return False
