@@ -272,22 +272,58 @@ class QwenScraper(BaseAIChatScraper):
     async def ensure_authenticated(self) -> bool:
         """Idempotent auth check untuk Qwen.
 
-        Flow:
-          1. Jika profile session masih valid → selesai (return True).
-          2. Jika terdeteksi tombol Login/Sign Up → arahkan ke login page
-             dan login dengan email + password dari cookies/auth.json.
-          3. Session berhasil → simpan ke persistent profile.
+        Identik dengan DeepSeek ensure_authenticated():
+          1. Navigasi ke chat.qwen.ai agar DOM dapat dicek (sama seperti DeepSeek
+             yang navigate ke chat URL sebelum cek session expired).
+          2. Jika session masih valid (tidak ada tombol Login/Sign Up) → selesai.
+          3. Jika terdeteksi tombol Login / redirect ke /auth → login otomatis
+             dengan email + password dari cookies/authqwen.json.
+          4. Persistent profile menyimpan session setelah login → restart
+             berikutnya langsung lanjut tanpa login ulang.
         """
         if self._page is None:
             return False
 
-        # Jika sudah login, tidak perlu apa-apa
+        # ── STEP 1: Navigasi ke halaman utama Qwen ─────────────────────────
+        # Ini WAJIB sebelum cek DOM, karena setelah launch_browser() page
+        # masih "about:blank" (profile kosong) atau halaman terakhir yang
+        # tersimpan. Tanpa navigate, _is_unauthenticated() tidak bisa
+        # mendeteksi apakah sesi valid atau tidak.
+        # (Sama seperti DeepSeek yang goto(chat_url) sebelum cek session.)
+        try:
+            current_url = self._page.url or ""
+            # Jika sudah di chat.qwen.ai → tidak perlu navigate ulang
+            if "chat.qwen.ai" not in current_url:
+                self.logger.info(
+                    "ensure_authenticated: navigasi ke chat.qwen.ai "
+                    "(current url: %s)",
+                    current_url or "about:blank",
+                )
+                await self._page.goto(
+                    "https://chat.qwen.ai",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+                await asyncio.sleep(1.5)   # beri waktu SPA render tombol Login
+        except Exception as nav_err:
+            self.logger.warning(
+                "ensure_authenticated: gagal navigasi ke chat.qwen.ai: %s",
+                nav_err,
+            )
+
+        # ── STEP 2: Cek apakah session masih valid ─────────────────────────
         if not await self._is_unauthenticated():
+            self.logger.info(
+                "ensure_authenticated: session account '%s' masih valid ✅",
+                self.account,
+            )
             self._authenticated = True
             return True
 
+        # ── STEP 3: Session tidak valid → login ────────────────────────────
         self.logger.info(
-            "Tombol Login/Sign Up terdeteksi untuk account '%s' → memulai login",
+            "ensure_authenticated: tombol Login/Sign Up terdeteksi untuk "
+            "account '%s' → memulai login otomatis",
             self.account,
         )
         ok = await self.login()

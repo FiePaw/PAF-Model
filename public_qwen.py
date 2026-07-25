@@ -6,10 +6,10 @@ Konek ke VPS via WebSocket, menerima task, menjalankan QwenScraper
 dari pre-warmed BrowserPool, dan mengembalikan hasil ke VPS.
 
 Perbedaan utama dari versi lama:
-  • BrowserPool dibuat SEKALI saat startup → N browser sudah warm & login
+  • BrowserPool dibuat SEKALI saat startup → N browser sudah warm & ter-autentikasi
   • Task tidak lagi spawn browser baru → tidak ada cold-start per task
-  • Setiap slot dedicated ke 1 cookie file
-  • Slot crash → auto-respawn di background
+  • Auth model identik dengan DeepSeek: authqwen.json → email+password → persistent profile
+  • Slot crash → auto-respawn di background (termasuk re-login jika session expired)
 
 Flow:
   [public.py] → konek WebSocket → [vps_server.py]
@@ -50,7 +50,7 @@ logger = setup_logger("local_worker")
 @dataclass
 class Session:
     session_id: str
-    cookie_file: Path                      # Path lengkap — dipakai untuk preferred_cookie di pool
+    account_name: str                      # nama account (dari authqwen.json) untuk session affinity
     conversation_url: str | None = None
     created_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
@@ -91,7 +91,7 @@ class SessionStore:
     def _to_dict(self, s: Session) -> dict:
         return {
             "session_id":       s.session_id,
-            "cookie_file":      str(s.cookie_file),
+            "account_name":     s.account_name,
             "conversation_url": s.conversation_url,
             "created_at":       s.created_at,
             "last_used":        s.last_used,
@@ -99,9 +99,15 @@ class SessionStore:
         }
 
     def _from_dict(self, d: dict) -> Session:
+        # Backward compat: session lama mungkin punya "cookie_file" bukan "account_name"
+        account = d.get("account_name") or ""
+        if not account and "cookie_file" in d:
+            # Derive account_name dari cookie_file path (e.g. "cookies/account1.json" → "account1")
+            from pathlib import Path as _P
+            account = _P(d["cookie_file"]).stem
         return Session(
             session_id=d["session_id"],
-            cookie_file=Path(d["cookie_file"]),
+            account_name=account,
             conversation_url=d.get("conversation_url"),
             created_at=d.get("created_at", time.time()),
             last_used=d.get("last_used", time.time()),
@@ -153,9 +159,9 @@ class SessionStore:
                 self._sessions[s.session_id] = s
                 restored += 1
                 logger.debug(
-                    "SessionStore: restore session %s (cookie=%s, url=%s)",
+                    "SessionStore: restore session %s (account=%s, url=%s)",
                     s.session_id[:8],
-                    s.cookie_file.name,
+                    s.account_name,
                     s.conversation_url or "-",
                 )
             except Exception as e:
@@ -182,10 +188,10 @@ class SessionStore:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    async def create(self, cookie_file: Path, session_id: str | None = None) -> Session:
+    async def create(self, account_name: str, session_id: str | None = None) -> Session:
         async with self._lock:
             sid = session_id or uuid.uuid4().hex
-            session = Session(session_id=sid, cookie_file=cookie_file)
+            session = Session(session_id=sid, account_name=account_name)
             self._sessions[sid] = session
             self._save_to_disk(session)
             return session
@@ -201,12 +207,12 @@ class SessionStore:
                 return None
             return s
 
-    async def get_or_create(self, session_id: str | None, cookie_file: Path) -> Session:
+    async def get_or_create(self, session_id: str | None, account_name: str) -> Session:
         if session_id:
             existing = await self.get(session_id)
             if existing:
                 return existing
-        return await self.create(cookie_file, session_id=session_id)
+        return await self.create(account_name, session_id=session_id)
 
     async def update(self, s: Session) -> None:
         """Simpan ulang session ke disk setelah dimodifikasi (misal: touch, update URL)."""
@@ -424,21 +430,21 @@ class TaskProcessor:
         # ── Resolve session ────────────────────────────────────────────────────
         mode = "new"
         conv_url: str | None = None
-        preferred_cookie: str | None = None   # nama file, untuk pool.acquire()
-        session_cookie_file: Path | None = None  # Path lengkap, untuk SessionStore
+        preferred_cookie: str | None = None   # account_name.json, untuk pool.acquire()
+        session_account: str | None = None    # account name, untuk SessionStore affinity
 
         if incoming_sid:
             existing = await self.sessions.get(incoming_sid)
             if existing:
                 mode = "continue"
                 conv_url = existing.conversation_url
-                # ← FIX Bug #1 & #3: ambil cookie Path dari session, teruskan ke pool
-                session_cookie_file = existing.cookie_file
-                preferred_cookie    = existing.cookie_file.name
+                session_account  = existing.account_name
+                # pool.acquire() pakai preferred_cookie = "account1.json" untuk affinity
+                preferred_cookie = f"{existing.account_name}.json" if existing.account_name else None
                 logger.info(
-                    "Worker#%s CONTINUE [%s] session=%s cookie=%s conv_url=%s",
+                    "Worker#%s CONTINUE [%s] session=%s account=%s conv_url=%s",
                     worker_label, request_id[:8], incoming_sid[:8],
-                    preferred_cookie, conv_url,
+                    session_account, conv_url,
                 )
             else:
                 logger.info(
@@ -572,13 +578,15 @@ class TaskProcessor:
             if not result.get("success"):
                 return {"success": False, "error": result.get("error", "Unknown scraper error")}
 
-            # Resolusi cookie_file sebagai Path untuk disimpan di session
-            if session_cookie_file:
-                resolved_cookie_path = session_cookie_file
-            else:
-                resolved_cookie_path = self.pool.get_cookie_path(cookie_name)
+            # Resolusi account_name untuk disimpan di session
+            # cookie_name = "account1.json" → account_name = "account1"
+            resolved_account = (
+                session_account                           # CONTINUE: sudah tau account-nya
+                or cookie_name.replace(".json", "")       # NEW: dari slot yang dipakai
+                if cookie_name else "qwen"
+            )
 
-            session = await self.sessions.get_or_create(incoming_sid, resolved_cookie_path)
+            session = await self.sessions.get_or_create(incoming_sid, resolved_account)
             if current_url and "chat.qwen.ai" in current_url:
                 session.conversation_url = current_url
             session.touch()
@@ -605,7 +613,7 @@ class TaskProcessor:
                     "finish_reason": "tool_calls",
                     "tool_calls": tool_calls_list,
                     "session_id": session.session_id,
-                    "cookie_file": cookie_name,
+                    "account_used": cookie_name,
                     "conversation_url": session.conversation_url or "",
                     "usage": usage,
                     "x_metadata": x_metadata,
@@ -629,7 +637,7 @@ class TaskProcessor:
                     "urls": media_urls,
                     "task_type": task_type,
                     "session_id": session.session_id,
-                    "cookie_file": cookie_name,
+                    "account_used": cookie_name,
                     "conversation_url": session.conversation_url or "",
                     "account_used": cookie_name,
                     "usage": usage,
@@ -721,9 +729,17 @@ class LocalWorker:
                 logger.error("Worker#%s Gagal kirim validation-error ke VPS: %s", self._label, e)
             return
 
-        # Field mapping: model → preferred_cookie (jika belum di-set VPS)
+        # Field mapping: model → preferred_cookie
+        # Hanya set preferred_cookie jika model mengandung account spesifik
+        # dalam format "qwen(account1)" — model bare "qwen" tidak berarti account.
+        # Ini mencegah "qwen.json" yang tidak ada di pool.
         if payload.get("model") and not payload.get("preferred_cookie"):
-            payload["preferred_cookie"] = payload["model"]
+            _model_val = payload["model"]
+            import re as _re
+            _m = _re.match(r"qwen\(([^)]+)\)", _model_val, _re.IGNORECASE)
+            if _m:
+                # "qwen(account1)" → preferred_cookie = "account1.json"
+                payload["preferred_cookie"] = _m.group(1)
 
         # Pisah system message dari messages
         # CATATAN: tools tetap ada di payload["tools"], tidak disentuh di sini

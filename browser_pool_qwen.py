@@ -1,17 +1,29 @@
 """
-browser_pool.py – Pre-warmed Browser Pool untuk AIChatScraper
-=============================================================
+browser_pool_qwen.py – Pre-warmed Browser Pool untuk QwenScraper
+================================================================
+
+AUTH MODEL (identik dengan DeepSeek):
+  • Semua account didefinisikan di cookies/authqwen.json
+    Format: [{"name": "account1", "email": "...", "password": "..."}]
+  • Setiap account → persistent browser profile di profiles/<account>/
+  • Saat warmup (start()), setiap slot:
+      1. launch_browser(account) → buka persistent context
+      2. ensure_authenticated():
+           - Profile lama & session valid  → langsung siap (tanpa login)
+           - Profile baru / expired        → login otomatis via email+password
+  • Profile menyimpan session setelah login pertama → restart berikutnya
+    tidak perlu login ulang selama session belum expired
 
 Setiap slot di pool:
-  • Dedicated ke 1 cookie file
-  • Browser + halaman sudah terbuka & login sejak startup
+  • Dedicated ke 1 account (dari authqwen.json)
+  • Browser + halaman sudah terbuka & ter-autentikasi sejak startup
   • Task tinggal langsung send_prompt() tanpa cold-start
 
 Usage (di public.py):
-    pool = BrowserPool(cookies_dir=COOKIES_DIR, pool_size=20, headless=True)
-    await pool.start()
+    pool = BrowserPool(cookies_dir=COOKIES_DIR, pool_size=2, headless=True)
+    await pool.start()   # spawn browser + login jika perlu
 
-    async with pool.acquire() as scraper:
+    async with pool.acquire() as (scraper, cookie_name, slot_id):
         result = await scraper.send_prompt(prompt)
 
     await pool.stop()
@@ -30,7 +42,7 @@ from typing import AsyncIterator
 
 from config import QWEN_AUTH_CONFIG
 from scrapers.qwen_scraper import QwenScraper
-from scrapers.utils import AuthStore, discover_cookie_files, setup_logger
+from scrapers.utils import AuthStore, setup_logger
 
 logger = setup_logger("browser_pool")
 
@@ -79,10 +91,21 @@ class BrowserPool:
     """
     Pool of pre-warmed QwenScraper instances.
 
-    • pool_size browser dibuat saat start(), masing-masing pakai 1 cookie file.
-    • Kalau jumlah cookie file < pool_size, cookie di-wrap round-robin.
-    • acquire() mengembalikan slot idle; kalau semua busy, tunggu sampai ada yang selesai.
-    • Slot yang crash di-respawn otomatis di background dengan cookie yang sama.
+    AUTH MODEL (sama dengan DeepSeek):
+    ─────────────────────────────────
+    • Semua account didefinisikan di satu file: cookies/authqwen.json
+      Format: [{"name": "account1", "email": "...", "password": "..."}]
+    • Setiap account → persistent browser profile di profiles/<account>/
+    • Saat warmup (start()), setiap slot:
+        1. launch_browser(account) → buka persistent context
+        2. ensure_authenticated() → cek apakah session valid
+           - Jika profile sudah ada & session valid → langsung pakai (tidak login ulang)
+           - Jika profile baru / session expired → login otomatis dengan email+password
+    • Profile menyimpan session setelah login → restart berikutnya tidak perlu login ulang
+
+    Flow sama persis dengan DeepSeek:
+      authqwen.json → AuthStore → account list
+      _init_slot() → QwenScraper(account=...) → launch_browser() → ensure_authenticated()
     """
 
     MAX_RESPAWN_ATTEMPTS = 3       # maks percobaan respawn sebelum slot dianggap permanen mati
@@ -102,17 +125,23 @@ class BrowserPool:
         self.headless    = headless
         self.think_mode  = think_mode
 
-        # Deteksi mode auth: prioritaskan email+password (auth.json) jika ada
+        # Auth model: SELALU pakai email+password dari authqwen.json
+        # (sama persis dengan DeepSeek yang pakai auth.json)
         auth_store = AuthStore(QWEN_AUTH_CONFIG["auth_file"])
         self._auth_accounts: list[str] = auth_store.account_names()
-        self._use_auth_mode: bool = len(self._auth_accounts) > 0
-        if self._use_auth_mode:
-            logger.info(
-                "BrowserPool: email+password mode (%d account(s) dari auth.json): %s",
-                len(self._auth_accounts), self._auth_accounts,
+
+        if not self._auth_accounts:
+            raise RuntimeError(
+                f"Tidak ada account di {QWEN_AUTH_CONFIG['auth_file']}.\n"
+                f"Buat file tersebut dengan format:\n"
+                f'  [{{"name": "account1", "email": "you@email.com", "password": "secret"}}]\n'
+                f"Lihat .env.example untuk petunjuk lengkap."
             )
-        else:
-            logger.info("BrowserPool: legacy cookie-file mode")
+
+        logger.info(
+            "BrowserPool: auth.json mode — %d account(s): %s",
+            len(self._auth_accounts), self._auth_accounts,
+        )
 
         self._slots: list[BrowserSlot] = []
         # Kumpulan slot_id yang sedang berjalan dalam mode no-headless.
@@ -125,40 +154,31 @@ class BrowserPool:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Spawn semua slot secara paralel lalu tunggu hingga semuanya IDLE."""
+        """
+        Spawn semua slot secara paralel lalu tunggu hingga semuanya IDLE.
+
+        Sama dengan DeepSeek:
+          1. Baca semua account dari authqwen.json
+          2. 1 slot per account (wrap round-robin jika pool_size > jumlah account)
+          3. Tiap slot: launch_browser(account) → ensure_authenticated()
+             - Profile baru  → login otomatis
+             - Profile lama  → reuse session tanpa login ulang
+        """
         if self._started:
             return
 
-        if self._use_auth_mode:
-            # ── Email+password mode: 1 slot per account (wrap round-robin) ──
-            accounts = self._auth_accounts
-            logger.info(
-                "BrowserPool: memulai %d slot (auth.json accounts: %d)",
-                self.pool_size, len(accounts),
-            )
-            for i in range(self.pool_size):
-                acct = accounts[i % len(accounts)]
-                slot = BrowserSlot(slot_id=i, account_name=acct)
-                self._slots.append(slot)
-        else:
-            # ── Legacy cookie-file mode ──────────────────────────────────────
-            cookie_files = discover_cookie_files(self.cookies_dir)
-            if not cookie_files:
-                raise RuntimeError(
-                    f"Tidak ada cookie file di {self.cookies_dir} dan "
-                    f"tidak ada account di auth.json ({QWEN_AUTH_CONFIG['auth_file']}). "
-                    f"Tambahkan credentials ke salah satu."
-                )
-            logger.info(
-                "BrowserPool: memulai %d slot (cookie file tersedia: %d)",
-                self.pool_size, len(cookie_files),
-            )
-            for i in range(self.pool_size):
-                cf = cookie_files[i % len(cookie_files)]
-                slot = BrowserSlot(slot_id=i, cookie_file=cf)
-                self._slots.append(slot)
+        accounts = self._auth_accounts
+        logger.info(
+            "BrowserPool: memulai %d slot dari %d account(s) di authqwen.json",
+            self.pool_size, len(accounts),
+        )
 
-        # Spawn semua browser paralel
+        for i in range(self.pool_size):
+            acct = accounts[i % len(accounts)]
+            slot = BrowserSlot(slot_id=i, account_name=acct)
+            self._slots.append(slot)
+
+        # Spawn semua browser paralel — setiap slot login jika diperlukan
         await asyncio.gather(*[self._init_slot(slot) for slot in self._slots])
 
         idle_count = sum(1 for s in self._slots if s.status == SlotStatus.IDLE)
@@ -167,7 +187,8 @@ class BrowserPool:
             idle_count, self.pool_size,
         )
         if idle_count == 0:
-            raise RuntimeError("Tidak ada slot yang berhasil diinisialisasi")
+            raise RuntimeError("Tidak ada slot yang berhasil diinisialisasi. "
+                               "Cek credentials di authqwen.json dan koneksi internet.")
 
         self._started = True
 
@@ -191,70 +212,76 @@ class BrowserPool:
     # ── Slot initialization ───────────────────────────────────────────────────
 
     async def _init_slot(self, slot: BrowserSlot) -> None:
-        """Buat scraper baru untuk slot, navigasi ke halaman chat.
+        """
+        Buat dan autentikasi scraper untuk satu slot.
 
-        Mendukung dua mode:
-          • Email+password (slot.account_name set): launch profile by account,
-            lalu panggil ensure_authenticated() untuk login jika perlu.
-          • Legacy cookie-file (slot.cookie_file set): seed cookie lama.
+        Flow identik dengan DeepSeek browser_pool_deepseek._init_slot:
+          1. Buat QwenScraper dengan account name dari authqwen.json
+          2. launch_browser(account) → buka persistent context di profiles/<account>/
+          3. ensure_authenticated():
+               - Profile baru     → navigasi ke /auth, isi form, login otomatis
+               - Profile lama     → cek session masih valid, skip login jika OK
+               - Session expired  → re-login otomatis
+               - Captcha headless → fail loud (user perlu --no-headless sekali)
+          4. Slot marked IDLE → siap terima task
         """
         slot.status = SlotStatus.STARTING
+        account = slot.account_name
         try:
-            if slot.account_name:
-                # ── Email+password mode ──────────────────────────────────────
-                scraper = QwenScraper(
-                    headless=self.headless,
-                    cookies_dir=self.cookies_dir,
-                    think_mode=self.think_mode,
-                    account=slot.account_name,
-                )
-                scraper._discover_accounts()
-                await scraper.launch_browser(account=slot.account_name)
-
-                # Login jika session belum ada / expired
-                ok = await scraper.ensure_authenticated()
-                if not ok:
-                    raise RuntimeError(
-                        f"ensure_authenticated() gagal untuk account '{slot.account_name}'"
-                    )
-
-                logger.info(
-                    "Slot#%d ✅ siap (account: %s, auth: email+password)",
-                    slot.slot_id, slot.account_name,
-                )
-            else:
-                # ── Legacy cookie-file mode ──────────────────────────────────
-                scraper = QwenScraper(
-                    headless=self.headless,
-                    cookies_path=slot.cookie_file,
-                    cookies_dir=self.cookies_dir,
-                    think_mode=self.think_mode,
-                )
-                scraper._discover_accounts()
-
-                # Set _cookie_index ke posisi slot.cookie_file yang benar
-                try:
-                    idx = scraper._cookie_files.index(slot.cookie_file)
-                    scraper._cookie_index = idx
-                except ValueError:
-                    scraper.cookies_path = slot.cookie_file
-                    logger.warning(
-                        "Slot#%d: %s tidak ditemukan di _cookie_files, fallback cookies_path",
-                        slot.slot_id, slot.cookie_file.name if slot.cookie_file else "?",
-                    )
-
-                await scraper.launch_browser(cookie_file=slot.cookie_file)
-                logger.info(
-                    "Slot#%d ✅ siap (cookie: %s, auth: legacy)",
-                    slot.slot_id, slot.cookie_file.name if slot.cookie_file else "?",
+            if not account:
+                raise RuntimeError(
+                    f"Slot#{slot.slot_id}: account_name tidak di-set. "
+                    f"Pastikan {QWEN_AUTH_CONFIG['auth_file']} berisi minimal satu account."
                 )
 
+            logger.info(
+                "Slot#%d: warming up account '%s' (headless=%s) …",
+                slot.slot_id, account,
+                slot.slot_id not in self._no_headless_slot_ids and self.headless,
+            )
+
+            scraper = QwenScraper(
+                headless=slot.slot_id not in self._no_headless_slot_ids and self.headless,
+                cookies_dir=self.cookies_dir,
+                think_mode=self.think_mode,
+                account=account,
+            )
+
+            # Buka persistent browser profile untuk account ini.
+            # Profile baru  → Playwright buat directory kosong, lanjut ke ensure_authenticated().
+            # Profile lama  → Playwright load saved session (cookies, localStorage).
+            await scraper.launch_browser(account=account)
+            logger.info(
+                "Slot#%d: browser launched untuk '%s', memverifikasi sesi …",
+                slot.slot_id, account,
+            )
+
+            # Verifikasi sesi dan login jika diperlukan.
+            # ensure_authenticated() adalah idempotent:
+            #   - Sesi masih valid  → return True langsung (tidak ke halaman login)
+            #   - Sesi tidak valid  → goto /auth, isi email+password, submit, tunggu redirect
+            ok = await scraper.ensure_authenticated()
+            if not ok:
+                raise RuntimeError(
+                    f"Autentikasi gagal untuk account '{account}'. "
+                    f"Periksa credentials di {QWEN_AUTH_CONFIG['auth_file']} "
+                    f"atau jalankan dengan --no-headless untuk selesaikan captcha."
+                )
+
+            logger.info(
+                "Slot#%d ✅ siap (account: %s, auth: email+password via authqwen.json)",
+                slot.slot_id, account,
+            )
             slot.scraper = scraper
             slot.mark_idle()
             self._idle_event.set()
+
         except Exception as e:
             slot.mark_dead()
-            logger.error("Slot#%d ❌ gagal init: %s", slot.slot_id, e, exc_info=True)
+            logger.error(
+                "Slot#%d ❌ gagal init (account: %s): %s",
+                slot.slot_id, account or "?", e, exc_info=True,
+            )
 
     # ── Respawn ───────────────────────────────────────────────────────────────
 
@@ -337,14 +364,14 @@ class BrowserPool:
 
             logger.debug(
                 "Slot#%d dipakai (cookie=%s, preferred_slot=%s, preferred_cookie=%s)",
-                slot.slot_id, slot.cookie_file.name,
+                slot.slot_id, self._slot_cookie_name(slot),
                 preferred_slot_id if preferred_slot_id is not None else "-",
                 preferred_cookie or "-",
             )
             break   # slot sehat, keluar dari loop
 
         try:
-            yield slot.scraper, slot.cookie_file.name, slot.slot_id
+            yield slot.scraper, self._slot_cookie_name(slot), slot.slot_id
         except Exception as e:
             logger.error("Slot#%d error saat dipakai: %s", slot.slot_id, e)
             slot.mark_dead()
@@ -404,7 +431,7 @@ class BrowserPool:
                 if preferred_cookie:
                     matched_slots = [
                         s for s in self._slots
-                        if s.cookie_file.name == preferred_cookie
+                        if self._slot_cookie_name(s) == preferred_cookie
                     ]
                     if not matched_slots:
                         logger.warning(
@@ -472,8 +499,11 @@ class BrowserPool:
         Kalau tidak ketemu, kembalikan Path dari cookies_dir (best-effort).
         """
         for slot in self._slots:
-            if slot.cookie_file.name == cookie_name:
-                return slot.cookie_file
+            if self._slot_cookie_name(slot) == cookie_name:
+                if slot.cookie_file is not None:
+                    return slot.cookie_file
+                # mode email+password: tidak ada Path fisik, konstruksi dari cookies_dir
+                return self.cookies_dir / cookie_name
         # fallback
         return self.cookies_dir / cookie_name
 
@@ -493,56 +523,57 @@ class BrowserPool:
 
     # ── Account command helpers ───────────────────────────────────────────────
 
-    async def add_account(self, cookie_filename: str) -> dict:
+    async def add_account(self, account_name: str) -> dict:
         """
         Daftarkan akun baru ke pool secara runtime tanpa restart worker.
 
+        Sama dengan DeepSeek: cukup berikan nama account yang sudah ada
+        di authqwen.json — tidak perlu path file cookie.
+
         Alur:
-          1. Resolve path: cookies_dir / cookie_filename
-             (boleh dengan atau tanpa ekstensi .json)
-          2. Validasi file ada dan belum terdaftar di pool.
-          3. Buat BrowserSlot baru dengan slot_id berikutnya.
-          4. Jalankan _init_slot → browser langsung warm & IDLE.
+          1. Validasi account ada di authqwen.json.
+          2. Validasi belum terdaftar di pool.
+          3. Buat BrowserSlot baru, jalankan _init_slot → login jika perlu.
 
         Returns dict {"ok": bool, "message": str, "slot_id": int | None}.
         """
-        # Normalisasi nama file: pastikan berekstensi .json
-        name = cookie_filename.strip()
-        if not name.endswith(".json"):
-            name += ".json"
+        name = account_name.strip()
 
-        cookie_path = self.cookies_dir / name
-
-        # Validasi: file harus ada
-        if not cookie_path.exists():
+        # Validasi: account harus ada di authqwen.json
+        auth_store = AuthStore(QWEN_AUTH_CONFIG["auth_file"])
+        all_accounts = auth_store.account_names()
+        if name not in all_accounts:
             return {
                 "ok"     : False,
                 "slot_id": None,
-                "message": f"File cookie tidak ditemukan: {cookie_path}",
+                "message": (
+                    f"Account '{name}' tidak ditemukan di {QWEN_AUTH_CONFIG['auth_file']}. "
+                    f"Account tersedia: {all_accounts}"
+                ),
             }
 
         # Validasi: belum terdaftar di pool
         for slot in self._slots:
-            if slot.cookie_file.resolve() == cookie_path.resolve():
+            if slot.account_name == name:
                 return {
                     "ok"     : False,
                     "slot_id": slot.slot_id,
                     "message": (
-                        f"Akun '{cookie_path.stem}' sudah terdaftar "
+                        f"Account '{name}' sudah terdaftar "
                         f"di Slot#{slot.slot_id} (status: {slot.status.name.lower()})"
                     ),
                 }
 
         # Buat slot baru
         new_slot_id = max((s.slot_id for s in self._slots), default=-1) + 1
-        slot = BrowserSlot(slot_id=new_slot_id, cookie_file=cookie_path)
+        slot = BrowserSlot(slot_id=new_slot_id, account_name=name)
 
         async with self._lock:
             self._slots.append(slot)
 
         logger.info(
-            "addaccount: menambahkan Slot#%d untuk akun '%s' …",
-            new_slot_id, cookie_path.stem,
+            "addaccount: menambahkan Slot#%d untuk account '%s' …",
+            new_slot_id, name,
         )
 
         await self._init_slot(slot)
@@ -552,7 +583,7 @@ class BrowserPool:
                 "ok"     : True,
                 "slot_id": new_slot_id,
                 "message": (
-                    f"Akun '{cookie_path.stem}' berhasil ditambahkan "
+                    f"Account '{name}' berhasil ditambahkan "
                     f"sebagai Slot#{new_slot_id} dan siap digunakan"
                 ),
             }
@@ -561,10 +592,39 @@ class BrowserPool:
                 "ok"     : False,
                 "slot_id": new_slot_id,
                 "message": (
-                    f"Slot#{new_slot_id} untuk akun '{cookie_path.stem}' "
+                    f"Slot#{new_slot_id} untuk account '{name}' "
                     f"gagal inisialisasi (status: {slot.status.name.lower()})"
                 ),
             }
+
+
+    @staticmethod
+    def _slot_account_name(slot: "BrowserSlot") -> str:
+        """
+        Resolve nama akun dari slot, mendukung dua mode auth:
+          - email+password mode : slot.account_name (str)
+          - legacy cookie-file  : slot.cookie_file.stem (Path)
+        Kembalikan string fallback jika keduanya None.
+        """
+        if slot.account_name:
+            return slot.account_name
+        if slot.cookie_file is not None:
+            return slot.cookie_file.stem
+        return f"slot{slot.slot_id}"
+
+    @staticmethod
+    def _slot_cookie_name(slot: "BrowserSlot") -> str:
+        """
+        Resolve nama file cookie dari slot (dipakai sebagai identifier acquire/session).
+          - legacy cookie-file  : slot.cookie_file.name  (misal "account1.json")
+          - email+password mode : slot.account_name + ".json" (agar konsisten)
+        Kembalikan string fallback jika keduanya None.
+        """
+        if slot.cookie_file is not None:
+            return slot.cookie_file.name
+        if slot.account_name:
+            return f"{slot.account_name}.json"
+        return f"slot{slot.slot_id}.json"
 
     def list_accounts(self) -> list[dict]:
         """
@@ -578,7 +638,7 @@ class BrowserPool:
         """
         return [
             {
-                "account"    : slot.cookie_file.stem,
+                "account"    : self._slot_account_name(slot),
                 "status"     : slot.status.name.lower(),
                 "slot_id"    : slot.slot_id,
                 "no_headless": slot.slot_id in self._no_headless_slot_ids,
@@ -604,7 +664,7 @@ class BrowserPool:
         """
         target: BrowserSlot | None = None
         for slot in self._slots:
-            if slot.cookie_file.stem == account_name:
+            if self._slot_account_name(slot) == account_name:
                 target = slot
                 break
 
@@ -637,24 +697,30 @@ class BrowserPool:
         # Spawn scraper baru dengan headless=False (override sementara)
         target.status = SlotStatus.STARTING
         try:
+            account = target.account_name
+            if not account:
+                raise RuntimeError(f"Slot#{target.slot_id} tidak memiliki account_name.")
+
             scraper = QwenScraper(
-                headless=False,
-                cookies_path=target.cookie_file,
+                headless=False,   # no-headless mode: browser visible
                 cookies_dir=self.cookies_dir,
                 think_mode=self.think_mode,
+                account=account,
             )
-            scraper._discover_accounts()
-            try:
-                idx = scraper._cookie_files.index(target.cookie_file)
-                scraper._cookie_index = idx
-            except ValueError:
-                scraper.cookies_path = target.cookie_file
 
-            await scraper.launch_browser(cookie_file=target.cookie_file)
+            # Buka profile yang sama dengan yang dipakai saat warmup
+            await scraper.launch_browser(account=account)
 
-            # Navigasi ke halaman settings/general agar user bisa langsung
-            # memeriksa kondisi akun secara visual di browser yang terbuka.
-            settings_url = "https://chat.qwen.ai/settings/general"
+            # Verifikasi / re-login jika session sudah expired
+            ok = await scraper.ensure_authenticated()
+            if not ok:
+                raise RuntimeError(
+                    f"ensure_authenticated() gagal untuk account '{account}' "
+                    f"dalam mode no-headless."
+                )
+
+            # Navigasi ke halaman utama agar user bisa memeriksa kondisi akun
+            settings_url = "https://chat.qwen.ai"
             try:
                 await scraper._page.goto(
                     settings_url,
@@ -666,7 +732,6 @@ class BrowserPool:
                     target.slot_id, account_name, settings_url,
                 )
             except Exception as nav_err:
-                # Navigasi gagal tidak dianggap fatal — browser tetap terbuka
                 logger.warning(
                     "showheadless: Slot#%d (%s) ⚠️  gagal navigasi ke %s: %s",
                     target.slot_id, account_name, settings_url, nav_err,
@@ -724,7 +789,7 @@ class BrowserPool:
             }
 
         for slot in targets:
-            account_name = slot.cookie_file.stem
+            account_name = self._slot_account_name(slot)
             if slot.status == SlotStatus.BUSY:
                 skipped.append(account_name)
                 logger.warning(
