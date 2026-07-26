@@ -458,19 +458,48 @@ class DeepSeekScraper(BaseAIChatScraper):
             )
 
         # DeepSeek is a React SPA: domcontentloaded fires before JS routing runs.
-        # Poll until the URL stabilises (no longer changing) so that is_session_expired()
-        # sees the final destination (/sign_in vs chat UI) rather than the intermediate root.
-        _settle_poll = 0.3   # seconds between URL samples
-        _settle_max  = 5.0   # max total wait for URL to stabilise
-        _settle_elapsed = 0.0
-        _prev_url = self.page.url or ""
-        while _settle_elapsed < _settle_max:
-            await asyncio.sleep(_settle_poll)
-            _settle_elapsed += _settle_poll
-            _curr_url = self.page.url or ""
-            if _curr_url == _prev_url:
-                break   # URL stopped changing — SPA routing complete
-            _prev_url = _curr_url
+        #
+        # BUG (sesi 2, Fix 1) — URL-stability guessing was unreliable: the loop
+        # broke as soon as one 0.3s sample matched the previous one. If the
+        # SPA's client-side redirect to /sign_in took *longer* than a single
+        # 0.3s poll (e.g. it's waiting on an auth-check API call), the very
+        # first sample still equalled the base URL taken right after
+        # domcontentloaded, so the loop concluded "stable" and exited before
+        # the redirect even started. is_session_expired() then ran against the
+        # stale base URL — no password field visible yet, no chat input yet —
+        # fell through to the phrase-match fallback (which found nothing
+        # mid-load) and returned False ("not expired"), silently skipping
+        # login while the browser was still about to land on /sign_in.
+        #
+        # Fix: stop guessing from URL stability and poll directly for one of
+        # the three definitive end-states instead — whichever appears first
+        # tells us unambiguously where the SPA landed:
+        #   (a) URL already contains /sign_in           → expired
+        #   (b) password field visible                   → expired (login DOM)
+        #   (c) a configured chat-input selector present  → authenticated
+        _deadline = asyncio.get_event_loop().time() + 10.0  # fixed cap, independent of page_load (60s)
+        _poll = 0.25
+        while asyncio.get_event_loop().time() < _deadline:
+            url_now = self.page.url or ""
+            if DEEPSEEK_CONFIG["login_url"] in url_now:
+                break
+            try:
+                pwd = await self.page.query_selector('input[type="password"]')
+                if pwd is not None and await pwd.is_visible():
+                    break
+            except Exception:
+                pass
+            found_chat = False
+            for sel in _SEL["chat_input"]:
+                try:
+                    if await self.page.query_selector(sel) is not None:
+                        found_chat = True
+                        break
+                except Exception:
+                    continue
+            if found_chat:
+                break
+            await asyncio.sleep(_poll)
 
         # Profile-first: reuse the saved session. If the login DOM appears
         # (fresh profile or expired session), ensure_authenticated() logs in.

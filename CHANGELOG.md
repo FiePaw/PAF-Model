@@ -5,6 +5,60 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — 2026-07-26 (sesi 3)
+
+### Fix — DeepSeek warmup masih diam di `/sign_in` (fix sesi 2 belum menutup celah)
+
+**File:** `scrapers/deepseek_scraper.py`
+**Dipicu oleh:** Setelah fix sesi 2 (Fix 1) diterapkan, bug yang sama masih muncul:
+browser warmup berhenti di `https://chat.deepseek.com/sign_in` tanpa login terpicu.
+
+#### Root Cause
+
+Fix sesi 2 menambahkan "URL-stabilisation loop" yang menganggap SPA sudah selesai
+routing begitu satu sample URL (tiap 0.3s) sama dengan sample sebelumnya. Ini
+adalah asumsi yang salah:
+
+```
+t=0.0s : goto() selesai (domcontentloaded) → _prev_url = "https://chat.deepseek.com"
+t=0.3s : SPA belum sempat redirect ke /sign_in (masih proses cek auth via API)
+         → _curr_url masih sama dengan _prev_url → loop mengira "stabil" → break ❌
+         (padahal redirect sebenarnya baru terjadi di t=0.5s, SETELAH loop keluar)
+```
+
+Karena loop keluar terlalu dini, `ensure_authenticated()` → `is_session_expired()`
+dipanggil saat URL **masih** base_url (bukan `/sign_in` yang sebenarnya akan
+dituju). Pada momen itu:
+- Check 1 (URL == sign_in) → belum match, URL masih base_url
+- Check 2 (password field visible) → belum ada, halaman belum selesai render
+- Check 3 (chat_input present) → belum ada juga
+- Check 4 (phrase match di body) → body masih kosong/loading, tidak match
+
+Hasilnya `is_session_expired()` return `False` ("dikira sudah login") → login
+di-skip → slot ditandai READY padahal browser baru mendarat di `/sign_in`
+beberapa ratus ms kemudian.
+
+#### Fix di `scrapers/deepseek_scraper.py` (`_ensure_loaded()`)
+
+Ganti pendekatan "tebak dari stabilitas URL" (heuristik, rawan race condition)
+dengan **polling langsung ke state akhir yang definitif** — menunggu salah satu
+dari tiga kondisi berikut muncul (bounded, maks 10 detik, cek tiap 0.25s):
+
+1. URL sudah mengandung `/sign_in` → session expired
+2. Password field terlihat (`input[type="password"]` visible) → login DOM tampil
+3. Salah satu selector `chat_input` (dari config) ditemukan → sudah terautentikasi
+
+```
+Sebelum: goto() → tunggu 1 sample URL sama dgn sebelumnya → is_session_expired() ← masih bisa fooled ❌
+Sesudah: goto() → poll sampai salah satu dari 3 state definitif muncul (maks 10s) → is_session_expired() ✅
+```
+
+Deadline di-cap fixed 10 detik (independen dari timeout `page_load` 60 detik)
+supaya kasus halaman benar-benar stuck tidak membuat warmup menunggu semenit
+penuh per slot.
+
+---
+
 ## [Unreleased] — 2026-07-26 (sesi 2)
 
 ### Fix 1 — DeepSeek warmup diam di `/sign_in` (false-valid session)
