@@ -74,6 +74,7 @@ class BrowserPool:
         self._idle_event = asyncio.Event()
         self._started = False
         self._account_headless: dict[str, bool] = {}  # Per-account headless state
+        self._rr_index: int = 0  # Round-robin counter untuk mode NEW
 
     # ------------------------------------------------------------------ #
     # Accounts
@@ -301,15 +302,26 @@ class BrowserPool:
                 preferred_account,
             )
 
-        # --- Second pass: any idle slot ---------------------------------
+        # --- Second pass: round-robin across idle slots (mode NEW) ------
+        # Mulai iterasi dari _rr_index agar beban tersebar merata antar account.
+        # Setiap request NEW yang berhasil mendapat slot akan menggeser _rr_index
+        # ke slot berikutnya, sehingga request selanjutnya mulai pencarian dari sana.
         deadline2 = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline2:
-            for slot in self.slots:
+            n = len(self.slots)
+            for i in range(n):
+                slot = self.slots[(self._rr_index + i) % n]
                 if slot.status != SlotStatus.IDLE:
                     continue
                 async with slot._lock:
                     if slot.status == SlotStatus.IDLE:
+                        # Geser counter ke slot berikutnya untuk request berikutnya
+                        self._rr_index = (self.slots.index(slot) + 1) % n
                         slot.mark_busy()
+                        log.debug(
+                            "Round-robin NEW: slot %d (account=%s), next_rr=%d",
+                            slot.index, slot.account, self._rr_index,
+                        )
                         return slot
             self._idle_event.clear()
             try:

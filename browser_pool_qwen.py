@@ -150,6 +150,7 @@ class BrowserPool:
         self._lock  = asyncio.Lock()          # untuk modifikasi _slots
         self._idle_event = asyncio.Event()    # di-set setiap kali ada slot → IDLE
         self._started = False
+        self._rr_index: int = 0              # Round-robin counter untuk mode NEW
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -449,13 +450,21 @@ class BrowserPool:
                         await asyncio.sleep(self.ACQUIRE_POLL)
                         continue
 
-                # ── Prioritas 3: slot idle mana saja (mode NEW) ───────────────
-                idle_slots = [
-                    s for s in self._slots
-                    if s.status == SlotStatus.IDLE and s.scraper
-                ]
-                if idle_slots:
-                    return min(idle_slots, key=lambda s: s.last_used)
+                # ── Prioritas 3: round-robin (mode NEW) ──────────────────────
+                # Iterasi mulai dari _rr_index agar beban tersebar merata antar account.
+                # Setiap request NEW yang berhasil mendapat slot menggeser _rr_index
+                # ke posisi berikutnya, sehingga request selanjutnya mulai dari sana.
+                n = len(self._slots)
+                for i in range(n):
+                    candidate = self._slots[(self._rr_index + i) % n]
+                    if candidate.status == SlotStatus.IDLE and candidate.scraper:
+                        # Geser counter ke slot berikutnya untuk request berikutnya
+                        self._rr_index = (self._slots.index(candidate) + 1) % n
+                        logger.debug(
+                            "Round-robin NEW: Slot#%d (account=%s), next_rr=%d",
+                            candidate.slot_id, candidate.account_name, self._rr_index,
+                        )
+                        return candidate
 
                 self._idle_event.clear()
 
@@ -691,6 +700,12 @@ class BrowserPool:
             target.scraper = None
         target.mark_dead()
 
+        # Beri jeda agar OS melepas SingletonLock pada profile directory.
+        # Playwright menutup context secara async — proses Chrome di OS masih
+        # bisa hidup sebentar. Tanpa jeda ini, launch_persistent_context()
+        # berikutnya gagal dengan TargetClosedError karena profile terkunci.
+        await asyncio.sleep(2.0)
+
         # Simpan override headless untuk slot ini sebelum _init_slot
         self._no_headless_slot_ids.add(target.slot_id)
 
@@ -813,6 +828,9 @@ class BrowserPool:
                     pass
                 slot.scraper = None
             slot.mark_dead()
+
+            # Beri jeda agar OS melepas SingletonLock profile (sama seperti restart_slot_no_headless)
+            await asyncio.sleep(2.0)
 
             # Respawn normal (pakai self.headless)
             await self._init_slot(slot)

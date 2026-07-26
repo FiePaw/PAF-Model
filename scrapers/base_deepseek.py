@@ -138,10 +138,17 @@ class BaseAIChatScraper(ABC):
         return self.auth.account_names()
 
     def _profile_dir_for(self, account: Optional[str]) -> Path:
-        """Per-account persistent-profile directory."""
+        """Per-account persistent-profile directory.
+
+        Profiles are stored under profiles/deepseek/<account>/ to avoid
+        collision with the Qwen backend which uses profiles/qwen/<account>/.
+        Both backends may share the same account name (e.g. 'account1') and
+        previously wrote to the same profiles/ path, causing Chrome
+        SingletonLock conflicts when both workers ran simultaneously.
+        """
         if self._explicit_profile_dir:
             return self._explicit_profile_dir
-        return PROFILES_DIR / (account or PERSISTENT_CONTEXT_CONFIG["default_profile"])
+        return PROFILES_DIR / "deepseek" / (account or PERSISTENT_CONTEXT_CONFIG["default_profile"])
 
     @staticmethod
     def _profile_seeded(profile_dir: Path) -> bool:

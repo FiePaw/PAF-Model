@@ -5,6 +5,144 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — 2026-07-26 (sesi 2)
+
+### Fix 1 — DeepSeek warmup diam di `/sign_in` (false-valid session)
+
+**File:** `scrapers/deepseek_scraper.py`
+**Dipicu oleh:** Browser tampil di `https://chat.deepseek.com/sign_in` setelah warmup,
+padahal log menunjukkan "Slot ready".
+
+#### Root Cause
+`_ensure_loaded()` memanggil `goto(base_url, wait_until="domcontentloaded")` lalu
+langsung memanggil `ensure_authenticated()` dengan jeda hanya 0.1s. DeepSeek adalah
+React SPA — event `domcontentloaded` fire **sebelum** JS routing selesai. Saat
+`is_session_expired()` dipanggil, URL masih `https://chat.deepseek.com` (bukan `/sign_in`),
+sehingga semua check lolos → fungsi return `False` (dikira valid). Slot ditandai READY,
+padahal browser baru kemudian menyelesaikan redirect ke `/sign_in`.
+
+Ada juga bug kecil di cek `base_url NOT IN page.url`: karena `base_url =
+"https://chat.deepseek.com"` adalah substring dari
+`"https://chat.deepseek.com/sign_in"`, kondisi skip `goto()` bisa salah terpicu.
+
+#### Fix di `scrapers/deepseek_scraper.py`
+
+1. **Perbaiki cek `on_app`** — ganti substring check menjadi prefix check yang tepat
+   sehingga `/sign_in`, `/settings`, dll. tidak dianggap "sudah di app".
+
+2. **Tambah URL-stabilisation loop** — setelah `goto()`, poll URL setiap 0.3s hingga
+   URL tidak berubah lagi (maks 5s). Ini memastikan React router sudah selesai
+   redirect sebelum `is_session_expired()` dipanggil.
+
+```
+Sebelum: goto(base_url) → sleep(0.1s) → is_session_expired() ← SPA belum selesai ❌
+Sesudah: goto(base_url) → poll URL sampai stabil (maks 5s) → is_session_expired() ✅
+```
+
+---
+
+### Fix 2 — Qwen `showheadless` crash `TargetClosedError` (profile lock)
+
+**File:** `browser_pool_qwen.py`
+**Dipicu oleh:** `showheadless <account>` gagal dengan
+`BrowserType.launch_persistent_context: Target page, context or browser has been closed`.
+
+#### Root Cause
+`restart_slot_no_headless()` memanggil `close_browser()` lalu **langsung**
+`launch_browser()` tanpa jeda. `close_browser()` menutup context Playwright secara
+async, tapi proses Chrome di OS masih hidup sebentar dan memegang **`SingletonLock`**
+pada direktori profile (`profiles/<account>/`). Browser baru yang mencoba membuka
+profile yang sama gagal karena lock belum dilepas.
+
+Masalah yang sama ada di `stop_all_no_headless()`.
+
+#### Fix di `browser_pool_qwen.py`
+
+Tambah `await asyncio.sleep(2.0)` setelah `close_browser()` di dua fungsi:
+- `restart_slot_no_headless()` — saat toggle ke visible
+- `stop_all_no_headless()` — saat kembalikan ke headless
+
+```
+Sebelum: close_browser() → launch_browser() ← Chrome masih lock profile ❌
+Sesudah: close_browser() → sleep(2.0s) → launch_browser() ✅
+```
+
+---
+
+### Fix 3 — Profile collision antar backend (DeepSeek vs Qwen)
+
+**File:** `scrapers/base_deepseek.py`, `scrapers/base_qwen.py`
+**Dipicu oleh:** Kedua backend berjalan bersamaan; salah satunya crash atau mengalami
+`SingletonLock` error meski account berbeda.
+
+#### Root Cause
+Kedua backend menyimpan profile browser ke direktori yang **sama**:
+```
+PROFILES_DIR / account   →   profiles/account1/
+```
+Jika DeepSeek worker dan Qwen worker sama-sama punya `account1`, keduanya membuka
+`profiles/account1/` secara bersamaan → konflik lock di OS level.
+
+#### Fix
+
+Profile dipisah ke subdirektori per backend:
+
+| Backend | Sebelum | Sesudah |
+|---|---|---|
+| DeepSeek | `profiles/account1/` | `profiles/deepseek/account1/` |
+| Qwen | `profiles/account1/` | `profiles/qwen/account1/` |
+
+> **Migrasi:** Profile lama di `profiles/<account>/` tidak otomatis dipindah.
+> Hapus direktori `profiles/` dan biarkan worker login ulang saat pertama kali jalan,
+> atau pindah manual: `profiles/account1/` → `profiles/deepseek/account1/` (DeepSeek)
+> dan `profiles/qwen/account1/` (Qwen).
+
+---
+
+## [Unreleased] — 2026-07-26 (sesi 1)
+
+### Fix — Round-Robin Account Rotation di Mode `new` (kedua backend)
+
+
+**File:** `browser_pool_deepseek.py`, `browser_pool_qwen.py`
+**Masalah:** Kedua backend tidak merotasi account saat mode `new`. Request selalu
+mendapat slot pertama yang idle, yang dalam praktiknya selalu `account1`.
+
+#### Root Cause
+
+**DeepSeek (`browser_pool_deepseek.py`):**
+`_acquire_with_account()` di second pass (mode NEW, tanpa `preferred_account`)
+melakukan `for slot in self.slots` dan langsung return slot IDLE pertama yang
+ditemukan — selalu slot index 0 (`account1`) selama slot itu tidak sedang BUSY.
+
+**Qwen (`browser_pool_qwen.py`):**
+`_wait_for_idle_slot()` di Prioritas 3 (mode NEW) menggunakan
+`min(idle_slots, key=lambda s: s.last_used)` — memilih slot yang paling lama
+idle. Karena semua slot memiliki `last_used` yang hampir sama saat traffic rendah,
+slot 0 (`account1`) cenderung selalu terpilih.
+
+#### Fix
+
+Ditambah field `_rr_index: int = 0` di `BrowserPool.__init__()` pada kedua file.
+Field ini bertindak sebagai pointer giliran (round-robin cursor).
+
+**Logika baru (identik di kedua backend):**
+```
+request NEW masuk → iterasi mulai dari _rr_index
+  → temukan slot[(_rr_index + i) % n] yang IDLE
+  → _rr_index = (index_slot_terpilih + 1) % n   ← geser untuk request berikutnya
+  → return slot
+```
+
+| Skenario | Sebelum | Sesudah |
+|---|---|---|
+| 3 account, 3 request NEW berurutan | acc1, acc1, acc1 | acc1, acc2, acc3 |
+| acc1 sedang BUSY, ada request NEW | tunggu acc1 | langsung ambil acc2 |
+| mode CONTINUE | tidak berubah (pinned ke account asal) | tidak berubah |
+| `preferred_account` eksplisit | tidak berubah | tidak berubah |
+
+---
+
 ## [Unreleased] — 2026-07-25
 
 ### Ringkasan Sesi
@@ -177,6 +315,24 @@ preferred_cookie = _m.group(1) if _m else None
 
 ## File yang Dimodifikasi
 
+### Sesi 2026-07-26 (sesi 2)
+
+| File | Fix 1 (DS warmup) | Fix 2 (Qwen lock) | Fix 3 (profile collision) |
+|---|:---:|:---:|:---:|
+| `scrapers/deepseek_scraper.py` | ✅ | — | — |
+| `browser_pool_qwen.py` | — | ✅ | — |
+| `scrapers/base_deepseek.py` | — | — | ✅ |
+| `scrapers/base_qwen.py` | — | — | ✅ |
+
+### Sesi 2026-07-26 (sesi 1)
+
+| File | Round-Robin Rotation |
+|---|:---:|
+| `browser_pool_deepseek.py` | ✅ |
+| `browser_pool_qwen.py` | ✅ |
+
+### Sesi 2026-07-25
+
 | File | Fix 1 | Fix 2 | Auth Unifikasi | Fix 3 |
 |---|:---:|:---:|:---:|:---:|
 | `browser_pool_qwen.py` | ✅ | ✅ | ✅ | — |
@@ -216,4 +372,4 @@ Jika sebelumnya menggunakan cookie files (`cookies/account1.json`, dst.):
 
 ---
 
-*Changelog ini dibuat pada 2026-07-25 untuk sesi development PAF-Model.*
+*Terakhir diperbarui: 2026-07-26.*

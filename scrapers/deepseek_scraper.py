@@ -443,12 +443,35 @@ class DeepSeekScraper(BaseAIChatScraper):
         if self.page is None:
             await self.launch_browser(self.account)
         assert self.page is not None
-        if DEEPSEEK_CONFIG["base_url"] not in (self.page.url or ""):
+
+        # Navigate to base URL only if we are not already on the DeepSeek domain.
+        # Note: use exact prefix check (endswith "/") to avoid falsely treating
+        # "/sign_in" as "already on the app".
+        current = self.page.url or ""
+        base = DEEPSEEK_CONFIG["base_url"].rstrip("/")
+        on_app = current.startswith(base + "/") or current == base or current == base + "/"
+        if not on_app:
             await self.page.goto(
                 DEEPSEEK_CONFIG["base_url"],
                 wait_until="domcontentloaded",
                 timeout=_T["page_load"] * 1000,
             )
+
+        # DeepSeek is a React SPA: domcontentloaded fires before JS routing runs.
+        # Poll until the URL stabilises (no longer changing) so that is_session_expired()
+        # sees the final destination (/sign_in vs chat UI) rather than the intermediate root.
+        _settle_poll = 0.3   # seconds between URL samples
+        _settle_max  = 5.0   # max total wait for URL to stabilise
+        _settle_elapsed = 0.0
+        _prev_url = self.page.url or ""
+        while _settle_elapsed < _settle_max:
+            await asyncio.sleep(_settle_poll)
+            _settle_elapsed += _settle_poll
+            _curr_url = self.page.url or ""
+            if _curr_url == _prev_url:
+                break   # URL stopped changing — SPA routing complete
+            _prev_url = _curr_url
+
         # Profile-first: reuse the saved session. If the login DOM appears
         # (fresh profile or expired session), ensure_authenticated() logs in.
         await self.ensure_authenticated()

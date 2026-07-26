@@ -144,15 +144,22 @@ class BaseAIChatScraper(ABC):
         """Return the profile directory.
 
         Priority (new email+password mode first, then legacy cookie-file mode):
-          1. account name  → profiles/<account>/
-          2. cookie_file   → profiles/<cookie_stem>/   (legacy)
-          3. fallback      → profiles/<default_profile>/
+          1. account name  → profiles/qwen/<account>/
+          2. cookie_file   → profiles/qwen/<cookie_stem>/   (legacy)
+          3. fallback      → profiles/qwen/<default_profile>/
+
+        Profiles are stored under profiles/qwen/ to avoid collision with the
+        DeepSeek backend which uses profiles/deepseek/<account>/. Both backends
+        may share the same account name (e.g. 'account1') and previously wrote
+        to the same profiles/ root, causing Chrome SingletonLock conflicts when
+        both workers ran simultaneously.
         """
+        base = PROFILES_DIR / "qwen"
         if account:
-            return PROFILES_DIR / account
+            return base / account
         if cookie_file:
-            return PROFILES_DIR / cookie_file.stem
-        return PROFILES_DIR / PERSISTENT_CONTEXT_CONFIG["default_profile"]
+            return base / cookie_file.stem
+        return base / PERSISTENT_CONTEXT_CONFIG["default_profile"]
 
     def _profile_seeded(self, profile_dir: Path) -> bool:
         """
