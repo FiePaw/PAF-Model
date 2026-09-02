@@ -5,6 +5,125 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — 2026-09-03 (sesi 4)
+
+### Fix — DeepSeek scraper menangkap output "Thought for N seconds" / partial-stream sebagai jawaban final (5 lapis bug berantai)
+
+**File:** `scrapers/base_deepseek.py`
+**Dipicu oleh:** Screenshot + log worker menunjukkan scraper berulang kali gagal
+validasi JSON (`JSON parse error: Expecting value: line 1 column 1 (char 0)`) dan
+melakukan corrective-retry berulang, kadang berujung proses "stuck" tanpa respons
+sama sekali. Investigasi dilakukan bertahap — setiap fix menutup satu jalur
+kegagalan sekaligus membuka gejala baru, sampai akhirnya seluruh rantai tertutup.
+
+Semua fix di bawah ini berada di `BaseAIChatScraper._get_last_response_text()`
+dan `BaseAIChatScraper.wait_for_response()`.
+
+#### Root Cause (lapis 1) — thought-block ikut terbaca sebagai respons
+
+DeepSeek merender bullet chain-of-thought pada panel **"Thought for N seconds"**
+(mode DeepThink/Expert) dengan class DOM (`div.ds-markdown`) yang **sama** dengan
+elemen jawaban final. Selama model masih "thinking", elemen jawaban final belum
+ada di DOM — `_get_last_response_text()` yang naif mengambil elemen `div.ds-markdown`
+**terakhir** di DOM sehingga menangkap baris reasoning, bukan jawaban sesungguhnya.
+Teks reasoning ini bukan JSON valid → corrective-retry loop.
+
+```
+Sebelum: ambil div.ds-markdown TERAKHIR di DOM, apa pun isinya         ❌
+Sesudah: skip elemen yang berada di dalam blok "Thought for N seconds",
+         kembalikan "" jika SEMUA kandidat masih di dalam blok thought  ✅
+```
+
+Deteksi blok thought dipakai lewat heuristik teks header produk yang selalu
+Inggris ("Thought for N seconds…") — bukan class minified yang memang sudah
+ditandai "WILL change between builds" di `config/deepseek.py` — dicek pada
+`firstElementChild` tiap ancestor (dibatasi panjang teks, bukan `textContent`
+penuh) supaya tidak salah tangkap container gabungan thought+jawaban-final,
+dengan batas kedalaman ancestor 25 level sebagai margin aman untuk DOM nyata.
+
+#### Root Cause (lapis 2) — timeout tetap trigger retry walau masih "Thinking"
+
+Setelah lapis 1 diperbaiki, `wait_for_response()` benar mengembalikan `""` selama
+masih thinking — tapi fungsi ini punya **hard timeout 60 detik** (`response_wait`)
+tanpa mengecek apakah model masih aktif memproses. DeepThink + web-search dengan
+banyak ronde pencarian bisa berjalan >60 detik secara legitimate. Saat deadline
+tercapai padahal model masih "Thinking", kode langsung menganggap gagal dan
+mengirim **corrective prompt** — yang justru **memutus/menginterupsi** proses
+"Thought for N seconds" yang sedang berjalan di browser, memicu retry-loop.
+
+```
+Sebelum: deadline 60s tercapai → langsung timeout → kirim corrective prompt
+         (memutus generation yang masih berjalan)                      ❌
+Sesudah: deadline tercapai → cek _is_generating() (stop-button /
+         loading-indicator / thought-panel tanpa jawaban) → jika masih
+         aktif, perpanjang deadline alih-alih menyerah                 ✅
+```
+
+#### Root Cause (lapis 3) — deadline diperpanjang tanpa batas saat benar-benar macet
+
+Fix lapis 2 menimbulkan gejala baru: log menunjukkan teks reasoning beku
+**persis sama** selama 4+ menit sementara `_is_generating()` terus melaporkan
+"masih generating", sehingga deadline diperpanjang berkali-kali menuju
+`hard_ceiling` (6x timeout) — dari sisi pengguna terlihat "stuck, tidak ada
+respons". Sinyal "masih generating" hanya membuktikan indikator visible di
+DOM, bukan bukti ada progres nyata.
+
+```
+Sebelum: masih "generating" → perpanjang terus sampai hard_ceiling (~6 menit) ❌
+Sesudah: tambahkan stall watchdog — jika teks BENAR-BENAR tidak berubah
+         > max(timeout*1.5, 90s), anggap macet (frozen page / backend hang)
+         dan berhenti menunggu lebih cepat, sekaligus trigger dump
+         diagnostik + screenshot untuk debugging                         ✅
+```
+
+#### Root Cause (lapis 4) — jawaban final yang masih di-*stream* tertangkap belum lengkap
+
+Setelah "Thought for N seconds" selesai, DeepSeek men-*stream* jawaban
+kata-per-kata/chunk-per-chunk. Mekanisme stability check (`stability_polls=2`,
+`poll_interval=0.5s` → hanya butuh teks sama 1 detik) terlalu longgar: jeda
+sesaat antar-chunk streaming (mis. baru ketik `"The"` lalu pause) bisa dianggap
+"stabil" secara prematur, sehingga teks setengah-jadi lolos dan gagal validasi
+JSON → corrective retry dikirim **selagi jawaban asli masih di-stream**.
+
+```
+Sebelum: teks sama 1 detik (2 poll) → langsung diterima sebagai final    ❌
+         → menangkap "The" (3 karakter) sebagai jawaban lengkap
+Sesudah: sebelum menerima "STABLE", cek _is_generating() — jika masih
+         streaming, JANGAN terima, terus tunggu                          ✅
+```
+
+#### Root Cause (lapis 5) — sinyal `_is_generating()` false-positive permanen memblokir jawaban yang SUDAH selesai
+
+Fix lapis 4 mengekspos bahwa selector `stop_button` / `loading_indicator` di
+`config/deepseek.py` (yang memang belum pernah diverifikasi ke DOM asli, masih
+bertanda `# TODO: verify`) bisa melaporkan "masih generating" **selamanya**,
+bahkan untuk teks yang sudah 100% lengkap dan tidak berubah selama 18+ poll
+(~9 detik). Gate lapis 4 yang bersifat hard-block membuat respons yang sudah
+tuntas tertahan tanpa akhir.
+
+```
+Sebelum: _is_generating()==True → tunggu terus tanpa batas waktu          ❌
+Sesudah: _is_generating() jadi sinyal ADVISORY dengan grace period
+         terbatas (~5 detik) — jika teks diam > grace period, terima
+         apa pun kata sinyal tersebut (anggap basi/tidak reliabel)        ✅
+```
+
+#### Test
+
+Ditambahkan 5 skrip verifikasi standalone (semua lolos, tidak saling konflik):
+`test_thought_fix.py`, `test_deadline_extension.py`, `test_stall_watchdog.py`,
+`test_streaming_gate.py`, `test_stuck_signal_regression.py`.
+
+**Catatan lanjutan:** Selector `stop_button` / `loading_indicator` di
+`config/deepseek.py` masih belum terverifikasi terhadap DOM live DeepSeek
+(diberi `# TODO: verify` sejak awal). Fix lapis 5 membuat sistem tahan
+terhadap kesalahan selector tersebut lewat grace period, tapi bila selector
+yang benar berhasil diverifikasi manual (mis. lewat DevTools saat model
+sedang "Thinking"), deteksi `_is_generating()` bisa dibuat presisi tanpa
+bergantung pada grace period sebagai pengaman.
+
+---
+
 ## [Unreleased] — 2026-07-26 (sesi 3)
 
 ### Fix — DeepSeek warmup masih diam di `/sign_in` (fix sesi 2 belum menutup celah)
@@ -426,4 +545,4 @@ Jika sebelumnya menggunakan cookie files (`cookies/account1.json`, dst.):
 
 ---
 
-*Terakhir diperbarui: 2026-07-26.*
+*Terakhir diperbarui: 2026-09-03.*

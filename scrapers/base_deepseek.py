@@ -87,6 +87,53 @@ def _count_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# --------------------------------------------------------------------------- #
+# Bug fix: "Thought for N seconds" (DeepThink chain-of-thought) exclusion.
+# --------------------------------------------------------------------------- #
+# DeepSeek renders its chain-of-thought bullets ("Thought for N seconds" panel)
+# using the SAME `div.ds-markdown` class as the final assistant answer. While
+# the model is still thinking (DeepThink / Expert mode, optionally + web
+# search), the final answer's markdown element does not exist in the DOM yet,
+# so a naive "take the last matching element" read grabs a thought bullet
+# instead of the real answer. That thought text isn't in the expected JSON
+# envelope, which then fails validation and triggers the corrective-retry
+# loop (see JSON response invalid warnings / retries).
+#
+# The thought panel's wrapper class is a minified per-build hash (confirmed
+# unstable — see config/deepseek.py comments), so we can't key off it
+# directly. Instead we key off the ALWAYS-ENGLISH, product-owned header text
+# "Thought for N seconds" that DeepSeek renders as the LEADING child of the
+# thought wrapper.
+#
+# IMPORTANT: we deliberately check each ancestor's FIRST-ELEMENT-CHILD text
+# (with a short length bound) instead of the ancestor's full/aggregated
+# ``textContent``. The thought block and the final answer are SIBLINGS under
+# a shared message-bubble container, and in DOM order the thought block comes
+# first — so the shared container's aggregated textContent ALSO starts with
+# "Thought for N seconds" (it just happens to contain the thought block's
+# text as its first characters, followed by the final answer's text). A
+# naive prefix-check on aggregated ancestor text would therefore misfire on
+# the final answer too. Bounding the check to a short leading-child snippet
+# reliably identifies only the actual thought-header element itself.
+_IS_INSIDE_THOUGHT_JS = """
+el => {
+    let node = el.parentElement;
+    for (let i = 0; i < 25 && node; i++) {
+        const first = node.firstElementChild;
+        if (first) {
+            const t = (first.textContent || '').trim();
+            if (t.length > 0 && t.length <= 60 &&
+                (/^Thought for\\s+\\d+/i.test(t) || /^Thinking\\b/i.test(t))) {
+                return true;
+            }
+        }
+        node = node.parentElement;
+    }
+    return false;
+}
+"""
+
+
 class BaseAIChatScraper(ABC):
     """Abstract base for browser-automation chat scrapers."""
 
@@ -377,8 +424,20 @@ class BaseAIChatScraper(ABC):
           2. Unscoped div.ds-markdown fallback (short conversations).
           3. Any element with ds-markdown class fragment.
 
+        Bug fix: DeepSeek renders its "Thought for N seconds" chain-of-thought
+        bullets with the SAME class as the final answer. Simply taking the
+        LAST matching element would grab a thought bullet while the model is
+        still thinking (the real answer element doesn't exist yet). To avoid
+        this, we walk backwards from the last match and skip any element that
+        lives inside a thought block (see ``_IS_INSIDE_THOUGHT_JS``). If every
+        match under a given selector turns out to be inside the thought
+        block, we report "" (still generating) instead of falling through to
+        a broader fallback selector that would just re-match the same
+        thought content.
+
         When _diagnostic=True, logs every selector's count for debugging.
-        Returns stripped inner text of last matching element, or "" if nothing found.
+        Returns stripped inner text of last non-thought matching element, or
+        "" if nothing found / the model is still thinking.
         """
         if self.page is None:
             return ""
@@ -389,13 +448,40 @@ class BaseAIChatScraper(ABC):
                 count = await loc.count()
                 if _diagnostic:
                     log.info("[DIAG] selector=%r count=%d", sel, count)
-                if count > 0:
-                    text = await loc.nth(count - 1).inner_text()
+                if count == 0:
+                    continue
+
+                for idx in range(count - 1, -1, -1):
+                    node = loc.nth(idx)
+                    try:
+                        inside_thought = await node.evaluate(_IS_INSIDE_THOUGHT_JS)
+                    except Exception:
+                        inside_thought = False
+                    if inside_thought:
+                        if _diagnostic:
+                            log.info(
+                                "[DIAG] selector=%r idx=%d skipped (inside "
+                                "'Thought for...' block)", sel, idx,
+                            )
+                        continue
+                    text = await node.inner_text()
                     if text and text.strip():
                         if _diagnostic:
-                            log.info("[DIAG] matched sel=%r text_len=%d preview=%r",
-                                     sel, len(text.strip()), text.strip()[:60])
+                            log.info("[DIAG] matched sel=%r idx=%d text_len=%d preview=%r",
+                                     sel, idx, len(text.strip()), text.strip()[:60])
                         return text.strip()
+
+                # Every match under this selector is inside the thought
+                # block \u2014 the model is still thinking and hasn't produced
+                # the final answer yet. Don't fall through to a broader
+                # fallback selector; it would just re-match the same thought
+                # content and reintroduce the bug.
+                if _diagnostic:
+                    log.info(
+                        "[DIAG] selector=%r: all %d match(es) are inside a "
+                        "thought block \u2014 still thinking", sel, count,
+                    )
+                return ""
             except Exception as exc:
                 if _diagnostic:
                     log.info("[DIAG] selector=%r exception=%s", sel, exc)
@@ -471,6 +557,77 @@ class BaseAIChatScraper(ABC):
         )
         return text
 
+    async def _is_generating(self) -> bool:
+        """
+        True while DeepSeek is actively generating (streaming text OR still
+        "Thinking"/running tools such as web search).
+
+        Bug fix: long DeepThink + web-search chains (multiple search/read
+        rounds — visible in the UI as a growing "Thought for N seconds"
+        panel) routinely run well past the fixed ``response_wait`` timeout.
+        Without this check, ``wait_for_response`` would time out mid-thought,
+        the caller would treat the empty/partial text as an invalid
+        response, and immediately send a corrective-retry prompt WHILE the
+        original answer was still being generated — cancelling/interrupting
+        it and causing an infinite retry loop (the exact "Thought for N
+        seconds terhenti dan looping" symptom).
+
+        Checks (any true -> still generating):
+          1. A visible stop-generation button (``stop_button`` selectors).
+          2. A visible loading/typing indicator (``loading_indicator``
+             selectors).
+          3. A "Thought for N seconds" panel is present but has not yet
+             produced a real (non-thought) answer element — i.e.
+             ``_get_last_response_text()`` currently returns "" because
+             every visible candidate is still inside the thought block.
+        """
+        if self.page is None:
+            return False
+
+        try:
+            from config import DEEPSEEK_CONFIG
+            sels = DEEPSEEK_CONFIG.get("selectors", {})
+        except Exception:
+            sels = {}
+
+        for sel in [*sels.get("stop_button", []), *sels.get("loading_indicator", [])]:
+            try:
+                loc = self.page.locator(sel).first
+                if await loc.count() and await loc.is_visible():
+                    return True
+            except Exception:
+                continue
+
+        # Fallback / primary signal for the DeepThink+web-search case: a
+        # thought panel exists but nothing outside it has rendered yet.
+        try:
+            thought_present = await self.page.evaluate(
+                """
+                () => {
+                    const divs = document.querySelectorAll('div');
+                    for (const d of divs) {
+                        const first = d.firstElementChild;
+                        if (!first) continue;
+                        const t = (first.textContent || '').trim();
+                        if (t.length > 0 && t.length <= 60 &&
+                            /^Thought for\\s+\\d+/i.test(t)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                """
+            )
+        except Exception:
+            thought_present = False
+
+        if thought_present:
+            current_text = await self._get_last_response_text()
+            if not current_text:
+                return True
+
+        return False
+
     async def wait_for_response(
         self,
         timeout: float,
@@ -507,6 +664,20 @@ class BaseAIChatScraper(ABC):
           • ``:last-of-type`` baseline mismatch
           • DOM restructuring between exchanges
 
+        DEADLINE EXTENSION (thought-interrupt bug fix):
+        ─────────────────────────────────────
+        ``_get_last_response_text()`` deliberately returns "" while the
+        model is still inside a "Thought for N seconds" block (see its
+        docstring) so thought content is never mistaken for the final
+        answer. That means a plain fixed timeout would fire mid-thought on
+        any DeepThink/web-search chain that runs longer than ``timeout``
+        seconds, even though the model is actively, successfully working.
+        Before giving up at the deadline we check ``_is_generating()``; if
+        the model is still visibly generating we extend the deadline by
+        another ``timeout`` window instead of bailing out — bounded by an
+        absolute ``hard_ceiling`` so a stuck/broken detector still can't
+        hang forever.
+
         ``initial_response_count`` and ``response_selectors`` are accepted
         for backward compatibility via **kwargs but are no longer used in the
         detection loop.  Pass ``response_selectors`` as a keyword argument at
@@ -514,18 +685,71 @@ class BaseAIChatScraper(ABC):
         until they are cleaned up.
         """
         deadline = time.monotonic() + timeout
+        # Absolute ceiling on deadline extensions granted for "still
+        # generating" — protects against a stuck/broken _is_generating()
+        # detector looping forever. 6x the configured timeout (or +300s,
+        # whichever is larger) comfortably covers multi-round web-search
+        # DeepThink chains while still bounding worst case.
+        hard_ceiling = time.monotonic() + max(timeout * 6, timeout + 300)
+        # STALL WATCHDOG (bug fix): "_is_generating() == True" only proves a
+        # stop-button/loading-indicator is visible — it says NOTHING about
+        # whether the model is actually making progress. A genuinely stuck
+        # page or a hung backend request (e.g. a web-search tool call that
+        # never returns) can leave that indicator visible indefinitely while
+        # the observed text never changes at all. Legitimate DeepThink /
+        # web-search chains update their "Thought for..." text every few
+        # seconds; text that is BYTE-IDENTICAL for `stall_timeout` seconds is
+        # not that — treat it as a stall and stop extending, instead of
+        # silently waiting all the way out to hard_ceiling (minutes) with no
+        # visible progress.
+        stall_timeout = max(timeout * 1.5, 90.0)
+        _last_seen_text: str | None = None
+        _last_change_at = time.monotonic()
         last_text = ""
         stable_count = 0
         _found_new = False
         _poll_count = 0
+        _extensions = 0
 
         log.info(
             "wait_for_response START: pre_send_text len=%d preview=%r",
             len(pre_send_text), pre_send_text[:60],
         )
 
-        while time.monotonic() < deadline:
+        while True:
+            if time.monotonic() >= deadline:
+                still_generating = False
+                try:
+                    still_generating = await self._is_generating()
+                except Exception:
+                    still_generating = False
+                stalled_for = time.monotonic() - _last_change_at
+                if still_generating and time.monotonic() < hard_ceiling and stalled_for <= stall_timeout:
+                    _extensions += 1
+                    deadline = min(time.monotonic() + timeout, hard_ceiling)
+                    log.info(
+                        "wait_for_response: deadline reached but model is "
+                        "still generating (thinking/streaming) — extending "
+                        "wait (extension #%d, new deadline in %.0fs, "
+                        "unchanged for %.0fs)",
+                        _extensions, deadline - time.monotonic(), stalled_for,
+                    )
+                elif still_generating and stalled_for > stall_timeout:
+                    log.warning(
+                        "wait_for_response: STALL detected — text has been "
+                        "unchanged for %.0fs despite still_generating=True "
+                        "(possible frozen page or hung backend request); "
+                        "giving up instead of extending further",
+                        stalled_for,
+                    )
+                    break
+                else:
+                    break
+
             current_text = await self._get_last_response_text()
+            if current_text != _last_seen_text:
+                _last_seen_text = current_text
+                _last_change_at = time.monotonic()
             _poll_count += 1
 
             # Log first few polls for visibility
@@ -555,11 +779,58 @@ class BaseAIChatScraper(ABC):
             if current_text == last_text:
                 stable_count += 1
                 if stable_count >= stability_polls:
-                    log.info(
-                        "wait_for_response: STABLE after %d polls (len=%d)",
-                        stable_count, len(current_text),
-                    )
-                    return current_text
+                    # Bug fix: DeepSeek streams the final answer token-by-
+                    # token / chunk-by-chunk. A brief pause between chunks
+                    # can make the text look "stable" for a couple of 0.5s
+                    # polls (e.g. current_text=="The", just the first word)
+                    # even though generation is still actively in progress —
+                    # accepting it here would return a half-formed response
+                    # that fails JSON validation and triggers a corrective
+                    # retry WHILE the real answer is still streaming. Before
+                    # accepting "stable" as "final", prefer to confirm the
+                    # page itself reports generation has actually stopped.
+                    #
+                    # IMPORTANT (regression fix): stop_button / loading_
+                    # indicator selectors are UNVERIFIED against the live
+                    # DOM (see config/deepseek.py TODOs) and have been
+                    # observed to report "still generating" indefinitely
+                    # even long after the text has genuinely finished and
+                    # stopped changing — which would otherwise block a
+                    # fully-complete response forever. Treat
+                    # ``_is_generating()`` as an advisory signal with a
+                    # bounded grace period, NOT a hard gate: once the text
+                    # has been unchanged for `stall_grace` seconds, accept
+                    # it regardless of what the (possibly unreliable)
+                    # generating-indicator says.
+                    elapsed_stable = stable_count * poll_interval
+                    stall_grace = max(stability_polls * poll_interval * 4, 5.0)
+                    try:
+                        still_streaming = await self._is_generating()
+                    except Exception:
+                        still_streaming = False
+                    if not still_streaming or elapsed_stable >= stall_grace:
+                        if still_streaming:
+                            log.warning(
+                                "wait_for_response: accepting text as final "
+                                "after %.1fs unchanged even though "
+                                "_is_generating() still reports True — grace "
+                                "period %.1fs exceeded, treating the signal "
+                                "as stale/unreliable (len=%d)",
+                                elapsed_stable, stall_grace, len(current_text),
+                            )
+                        else:
+                            log.info(
+                                "wait_for_response: STABLE after %d polls (len=%d)",
+                                stable_count, len(current_text),
+                            )
+                        return current_text
+                    else:
+                        log.info(
+                            "wait_for_response: text stable for %d polls "
+                            "(len=%d, %.1fs) but model is still streaming — "
+                            "NOT accepting yet (grace %.1fs), continuing to wait",
+                            stable_count, len(current_text), elapsed_stable, stall_grace,
+                        )
             else:
                 stable_count = 1
                 last_text = current_text
@@ -567,8 +838,9 @@ class BaseAIChatScraper(ABC):
             await asyncio.sleep(poll_interval)
 
         log.warning(
-            "wait_for_response timed out after %.0fs (found_new=%s, polls=%d, text_len=%d)",
-            timeout, _found_new, _poll_count, len(last_text),
+            "wait_for_response timed out after %.0fs (%d extension(s), "
+            "found_new=%s, polls=%d, text_len=%d)",
+            timeout, _extensions, _found_new, _poll_count, len(last_text),
         )
         # Run DOM diagnostic to identify why detection failed.
         await self._dump_dom_diagnostic()
