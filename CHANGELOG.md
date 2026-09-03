@@ -5,6 +5,142 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — 2026-09-03 (sesi 5)
+
+### Change — Session tidak lagi punya TTL otomatis; dihapus lewat API/console command secara eksplisit
+
+**File:** `public_deepseek.py`, `public_qwen.py`, `PublicForward/ForVPS/vps_server.py`,
+`API_USAGE.md`
+**Latar belakang:** Sebelumnya session (`X-Session-ID` → conversation_url +
+account pin) otomatis dihapus dari memory & disk setelah tidak dipakai
+selama `ttl` detik (default 3600s), lewat cek di `SessionStore.get()` +
+background loop tiap 60 detik. Tidak ada cara untuk menghapus session
+secara eksplisit lewat API — satu-satunya jalan adalah menunggu TTL habis.
+Perubahan ini mengganti model tersebut menjadi: **session hidup selamanya
+sampai dihapus secara eksplisit**, baik lewat API maupun command manual.
+
+#### 1. TTL otomatis dihapus total dari kedua backend
+
+`SessionStore.get()` (DeepSeek & Qwen) tidak lagi mengecek `is_expired()`
+dan menghapus session diam-diam saat diakses. `load_from_disk()` me-restore
+SEMUA file session di `dataSession/` tanpa syarat, tidak ada lagi yang
+di-skip sebagai "expired". Background loop (`_cleanup_loop` di DeepSeek,
+`_status_reporter` di Qwen) tidak lagi memanggil pembersihan session sama
+sekali — hanya membersihkan lock idle (housekeeping memory, tidak
+menyentuh data session).
+
+```
+Sebelum: get(sid) → cek is_expired(ttl) → auto-hapus jika lewat TTL   ❌
+         (juga terjadi otomatis tiap 60s lewat background loop)
+Sesudah: get(sid) → langsung return dari dict, TIDAK ADA pengecekan
+         umur sama sekali. Session hanya hilang lewat aksi eksplisit.  ✅
+```
+
+`cleanup_expired()` di kedua `SessionStore` diganti menjadi
+`cleanup_older_than(max_age=None)` — method yang sama, tapi sekarang
+HARUS dipanggil manual (tidak ada lagi yang memanggilnya otomatis di
+manapun). `cleanup_expired()` dipertahankan sebagai alias deprecated
+(memanggil `cleanup_older_than()` tanpa argumen) untuk backward-compat.
+
+#### 2. Command console manual "cleanup sessions" / "cleanupsessions"
+
+Karena TTL otomatis dihapus, operator butuh cara manual untuk membersihkan
+session yang sudah lama tidak dipakai (mencegah `dataSession/` tumbuh tanpa
+batas jika client tidak pernah memanggil delete). Ditambahkan:
+
+- **DeepSeek** (`public_deepseek.py`, console REPL lokal): perintah
+  `cleanup sessions [max_age_s]`. Tanpa argumen, pakai nilai `--session-ttl`
+  saat start worker sebagai default (nilai itu SEKARANG hanya default untuk
+  command manual ini, bukan lagi TTL otomatis).
+- **Qwen** (`public_qwen.py`, console REPL lokal): perintah
+  `cleanupsessions [max_age_s]` dengan semantik yang sama. Diperlukan
+  perubahan signature `_run_console_command(pool, line)` →
+  `_run_console_command(pool, worker, line)` agar command ini bisa
+  mengakses `worker.processor.sessions`.
+
+#### 3. Endpoint baru: `DELETE /v1/sessions/{session_id}`
+
+**File:** `PublicForward/ForVPS/vps_server.py`
+
+Session sesungguhnya hidup di WORKER (SessionStore per-worker), bukan di
+VPS — VPS hanya menyimpan hint routing (`_session_worker`) yang bisa basi
+(misal setelah worker restart). Karena itu, `WorkerManager.delete_session()`
+**broadcast** pesan `{"type":"delete_session","request_id","session_id"}`
+ke SEMUA worker yang terhubung (kedua backend), menunggu balasan
+`{"type":"session_deleted","request_id","found"}` dari masing-masing
+(future per-request + timeout 8s), lalu agregasi: `deleted = any(found)`.
+Hint `_session_worker[session_id]` juga langsung dihapus di VPS, apa pun
+hasilnya, supaya request berikutnya untuk `session_id` itu pasti dianggap
+baru (tidak coba pakai worker affinity yang basi).
+
+```bash
+curl -X DELETE http://VPS_HOST:PORT/v1/sessions/sess-421a9c7e1b2c3d4f
+# -> {"session_id": "sess-421a9c7e1b2c3d4f", "deleted": true, "workers_checked": 1}
+```
+
+`deleted: false` BUKAN error (idempotent) — cuma berarti session tidak
+ditemukan di worker mana pun (sudah terhapus / tidak pernah ada / worker
+pemiliknya sedang offline). Tidak ada auth tambahan di endpoint ini,
+konsisten dengan endpoint REST lain di gateway ini (lihat `API_USAGE.md`
+§3) — belum ada pengecekan token client-facing di gateway ini sama sekali.
+
+Worker menerima pesan `delete_session` lewat message-loop WS yang sudah
+ada (tipe pesan baru, paralel dengan `"task"`/`"ping"`), dan membalas
+`session_deleted` setelah menghapus dari `SessionStore` (memory + disk).
+
+#### 4. Race condition saat DELETE bersamaan dengan task CONTINUE yang sedang berjalan
+
+**Masalah:** task `mode="continue"` yang sedang berjalan untuk session X,
+di akhir eksekusinya akan memanggil `session_store.update()` /
+`get_or_create()` untuk menyimpan `conversation_url` terbaru. Jika request
+`DELETE` untuk session X datang DI TENGAH task itu berjalan, delete bisa
+selesai lebih dulu, lalu task yang masih berjalan "menghidupkan kembali"
+session yang baru saja dihapus saat dia selesai dan menulis ulang.
+
+**Fix:** `_handle_delete_session()` (di kedua worker) mengambil **lock
+per-session yang sama** yang sudah dipakai untuk serialisasi task
+CONTINUE (`_get_session_lock(session_id)`) SEBELUM memanggil
+`session_store.delete()`. Ini memaksa delete menunggu task yang sedang
+berjalan untuk session tersebut selesai dulu (task itu akan menulis ulang
+session seperti biasa), baru kemudian delete benar-benar dieksekusi —
+sehingga hasil akhirnya selalu terhapus, tidak pernah "dihidupkan kembali"
+oleh task yang tumpang tindih.
+
+```
+Sebelum: DELETE bisa balapan dengan task CONTINUE yang masih menulis ulang
+         session → session bisa "hidup lagi" setelah dihapus            ❌
+Sesudah: DELETE menunggu lock per-session yang sama dipakai task
+         CONTINUE → dijamin urut, tidak ada resurrection               ✅
+```
+
+#### 5. Dokumentasi: `API_USAGE.md`
+
+Bagian §6.2 (session continuity) mendapat sub-bagian baru **§6.2.1 "Sessions
+have NO automatic TTL — you manage their lifetime"** yang menjelaskan:
+- Session hidup selamanya sampai dihapus eksplisit.
+- Cara implementasi TTL versi client sendiri: simpan timestamp `last_used`
+  per `session_id` di sisi klien, panggil `DELETE /v1/sessions/{id}` sendiri
+  begitu dianggap basi (atau cukup berhenti memakai ulang `X-Session-ID`
+  itu — turn berikutnya otomatis jadi percakapan baru).
+- Endpoint `DELETE /v1/sessions/{session_id}` didaftarkan di §4.5 (daftar
+  endpoint) dan tabel otentikasi di §3 diperbarui untuk menyertakannya.
+
+#### Test
+
+Ditambahkan `tests/test_delete_session_e2e.py` — uji e2e nyata (uvicorn +
+websockets worker asli, pola sama dengan `tests/test_http_e2e.py`):
+tidak ada worker terhubung, worker terhubung tapi session tidak dikenal,
+worker menemukan & menghapus session (dan memverifikasi hint
+`_session_worker` ikut terhapus), serta delete berulang (idempoten). Semua
+skenario lolos.
+
+**Catatan:** `tests/test_http_e2e.py` ditemukan hang di sandbox ini —
+dikonfirmasi lewat `git stash` bahwa ini adalah masalah environment yang
+SUDAH ADA SEBELUM sesi ini (terjadi juga pada `vps_server.py` versi asli,
+tidak disebabkan oleh perubahan sesi ini).
+
+---
+
 ## [Unreleased] — 2026-09-03 (sesi 4)
 
 ### Fix — DeepSeek scraper menangkap output "Thought for N seconds" / partial-stream sebagai jawaban final (5 lapis bug berantai)

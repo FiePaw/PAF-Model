@@ -138,24 +138,22 @@ class SessionStore:
 
     def load_from_disk(self) -> int:
         """
-        Load semua session dari disk ke memory saat startup.
-        Session yang sudah expired langsung dihapus dari disk.
+        Load SEMUA session dari disk ke memory saat startup.
+
+        Perubahan desain: session tidak lagi punya TTL otomatis. Setiap
+        file session yang ditemukan di disk di-restore tanpa syarat --
+        tidak ada lagi yang otomatis dianggap "expired" dan dihapus di
+        sini. Session hanya hilang lewat delete() eksplisit
+        (DELETE /v1/sessions/{id} di VPS) atau command console manual
+        "cleanupsessions [max_age_s]" (cleanup_older_than()).
         Return: jumlah session yang berhasil di-restore.
         """
-        now = time.time()
         restored = 0
-        expired_files = []
 
         for path in self.store_dir.glob("*.json"):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 s = self._from_dict(data)
-
-                if now - s.last_used > self.ttl:
-                    # Session sudah expired — hapus file
-                    expired_files.append(path)
-                    continue
-
                 self._sessions[s.session_id] = s
                 restored += 1
                 logger.debug(
@@ -167,22 +165,13 @@ class SessionStore:
             except Exception as e:
                 logger.warning("SessionStore: gagal baca file session %s: %s", path.name, e)
 
-        for path in expired_files:
-            try:
-                path.unlink()
-            except Exception:
-                pass
-
         if restored:
             logger.info(
-                "SessionStore: %d session di-restore dari disk (%d expired dihapus)",
-                restored, len(expired_files),
+                "SessionStore: %d session di-restore dari disk (tanpa TTL -- semua dipertahankan)",
+                restored,
             )
         else:
-            logger.info(
-                "SessionStore: tidak ada session aktif di disk (%d expired dihapus)",
-                len(expired_files),
-            )
+            logger.info("SessionStore: tidak ada session di disk")
 
         return restored
 
@@ -197,15 +186,17 @@ class SessionStore:
             return session
 
     async def get(self, session_id: str) -> Session | None:
+        """Return the Session, or None jika tidak ada (atau sudah dihapus).
+
+        Perubahan desain: session TIDAK PUNYA TTL otomatis lagi -- session
+        hanya absen di sini karena memang belum pernah dibuat atau sudah
+        dihapus eksplisit lewat delete() / cleanup_older_than(). Caller
+        dengan mode="continue" untuk session_id yang tidak ada otomatis
+        fallback ke mode="new" (lihat TaskProcessor.process()), yang
+        memang perilaku yang diinginkan untuk session_id yang terhapus.
+        """
         async with self._lock:
-            s = self._sessions.get(session_id)
-            if s is None:
-                return None
-            if time.time() - s.last_used > self.ttl:
-                del self._sessions[session_id]
-                self._delete_from_disk(session_id)
-                return None
-            return s
+            return self._sessions.get(session_id)
 
     async def get_or_create(self, session_id: str | None, account_name: str) -> Session:
         if session_id:
@@ -220,16 +211,51 @@ class SessionStore:
             self._sessions[s.session_id] = s
             self._save_to_disk(s)
 
-    async def cleanup_expired(self) -> int:
-        """Hapus semua session expired dari memory dan disk. Return jumlah yang dihapus."""
+    async def delete(self, session_id: str) -> bool:
+        """Hapus satu session secara eksplisit (memory + disk).
+
+        Dipakai oleh path DELETE /v1/sessions/{session_id} (diteruskan VPS
+        sebagai pesan "delete_session") dan oleh cleanup manual.
+        Return True jika session memang ada dan berhasil dihapus.
+        """
+        async with self._lock:
+            existed = self._sessions.pop(session_id, None) is not None
+            self._delete_from_disk(session_id)
+            if existed:
+                logger.info("SessionStore: session %s dihapus", session_id[:8])
+            return existed
+
+    async def cleanup_older_than(self, max_age: float | None = None) -> int:
+        """Hapus manual semua session yang tidak dipakai lebih dari `max_age` detik.
+
+        Perubahan desain: session tidak lagi expired otomatis. Ini sekarang
+        tindakan EKSPLISIT yang harus dipicu operator -- lewat command
+        console "cleanupsessions [max_age_s]". Jika `max_age` tidak
+        diisi, pakai nilai --session-ttl saat start worker (disimpan hanya
+        sebagai default yang nyaman untuk command manual ini, BUKAN untuk
+        expiry otomatis).
+        Return jumlah session yang dihapus.
+        """
+        age = self.ttl if max_age is None else max_age
         async with self._lock:
             now = time.time()
-            expired = [sid for sid, s in self._sessions.items()
-                       if now - s.last_used > self.ttl]
-            for sid in expired:
+            old = [sid for sid, s in self._sessions.items()
+                   if now - s.last_used > age]
+            for sid in old:
                 del self._sessions[sid]
                 self._delete_from_disk(sid)
-            return len(expired)
+            if old:
+                logger.info(
+                    "SessionStore: %d session dibersihkan manual (usia > %.0fs)",
+                    len(old), age,
+                )
+            return len(old)
+
+    async def cleanup_expired(self) -> int:
+        """Alias deprecated untuk cleanup_older_than() -- dipertahankan untuk
+        backward compat. Tidak lagi dipanggil otomatis di manapun di
+        codebase ini (session tidak punya TTL)."""
+        return await self.cleanup_older_than()
 
 
 
@@ -686,6 +712,44 @@ class LocalWorker:
             return f"{self.vps_url}{sep}token={self.token}"
         return self.vps_url
 
+    async def _handle_delete_session(self, ws, msg: dict) -> None:
+        """
+        Tangani request "delete_session" yang diteruskan VPS (dipicu client
+        yang memanggil DELETE /v1/sessions/{session_id}).
+
+        Fix race condition: pakai lock per-session YANG SAMA dengan yang
+        dipakai untuk serialisasi task mode CONTINUE, sebelum menghapus.
+        Tanpa ini, task yang sedang berjalan untuk session_id ini bisa
+        selesai SETELAH delete dan memanggil sessions.update(), yang diam-
+        diam menghidupkan kembali session yang baru saja dihapus.
+        """
+        request_id = msg.get("request_id")
+        session_id = msg.get("session_id")
+        found = False
+        try:
+            if session_id:
+                lock = await self.processor._get_session_lock(session_id)
+                async with lock:
+                    found = await self.processor.sessions.delete(session_id)
+            logger.info(
+                "Worker#%s [%s] DELETE SESSION session=%s found=%s",
+                self._label, request_id, (session_id or "")[:8] or "-", found,
+            )
+        except Exception as e:
+            logger.error(
+                "Worker#%s [%s] DELETE SESSION error: %s",
+                self._label, request_id, e, exc_info=True,
+            )
+        try:
+            await ws.send(json.dumps({
+                "type": "session_deleted",
+                "request_id": request_id,
+                "session_id": session_id,
+                "found": found,
+            }))
+        except Exception as e:
+            logger.warning("Worker#%s Gagal kirim session_deleted ke VPS: %s", self._label, e)
+
     async def _handle_task(self, ws, request_id: str, payload: dict) -> None:
         logger.info("Worker#%s ▶ Request [%s]", self._label, request_id[:8])
 
@@ -960,7 +1024,14 @@ class LocalWorker:
                 break
 
     async def _status_reporter(self) -> None:
-        """Log status pool setiap 60 detik."""
+        """Log status pool setiap 60 detik.
+
+        Perubahan desain: TIDAK LAGI auto-cleanup session di sini. Session
+        tidak punya TTL otomatis -- penghapusan sekarang hanya lewat
+        command console "cleanupsessions [max_age_s]" atau
+        DELETE /v1/sessions/{session_id} di API. Loop ini hanya membersihkan
+        lock idle (housekeeping memory, tidak menyentuh data session).
+        """
         while self._running:
             await asyncio.sleep(60)
             try:
@@ -969,10 +1040,6 @@ class LocalWorker:
                     "Pool status: total=%d idle=%d busy=%d dead=%d starting=%d",
                     s["total"], s["idle"], s["busy"], s["dead"], s["starting"],
                 )
-                # Cleanup expired sessions dan locks secara berkala
-                cleaned = await self.processor.sessions.cleanup_expired()
-                if cleaned:
-                    logger.debug("Cleaned %d expired session(s)", cleaned)
                 await self.processor._cleanup_session_locks()
             except Exception:
                 pass
@@ -1020,6 +1087,9 @@ class LocalWorker:
                         )
                         # Non-blocking: task jalan paralel di background
                         asyncio.create_task(self._handle_task(ws, request_id, payload))
+
+                    elif msg_type == "delete_session":
+                        asyncio.create_task(self._handle_delete_session(ws, msg))
 
                     elif msg_type == "pong":
                         logger.debug("Worker#%s Pong dari VPS", self._label)
@@ -1081,12 +1151,17 @@ CONSOLE_HELP = """
 ║                           no-headless (browser visible)  ║
 ║  showheadlessstop         Kembalikan semua no-headless   ║
 ║                           ke mode headless normal        ║
+║  cleanupsessions [max_age_s]                             ║
+║                    Hapus manual session yang             ║
+║                    tidak dipakai > max_age_s detik       ║
+║                    (default: --session-ttl; TIDAK        ║
+║                    ada TTL otomatis lagi)                ║
 ║  help                     Tampilkan bantuan ini          ║
 ╚══════════════════════════════════════════════════════════╝
 """
 
 
-async def _run_console_command(pool: "BrowserPool", line: str) -> None:
+async def _run_console_command(pool: "BrowserPool", worker: "LocalWorker", line: str) -> None:
     """
     Parse dan eksekusi satu baris perintah console langsung ke BrowserPool.
     Output dicetak ke stdout agar mudah dibaca di console.
@@ -1156,6 +1231,22 @@ async def _run_console_command(pool: "BrowserPool", line: str) -> None:
             print(f"  Skipped   : {', '.join(result['skipped'])} (sedang busy)")
         print()
 
+    # ── cleanupsessions [max_age_s] ─────────────────────────────
+    elif cmd == "cleanupsessions":
+        max_age = None
+        if len(parts) >= 2:
+            try:
+                max_age = float(parts[1])
+            except ValueError:
+                print(f"\n  max_age_s tidak valid: {parts[1]!r} (harus angka)\n")
+                return
+        removed = await worker.processor.sessions.cleanup_older_than(max_age)
+        effective_age = worker.processor.sessions.ttl if max_age is None else max_age
+        print(
+            f"\n  Cleanup: {removed} session dihapus (tidak dipakai > "
+            f"{effective_age:.0f}s)\n"
+        )
+
     # ── help ──────────────────────────────────────────────────────────────────
     elif cmd in ("help", "?"):
         print(CONSOLE_HELP)
@@ -1183,7 +1274,7 @@ async def _console_loop(pool: "BrowserPool", worker: "LocalWorker") -> None:
             continue
 
         try:
-            await _run_console_command(pool, line)
+            await _run_console_command(pool, worker, line)
         except Exception as e:
             print(f"\n  Error saat menjalankan perintah: {e}\n")
 

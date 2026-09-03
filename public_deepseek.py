@@ -7,8 +7,8 @@ pre-warmed BrowserPool. Connects to the VPS over WebSocket, receives tasks,
 runs them through the pool, and streams results back. Auto-reconnects.
 
 NEW FEATURES:
-  1. Session persistence (disk) via SessionStore  [upgraded: TTL, account pin,
-     load_from_disk, cleanup_expired, bump_turn]
+  1. Session persistence (disk) via SessionStore  [account pin, load_from_disk,
+     delete()/cleanup_older_than() -- NO automatic TTL, manual only, bump_turn]
   2. CONTINUE: navigate to conversation URL + skip-goto optimisation
   3. Per-session lock (anti-collision CONTINUE) + lock TTL cleanup
   4. preferred_account routing — CONTINUE forces same account as Turn 1
@@ -91,10 +91,11 @@ class SessionStore:
     Persistent session store for CONTINUE mode.
 
     Each session is a JSON file under dataSession/<session_id>.json.
-    Sessions expire after `ttl` seconds of inactivity and are removed from
-    both memory and disk on next access or explicit cleanup_expired().
-    On startup, load_from_disk() restores all non-expired sessions so that
-    conversations survive a worker restart.
+    Sessions have NO automatic TTL/expiry -- they live indefinitely until
+    explicitly removed via delete() (DELETE /v1/sessions/{id} on the VPS
+    API) or the manual "cleanup sessions [max_age_s]" console command
+    (cleanup_older_than()). On startup, load_from_disk() restores every
+    session found on disk so that conversations survive a worker restart.
     """
 
     def __init__(
@@ -152,20 +153,20 @@ class SessionStore:
     # ------------------------------------------------------------------ #
     def load_from_disk(self) -> int:
         """
-        Load all non-expired sessions from disk into memory on startup.
-        Expired files are deleted immediately.
+        Load ALL persisted sessions from disk into memory on startup.
+
+        Design change: sessions no longer have an automatic TTL. Every
+        session file found on disk is restored unconditionally -- nothing
+        is silently dropped as "expired". Sessions only go away when
+        explicitly removed via delete() (DELETE /v1/sessions/{id}) or the
+        manual cleanup_older_than() console command.
         Returns the number of sessions restored.
         """
         restored = 0
-        removed  = 0
         for path in self.storage_dir.glob("*.json"):
             try:
                 d = json.loads(path.read_text(encoding="utf-8"))
                 s = self._from_dict(d)
-                if s.is_expired(self.ttl):
-                    path.unlink(missing_ok=True)
-                    removed += 1
-                    continue
                 self._sessions[s.session_id] = s
                 restored += 1
                 log.debug(
@@ -176,9 +177,9 @@ class SessionStore:
             except Exception as exc:
                 log.warning("SessionStore: failed to read %s: %s", path.name, exc)
         if restored:
-            log.info("SessionStore: restored %d session(s) (%d expired removed)", restored, removed)
+            log.info("SessionStore: restored %d session(s) from disk (no TTL -- all kept)", restored)
         else:
-            log.debug("SessionStore: no active sessions on disk (%d expired removed)", removed)
+            log.debug("SessionStore: no sessions found on disk")
         return restored
 
     # ------------------------------------------------------------------ #
@@ -196,16 +197,16 @@ class SessionStore:
         return s
 
     def get(self, session_id: str) -> Optional[Session]:
-        """Return the Session, or None if absent / expired (auto-deletes on expiry)."""
-        s = self._sessions.get(session_id)
-        if s is None:
-            return None
-        if s.is_expired(self.ttl):
-            del self._sessions[session_id]
-            self._delete_from_disk(session_id)
-            log.info("SessionStore: session %s expired — deleted", session_id[:8])
-            return None
-        return s
+        """Return the Session, or None if it doesn't exist (or was deleted).
+
+        Design change: sessions have NO automatic TTL anymore -- a session
+        is only ever absent here because it was never created or was
+        explicitly removed via delete() / cleanup_older_than(). A caller
+        requesting mode="continue" for a missing session_id naturally falls
+        back to mode="new" (see _execute_task), which is exactly the
+        desired behaviour for a deleted/unknown session_id.
+        """
+        return self._sessions.get(session_id)
 
     def get_or_create(
         self,
@@ -233,17 +234,46 @@ class SessionStore:
     def all_sessions(self) -> list[Session]:
         return list(self._sessions.values())
 
-    def cleanup_expired(self) -> int:
-        """Remove all expired sessions from memory and disk. Returns count removed."""
-        expired = [
-            sid for sid, s in self._sessions.items() if s.is_expired(self.ttl)
+    def delete(self, session_id: str) -> bool:
+        """Explicitly remove one session (memory + disk).
+
+        Used by the DELETE /v1/sessions/{session_id} API path (forwarded by
+        the VPS as a "delete_session" message) and by manual cleanup.
+        Returns True if the session existed and was removed.
+        """
+        existed = self._sessions.pop(session_id, None) is not None
+        self._delete_from_disk(session_id)
+        if existed:
+            log.info("SessionStore: session %s deleted", session_id[:8])
+        return existed
+
+    def cleanup_older_than(self, max_age: Optional[float] = None) -> int:
+        """Manually remove every session unused for more than `max_age` seconds.
+
+        Design change: sessions no longer expire automatically. This is now
+        an EXPLICIT, operator-triggered action only -- invoked via the
+        worker console command ``cleanup sessions [max_age_seconds]``. When
+        `max_age` is omitted, falls back to the value passed via
+        --session-ttl at worker startup (kept only as a convenient default
+        for this manual command, not for any automatic expiry).
+        Returns the number of sessions removed.
+        """
+        age = self.ttl if max_age is None else max_age
+        old = [
+            sid for sid, s in self._sessions.items() if s.is_expired(age)
         ]
-        for sid in expired:
+        for sid in old:
             del self._sessions[sid]
             self._delete_from_disk(sid)
-        if expired:
-            log.debug("SessionStore: cleaned %d expired session(s)", len(expired))
-        return len(expired)
+        if old:
+            log.info("SessionStore: manually cleaned %d session(s) older than %.0fs", len(old), age)
+        return len(old)
+
+    def cleanup_expired(self) -> int:
+        """Deprecated alias for cleanup_older_than() -- kept for backward
+        compatibility with any external caller. No longer invoked
+        automatically anywhere in this codebase (sessions have no TTL)."""
+        return self.cleanup_older_than()
 
 
 # =========================================================================== #
@@ -360,6 +390,8 @@ class LocalWorker:
             mtype = msg.get("type")
             if mtype == "task":
                 asyncio.create_task(self._handle_task(ws, msg))
+            elif mtype == "delete_session":
+                asyncio.create_task(self._handle_delete_session(ws, msg))
             elif mtype == "ping":
                 await ws.send(json.dumps({"type": "pong", "worker_id": self.worker_id}))
 
@@ -376,13 +408,18 @@ class LocalWorker:
             pass
 
     async def _cleanup_loop(self) -> None:
-        """Background task: remove expired sessions and idle locks every 60 s."""
+        """Background task: remove idle per-session locks every 60 s.
+
+        Design change: sessions themselves are NO LONGER auto-cleaned here.
+        They have no TTL; removing them is now an explicit action only --
+        either via the console command ``cleanup sessions [max_age_seconds]``
+        or via the DELETE /v1/sessions/{session_id} API path. This loop only
+        garbage-collects idle asyncio.Lock objects (a memory-hygiene detail
+        unrelated to session data / conversation history).
+        """
         try:
             while not self._stop.is_set():
                 await asyncio.sleep(60)
-                cleaned = self.session_store.cleanup_expired()
-                if cleaned:
-                    log.debug("Cleanup: removed %d expired session(s)", cleaned)
                 await self._cleanup_session_locks()
         except asyncio.CancelledError:
             pass
@@ -410,6 +447,49 @@ class LocalWorker:
             del self._session_locks_meta[sid]
         if stale:
             log.debug("Cleaned %d idle session lock(s)", len(stale))
+
+    # ------------------------------------------------------------------ #
+    # Session deletion (DELETE /v1/sessions/{session_id} -- forwarded by VPS)
+    # ------------------------------------------------------------------ #
+    async def _handle_delete_session(self, ws, msg: dict) -> None:
+        """
+        Handle a "delete_session" request forwarded by the VPS (triggered by
+        a client calling DELETE /v1/sessions/{session_id}).
+
+        Race-condition fix: acquires the SAME per-session lock used to
+        serialise CONTINUE-mode task execution before deleting. Without
+        this, a task already in-flight for this session_id could finish
+        AFTER the delete and call session_store.update()/get_or_create(),
+        silently re-creating the session we just removed.
+        """
+        request_id = msg.get("request_id")
+        session_id = msg.get("session_id")
+        found = False
+        try:
+            if session_id:
+                lock = await self._get_session_lock(session_id)
+                async with lock:
+                    found = self.session_store.delete(session_id)
+            log.info(
+                "[%s] DELETE SESSION session=%s found=%s",
+                request_id, (session_id or "")[:8] or "-", found,
+            )
+        except Exception as exc:
+            log.error("[%s] DELETE SESSION error: %s", request_id, exc, exc_info=True)
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "session_deleted",
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "found": found,
+                        "worker_id": self.worker_id,
+                    }
+                )
+            )
+        except Exception as exc:
+            log.warning("[%s] Failed to send session_deleted reply: %s", request_id, exc)
 
     # ------------------------------------------------------------------ #
     # Task Handling
@@ -699,6 +779,10 @@ class LocalWorker:
         print("  add account NAME   - Add account runtime (auto-login)")
         print("  status             - Show pool status")
         print("  showheadless ACC   - Toggle headless for account")
+        print("  cleanup sessions [max_age_s] - Manually remove sessions unused")
+        print("                       for longer than max_age_s seconds (default:")
+        print("                       --session-ttl value). Sessions have NO")
+        print("                       automatic TTL anymore -- this is opt-in.")
         print("  quit               - Graceful shutdown")
         print("=" * 60 + "\n")
 
@@ -767,6 +851,22 @@ class LocalWorker:
         elif command == "showheadless" and len(parts) == 2:
             account_name = parts[1]
             await self._toggle_headless(account_name)
+
+        # cleanup sessions [max_age_seconds]
+        elif command == "cleanup" and len(parts) >= 2 and parts[1] == "sessions":
+            max_age: Optional[float] = None
+            if len(parts) == 3:
+                try:
+                    max_age = float(parts[2])
+                except ValueError:
+                    print(f"❌ Invalid max_age_s: {parts[2]!r} (expected a number)")
+                    return
+            removed = self.session_store.cleanup_older_than(max_age)
+            effective_age = self.session_store.ttl if max_age is None else max_age
+            print(
+                f"🧹 Cleanup: removed {removed} session(s) unused for "
+                f"more than {effective_age:.0f}s"
+            )
 
         # quit
         elif command == "quit":

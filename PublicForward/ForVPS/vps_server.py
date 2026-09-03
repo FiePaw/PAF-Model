@@ -215,6 +215,7 @@ class WorkerManager:
         self.workers: dict[str, WorkerEntry] = {}
         self._futures: dict[str, asyncio.Future] = {}
         self._session_worker: dict[str, str] = {}
+        self._session_delete_futures: dict[str, asyncio.Future] = {}
         self._rr_index = 0
         self._lock = asyncio.Lock()
         self._worker_counter = 0
@@ -387,6 +388,80 @@ class WorkerManager:
             exc = HTTPException(status_code=status, detail=error_msg)
             self._futures[task_id].set_exception(exc)
 
+    # ----- Session deletion (DELETE /v1/sessions/{session_id}) ------- #
+    async def delete_session(self, session_id: str, timeout: float = 8.0) -> dict:
+        """Delete a session's server-side mapping across every connected worker.
+
+        The session's actual data (conversation_url, pinned account,
+        turn_count) lives on whichever WORKER handled it -- not on the VPS.
+        The VPS only keeps a routing-affinity hint (`_session_worker`) that
+        can go stale (e.g. after a worker restart), so rather than trusting
+        that hint we BROADCAST the delete request to every connected worker
+        (both backends) and let each one check its own SessionStore. This
+        is correct and cheap: at most one worker will ever actually have
+        the session_id, and checking is a fast in-memory dict lookup.
+
+        Also drops the (possibly stale) `_session_worker` routing entry so
+        the very next request for this session_id is guaranteed to be
+        treated as a fresh dispatch.
+        """
+        async with self._lock:
+            self._session_worker.pop(session_id, None)
+            targets = list(self.workers.items())
+
+        if not targets:
+            return {"session_id": session_id, "deleted": False, "workers_checked": 0}
+
+        request_ids: list[str] = []
+        futures: list[asyncio.Future] = []
+        for worker_id, worker in targets:
+            request_id = f"delsess-{uuid.uuid4().hex[:12]}"
+            future: asyncio.Future = asyncio.Future()
+            self._session_delete_futures[request_id] = future
+            request_ids.append(request_id)
+            futures.append(future)
+            try:
+                await worker.ws.send_json(
+                    {
+                        "type": "delete_session",
+                        "request_id": request_id,
+                        "session_id": session_id,
+                    }
+                )
+            except Exception as exc:
+                print(f"[vps] delete_session: failed to notify {worker_id}: {exc}")
+                if not future.done():
+                    future.set_result({"found": False})
+
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*futures, return_exceptions=True), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            results = []
+            for f in futures:
+                results.append(f.result() if f.done() and not f.cancelled() else {"found": False})
+        finally:
+            for rid in request_ids:
+                self._session_delete_futures.pop(rid, None)
+
+        found_any = any(
+            isinstance(r, dict) and r.get("found") for r in results
+        )
+        return {
+            "session_id": session_id,
+            "deleted": bool(found_any),
+            "workers_checked": len(targets),
+        }
+
+    async def handle_session_deleted(self, msg: dict) -> None:
+        """Resolve the pending future for a "session_deleted" reply."""
+        request_id = msg.get("request_id")
+        if request_id in self._session_delete_futures:
+            fut = self._session_delete_futures[request_id]
+            if not fut.done():
+                fut.set_result(msg)
+
     # ----- Feature 12: Worker stats ---------------------------------- #
     def get_stats(self) -> dict:
         """Get detailed worker statistics."""
@@ -508,6 +583,8 @@ async def worker_endpoint(ws: WebSocket):
                 await worker_mgr.handle_result(raw)
             elif mtype == "error":
                 await worker_mgr.handle_error(raw)
+            elif mtype == "session_deleted":
+                await worker_mgr.handle_session_deleted(raw)
             elif mtype == "update_accounts":
                 await worker_mgr.update_accounts(worker_id, raw.get("accounts", []))
             elif mtype == "ping":
@@ -582,6 +659,32 @@ async def list_models():
             }
         )
     return {"object": "list", "data": data}
+
+
+@app.delete("/v1/sessions/{session_id}")
+async def delete_session_endpoint(session_id: str):
+    """Delete a session's server-side conversation mapping.
+
+    Design change: sessions have NO automatic TTL/expiry anymore -- they
+    live indefinitely until explicitly deleted here. This call is
+    broadcast to every connected worker (both backends); whichever one
+    (if any) actually holds `session_id` removes it from its local
+    SessionStore (memory + disk).
+
+    After a successful delete, any subsequent request using this
+    `session_id` (via the X-Session-ID header) is treated as a brand-new
+    conversation -- the worker-side fallback that already exists for an
+    unknown/expired session_id (mode="continue" silently downgrades to
+    mode="new", surfaced via `x_meta.mode_fallback`) kicks in automatically.
+
+    Idempotent: deleting a session_id that doesn't exist (or was already
+    deleted) is not an error -- it simply reports `"deleted": false`.
+
+    Returns:
+        {"session_id": "...", "deleted": true|false, "workers_checked": N}
+    """
+    result = await worker_mgr.delete_session(session_id)
+    return JSONResponse(content=result)
 
 
 @app.post("/v1/chat/completions")

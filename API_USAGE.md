@@ -130,7 +130,13 @@ this before hard-coding a model id, especially per-account ids.
 ### 4.4 `POST /v1/chat/completions`
 The only endpoint that does real work. Details in §5–§7 below.
 
-### 4.5 `WS /ws/worker` (not for API clients)
+### 4.5 `DELETE /v1/sessions/{session_id}`
+Explicitly deletes a session's server-side conversation mapping. Sessions
+have no automatic TTL — this is the only way (besides an operator's manual
+worker-console cleanup command) to make the gateway forget one. Full
+details, response shape, and client-side TTL guidance in §6.2.1 below.
+
+### 4.6 `WS /ws/worker` (not for API clients)
 Internal protocol used by `public.py` workers to register and exchange tasks
 with the gateway. You do not call this as an API consumer — documented in
 `PublicForward/ForVPS/vps_server.py` / `public_deepseek.py` / `public_qwen.py`
@@ -233,10 +239,60 @@ This is the standard way to continue a conversation across multiple
      worker is currently registered).
 
 Body field `session_id` is accepted as a **fallback only** for clients that
-can't set headers — the header wins if both are present. There is no
-mechanism to end/delete a session explicitly via the API; sessions expire
-server-side per worker TTL settings (`--session-ttl` on `public.py`, not
-configurable via this REST API).
+can't set headers — the header wins if both are present.
+
+### 6.2.1 Sessions have NO automatic TTL — you manage their lifetime
+
+**Design change:** sessions no longer expire automatically. A session
+created via `X-Session-ID` lives **forever** (both in the worker's memory
+and on disk under `dataSession/`) until one of these happens:
+
+1. **You delete it explicitly** — `DELETE /v1/sessions/{session_id}` (new
+   endpoint, see below).
+2. **The operator runs a manual cleanup** on a worker's console:
+   `cleanup sessions [max_age_seconds]` (DeepSeek) /
+   `cleanupsessions [max_age_seconds]` (Qwen). This is opt-in and
+   operator-triggered only — nothing calls it automatically.
+
+If you want TTL-like behaviour (e.g. "forget this conversation after 1 hour
+of inactivity"), **implement it on the client side**:
+
+- Track your own `last_used` timestamp per `session_id` you hold.
+- When it exceeds whatever age you consider "stale", call
+  `DELETE /v1/sessions/{session_id}` yourself (or simply stop reusing that
+  `X-Session-ID` — nothing forces you to; the next call without it, or with
+  a session_id the server doesn't recognise, always starts a fresh
+  conversation, see below).
+- There's no server-side "TTL" setting exposed via this REST API on purpose:
+  every deployment/integration has different idle-conversation semantics,
+  so the gateway leaves that policy entirely up to the caller.
+
+#### `DELETE /v1/sessions/{session_id}`
+
+Deletes the server-side session → conversation mapping. The request is
+broadcast to every connected worker (both backends); whichever one (if
+any) actually holds that `session_id` removes it from its store.
+
+```bash
+curl -X DELETE http://<VPS_HOST>:<PORT>/v1/sessions/sess-421a9c7e1b2c3d4f
+```
+
+Response:
+```json
+{"session_id": "sess-421a9c7e1b2c3d4f", "deleted": true, "workers_checked": 1}
+```
+
+- `deleted: false` just means the session wasn't found anywhere (already
+  deleted, never existed, or the worker that held it is offline) — **not**
+  an error. The call is idempotent; deleting twice is harmless.
+- After a successful delete, sending that same `X-Session-ID` again on
+  `/v1/chat/completions` does **not** fail — it is automatically treated as
+  a brand-new conversation (`mode` silently falls back to `"new"`, surfaced
+  via `x_meta.mode_fallback: true`), exactly like it already does today for
+  any other unknown/never-seen `session_id`.
+- No auth is enforced on this endpoint, consistent with every other REST
+  endpoint on this gateway (see §2.4) — protect it at the network level if
+  that matters for your deployment.
 
 ### 6.3 Response headers
 
