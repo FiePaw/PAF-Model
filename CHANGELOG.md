@@ -5,6 +5,334 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — ChatGPT backend (major update)
+
+> **Full architecture + operational deep-dive:** see
+> **[`CHATGPT_BACKEND.md`](./CHATGPT_BACKEND.md)**. This section is the
+> chronological engineering log; the deep-dive doc is the organized
+> reference (structure, flows, testing, troubleshooting).
+
+**Index of entries below (newest first):**
+1. Feature — CDP attach ke Chrome asli yang sudah berjalan (workaround Turnstile terkuat)
+2. Feature — Dua jalur baru mengatasi Cloudflare Turnstile: driver Patchright + import cookies manual
+3. Fix — `_is_logged_in()` false positive saat login manual belum selesai (popup handling)
+4. Feature — `login_chatgpt.py`: helper login manual satu-kali
+5. Feature — `playwright-stealth` untuk mask fingerprint CDP controller
+6. Feature — Kontingensi Cloudflare Turnstile: opsi `channel="chrome"`
+7. Fix — Login ChatGPT salah klik "Continue with phone number" alih-alih "Continue"
+8. Fix — Tes gateway yang sudah usang disinkronkan ke API saat ini
+9. Feature — Backend ChatGPT ketiga (chat-only + code blocks + attachments) — initial implementation
+
+### Feature — CDP attach ke Chrome asli yang sudah berjalan (workaround Turnstile terkuat)
+
+**File baru:** `start_chatgpt_chrome.py`
+**File diubah:** `scrapers/base_chatgpt.py`, `config/chatgpt.py`, `.env.example`
+**Latar belakang:** Setelah seluruh jalur sebelumnya (stealth JS →
+`channel="chrome"` → patchright → login manual visible → import cookies),
+owner melaporkan Turnstile MUNCUL BAHKAN saat mengakses `chatgpt.com`
+biasa. Yang tersisa untuk dideteksi oleh Cloudflare adalah jejak
+otomasi level-proses yang ditanamkan saat browser DILUNCURKAN oleh
+Playwright/patchright (flag `--enable-automation` internal, argumen
+`--remote-debugging-pipe`, environment variable, dsb.) — hal yang tidak
+bisa dihilangkan dari sisi aplikasi.
+**Fix — CDP attach (mode `CHATGPT_CDP_ATTACH=1`):** alih-alih meluncurkan
+browser, worker/login helper sekarang bisa ATTACH ke Chrome asli yang
+SUDAH BERJALAN lewat `connect_over_cdp()`. Browser-nya adalah Chrome
+sungguhan yang memulai dirinya sendiri (di-start via
+`start_chatgpt_chrome.py --account account1`, yang meluncurkannya dengan
+persistent profile `profiles/chatgpt/<account>/` yang SAMA dengan yang
+dipakai worker + `--remote-debugging-port`) — jadi tidak ada fingerprint
+peluncuran otomasi yang pernah ada sejak awal. Playwright hanya membaca
+DOM / klik lewat koneksi CDP. Mode ini juga otomatis melewati injeksi
+stealth JS (browser sudah bersih; patch JS justru menambah artefak).
+`close_browser()` dalam mode ini hanya DISCONNECT — Chrome asli tetap
+berjalan (lifecycle-nya milik user, dihentikan via
+`start_chatgpt_chrome.py --account account1 --stop`).
+**Cara pakai:**
+```
+python start_chatgpt_chrome.py --account account1      # terminal 1 (login manual sekali)
+set CHATGPT_CDP_ATTACH=1                               # terminal 2 (Windows)
+python public.py --backend chatgpt --vps ws://... --token ...
+```
+**Verifikasi:** live test di sandbox — chromium asli di-start manual dengan
+`--remote-debugging-port`, lalu `ChatGPTScraper` dengan
+`CHATGPT_CDP_ATTACH=1` berhasil attach (`connect_over_cdp`), membaca
+halaman, dan disconnect bersih tanpa mematikan browser-nya. Semua test
+lain (driver, cookie-import, login-detection, popup-wait, continue-button,
+confirm-close, smoke, e2e, delete-session) tetap PASS.
+
+### Feature — Dua jalur baru mengatasi Cloudflare Turnstile: driver Patchright + import cookies manual
+
+**File baru:** `import_chatgpt_cookies.py`, `tests/_manual_driver_check.py`,
+`tests/_manual_cookie_import_check.py`
+**File diubah:** `scrapers/base_chatgpt.py`, `login_chatgpt.py`,
+`requirements.txt`, `.env.example`
+**Latar belakang:** Turnstile pada `auth.openai.com` muncul TERUS-menerus —
+bahkan di browser VISIBLE saat login manual. Ini berarti yang terdeteksi
+bukan stealth JS (yang sudah dipakai sejak versi sebelumnya), melainkan
+**controller CDP-nya sendiri**: vanilla Playwright meninggalkan jejak
+otomasi level-driver (`Runtime.enable` side effects, binding
+`getPlaywright`, dsb.) yang TIDAK bisa dihilangkan oleh patch JavaScript
+apapun — patch JS justru menambah artefak baru (getter non-native).
+**Fix 1 — Patchright (jalur utama):** `base_chatgpt.py` sekarang memilih
+driver Playwright-compatible via `_load_async_api()` + env
+`CHATGPT_BROWSER_DRIVER` (`auto` default = patchright jika terinstall,
+`playwright` untuk memaksa yang lama). [Patchright](https://github.com/Kaliiiiiiiiii-Virtual-Company/patchright)
+adalah fork Playwright yang di-patch DI LEVEL DRIVER untuk menghapus
+kebocoran CDP tadi — API-nya identik, jadi seluruh backend (scraper, pool,
+worker, login helper) memakainya tanpa perubahan kode. Saat driver
+patchright aktif, injeksi stealth JS otomatis di-skip (patch driver-level
+bisa rusak kalau ditumpuk patch JS). Bisa dikombinasikan dengan
+`CHATGPT_BROWSER_CHANNEL=chrome` untuk konfigurasi paling stealth.
+Cara pakai: `pip install patchright` + `python -m patchright install chromium`,
+lalu jalankan worker/login helper seperti biasa.
+**Fix 2 — Import cookies manual (jalur zero-automation):**
+`import_chatgpt_cookies.py` men-seed persistent profile dari cookies yang
+di-export MANUAL dari browser sehari-hari (ekstensi Cookie-Editor → Export
+JSON). Proses login sama sekali tidak menyentuh Playwright/CDP sehingga
+tidak ada yang bisa dideteksi Cloudflare. Script meng-inject cookies ke
+`profiles/chatgpt/<account>/` (pola yang sama dengan seeding cookie legacy
+Qwen, via `cookie_editor_json_to_playwright()`), verifikasi session benar
+valid (`_page_is_logged_in()`), menulis sentinel, dan selalu bertanya
+sebelum menutup browser. Pesan error actionable untuk semua bentuk export
+yang salah (header string, export saat belum login, file hilang).
+**Verifikasi:** test driver memastikan patchright ter-resolve dan seluruh
+alur stub (login-state check + persistent context) jalan di bawahnya; test
+cookie-import mencakup konversi Cookie-Editor (termasuk varian wrapper
+`{"cookies": [...]}`) dan pesan error yang jelas untuk export tidak valid.
+Semua test lain tetap PASS.
+
+### Fix — `_is_logged_in()` false positive saat login manual belum selesai
+
+**File:** `scrapers/base_chatgpt.py`, `login_chatgpt.py`,
+`tests/_manual_login_detection_check.py`, `tests/_manual_login_wait_check.py`
+**Bug (dilaporkan langsung dari `login_chatgpt.py`):** setelah menjalankan
+`login_chatgpt.py`, script langsung menandai "✅ Login detected" hanya ~9
+detik setelah browser terbuka — padahal user belum sempat menyelesaikan
+login sama sekali.
+**Root cause:** `_is_logged_in()` HANYA mengecek absennya tombol "Log in"
+di DOM. Itu benar untuk homepage ChatGPT yang sudah ter-render sepenuhnya,
+tapi jadi *false positive* pada halaman APAPUN yang belum/bukan app
+ChatGPT — halaman kosong/masih loading tepat setelah `page.goto()`, tab
+yang masih di tengah redirect, atau halaman interstitial Cloudflare di
+domain lain — karena semua itu juga "tidak punya tombol Log in" (bukan
+karena sudah login, tapi karena bukan halaman ChatGPT sama sekali / belum
+selesai render).
+**Fix (dua lapis):**
+1. `_is_logged_in()` sekarang mensyaratkan TIGA hal: (a) URL memuat
+   `chatgpt.com`, (b) tombol "Log in" tidak terlihat, DAN (c) konfirmasi
+   positif bahwa app shell benar-benar sudah render (`prompt_textarea` atau
+   `main_area` ada di DOM) — bukan sekadar absennya tombol Log in. Poin (c)
+   dipakai HANYA sebagai konfirmasi sekunder setelah poin (b) lolos, BUKAN
+   sebagai sinyal utama menggantikan absennya tombol Log in (tetap
+   konsisten dengan catatan desain: homepage logged-out juga menampilkan
+   input chat, jadi keberadaan input TIDAK BOLEH jadi satu-satunya sinyal).
+2. `login_chatgpt.wait_for_manual_login()` menambah debounce: butuh 2 poll
+   berturut-turut ber-hasil True sebelum dianggap sukses (pola "stability
+   check" yang sama dipakai `wait_for_response()` di tempat lain pada
+   codebase ini), sebagai lapisan pertahanan tambahan terhadap race
+   sesaat.
+**Verifikasi:** test HTML stub diperluas untuk menyajikan halaman via
+`page.route()` pada URL nyata `https://chatgpt.com/` (karena cek domain
+baru butuh URL asli, bukan `about:blank` dari `page.set_content()`), plus
+2 kasus regresi baru: halaman kosong/loading pada domain chatgpt.com HARUS
+tetap dianggap belum-login, dan halaman di luar domain chatgpt.com (mis.
+`about:blank`, mid-redirect) juga HARUS tetap dianggap belum-login.
+
+### Feature — `login_chatgpt.py`: helper login manual satu-kali (rekomendasi utama untuk Turnstile)
+
+**File baru:** `login_chatgpt.py`, `tests/_manual_login_wait_check.py`
+**Latar belakang:** Setelah `channel="chrome"` dan `playwright-stealth`
+tetap belum cukup mengatasi Cloudflare Turnstile untuk sebagian
+lingkungan/akun, jalan yang paling andal adalah menghindari flow login
+otomatis sama sekali untuk kasus yang terblokir: login **manual satu kali**
+di browser visible yang terikat ke persistent profile yang SAMA dengan
+yang dipakai worker/pool produksi.
+**Cara kerja:** `python login_chatgpt.py --account account1` membuka
+browser visible (headless=False) di `profiles/chatgpt/account1/`, lalu
+polling `_is_logged_in()` (fungsi yang sama dipakai di semua tempat lain di
+backend ini) sampai user selesai login secara manual (termasuk
+menyelesaikan checkbox Turnstile sendiri, mengisi email/password, klik
+"Continue with password"). Setelah terdeteksi login, sentinel
+`cookies_seeded` ditulis dan cookies di-backup (best-effort).
+**Mengapa ini menghilangkan masalah Turnstile untuk run berikutnya:**
+`ChatGPTScraper.ensure_authenticated()` SELALU mengecek `_is_logged_in()`
+LEBIH DULU sebelum pernah memanggil `login()` — jika profile sudah berisi
+session valid (dari login manual ini), worker headless berikutnya tidak
+pernah menyentuh flow login otomatis sama sekali, sehingga tidak pernah
+lagi mengunjungi halaman yang di-challenge Cloudflare.
+**Catatan:** akun tetap harus terdaftar namanya di
+`cookies/authchatgpt.json` (email/password boleh dikosongkan) agar
+`BrowserPool` tahu harus membuat slot untuk akun tersebut — kredensial di
+file itu hanya jadi fallback bila session manual ini nanti expired.
+
+### Feature — `playwright-stealth` untuk mask fingerprint CDP controller (bukan cuma UA/headless)
+
+**File:** `scrapers/base_chatgpt.py`, `requirements.txt`
+**Latar belakang:** Setelah kontingensi `channel="chrome"` diaktifkan, owner
+melaporkan Cloudflare Turnstile **masih** muncul di `auth.openai.com`
+meski IP reputasinya bersih dan browser sudah Chrome asli. Root cause:
+Cloudflare tidak hanya mengecek User-Agent/headless — ia mendeteksi
+**Playwright/CDP sebagai automation controller** lewat sinyal-sinyal lain
+(leak `Runtime.enable`, getter properti hasil override yang bukan native,
+bentuk `PluginArray` yang salah, mismatch prototype `iframe.contentWindow`,
+vendor WebGL, dsb.) yang TIDAK hilang hanya dengan berganti ke Chrome asli
+atau patch JS sederhana seperti `_apply_stealth` versi awal.
+**Fix:** `_apply_stealth()` sekarang memakai paket
+[`playwright-stealth`](https://pypi.org/project/playwright-stealth/)
+(port Python dari `puppeteer-extra-plugin-stealth`, ~15 evasion terarah:
+`navigator.webdriver`, `navigator.plugins`, `navigator.permissions`,
+`navigator.languages`, `iframe.contentWindow`, `chrome.csi`/`chrome.app`/
+`chrome.loadTimes`, `webgl_vendor`, `error_prototype`, `sec_ch_ua`, dll.)
+sebagai jalur utama — diterapkan di level `BrowserContext` sehingga berlaku
+untuk semua page yang dibuat dari context tersebut. Jika paket belum
+terinstall (dependency opsional), otomatis fallback ke script kustom
+sebelumnya (masih ada, tidak dihapus) agar backend tetap berfungsi.
+**Cara pakai:** `pip install -r requirements.txt` sudah mencakup
+`playwright-stealth>=2.0.0` — tidak perlu langkah tambahan.
+**Catatan realistis:** tidak ada kombinasi stealth-script yang dapat
+menjamin 100% lolos dari Cloudflare Turnstile (ini "managed challenge"
+yang terus diperbarui providernya) — kombinasi `channel="chrome"` +
+`playwright-stealth` + profile persisten + IP bersih adalah best-effort
+terbaik yang tersedia untuk automation berbasis CDP. Jika Turnstile tetap
+muncul setelah semua ini, satu-satunya jalan pasti adalah menyelesaikan
+challenge sekali secara manual dengan `--no-headless` — profile akan
+mengingat session tersebut untuk run headless berikutnya.
+
+### Feature — Kontingensi Cloudflare Turnstile: opsi `channel="chrome"` (v1.1, diaktifkan lebih awal)
+
+**File:** `config/chatgpt.py`, `scrapers/base_chatgpt.py`, `.env.example`
+**Latar belakang:** Risiko "Cloudflare mendeteksi Chromium headless" yang
+sudah didokumentasikan di `design_chatgpt_backend.md` §11 / `implementation.md`
+§3 terjadi di deployment nyata — login stuck di halaman
+`auth.openai.com` "Performing security verification" (Cloudflare Turnstile
+checkbox), bukan di happy-path "Continue with password".
+**Fix:** Kontingensi v1.1 yang sudah direncanakan diaktifkan lebih awal:
+`launch_browser()` sekarang membaca `CHATGPT_BROWSER_CHANNEL` (env var) atau
+`CHATGPT_CONFIG["browser_channel"]` (default `None` = bundled Chromium,
+perilaku tidak berubah). Jika di-set ke `"chrome"`, Playwright meluncurkan
+**Google Chrome asli** yang terinstall di mesin (`channel="chrome"`) — satu
+baris config, tanpa perlu ubah kode lain — karena Chrome asli umumnya lebih
+dipercaya Cloudflare Turnstile dibanding binary Chromium headless bawaan.
+Stealth script (`_apply_stealth`) juga diperluas: tambah patch
+`navigator.permissions.query` untuk notifications (pola stealth umum),
+selain patch `webdriver`/`languages`/`plugins` yang sudah ada.
+**Cara pakai:** `export CHATGPT_BROWSER_CHANNEL=chrome` di worker host (perlu
+`playwright install chrome` atau Chrome sistem sudah terinstall), lalu
+jalankan ulang `python public.py --backend chatgpt ...`.
+**Catatan tambahan jika Turnstile masih muncul:** Cloudflare juga menilai
+reputasi IP (datacenter/VPS IP sering memicu challenge terlepas dari
+headless atau tidak) — jika `channel="chrome"` belum cukup, coba jalankan
+worker sekali dengan `--no-headless` untuk menyelesaikan checkbox secara
+manual (profile akan mengingat session untuk run berikutnya), atau
+pertimbangkan menjalankan worker dari IP residensial/non-datacenter.
+
+### Fix — Login ChatGPT salah klik "Continue with phone number" alih-alih "Continue"
+
+**File:** `config/chatgpt.py`, `scrapers/chatgpt_scraper.py`,
+`tests/_manual_continue_button_check.py` (baru)
+**Root cause:** selector `continue_button` sebelumnya
+`button:has-text("Continue")` — di Playwright, `:has-text()` melakukan
+**substring match**, jadi ikut match tombol sekunder seperti "Continue with
+phone number" / "Continue with Google" / "Continue with Apple". Ditemukan
+langsung dari laporan pengguna: email berhasil terisi, tapi yang diklik
+malah "Continue with phone number".
+**Fix (dua lapis):**
+1. Selector diganti ke `button:text-is("Continue")` (exact match,
+   whitespace-normalized) sebagai kandidat utama, dengan fallback yang
+   secara eksplisit mengecualikan varian "... with ...":
+   `button:has-text("Continue"):not(:has-text("with"))`.
+2. `_click_continue_button()` (baru, menggantikan `_click_first()` generik
+   untuk tombol ini) menambahkan verifikasi runtime: teks elemen yang
+   ter-resolve harus PERSIS `"continue"` (case-insensitive, trimmed)
+   sebelum diklik — kandidat yang gagal verifikasi dilewati, bukan diklik
+   membabi-buta.
+**Verifikasi:** `tests/_manual_continue_button_check.py` mereproduksi
+skenario persis (tombol "Continue with phone number" diletakkan SEBELUM
+tombol "Continue" yang benar di DOM) dan memastikan tombol yang benar yang
+diklik.
+
+### Fix — Tes gateway yang sudah usang disinkronkan ke API saat ini
+
+`tests/test_vps_smoke.py` sebelumnya memanggil `V.resolve_backend(...)`, yang
+sudah tidak ada di `vps_server.py` (API saat ini hanya punya
+`resolve_backend_and_account(model) -> (backend, account_id)`). Diganti
+dengan `test_resolve_backend_and_account()` yang sesuai API saat ini +
+kasus `chatgpt`/`chatgpt(account1)`.
+
+`tests/test_http_e2e.py` sebelumnya mengirim `model: "deepseek-chat"` untuk
+kasus DeepSeek — string ini **tidak match** `MODEL_ID_RE` saat ini
+(`^(deepseek|qwen|chatgpt)(?:\(([^)]+)\))?$`), sehingga `chat_completions()`
+langsung melempar 400 SEBELUM pernah memanggil `dispatch()`, sementara test
+tetap menunggu `ws.recv()` untuk sebuah task envelope yang tidak akan pernah
+dikirim — membuat test **hang tanpa batas waktu**. Diperbaiki: model diganti
+ke `"deepseek"`, `ws.recv()` diberi timeout eksplisit, dan ditambahkan dua
+kasus baru untuk backend `chatgpt` (`"chatgpt"` dan `"chatgpt(account1)"`).
+
+---
+
+### Feature — Backend ChatGPT ketiga (chat-only + code blocks + attachments)
+
+**File baru:** `config/chatgpt.py`, `scrapers/base_chatgpt.py`,
+`scrapers/chatgpt_scraper.py`, `browser_pool_chatgpt.py`, `public_chatgpt.py`,
+`tests/_manual_login_detection_check.py`
+**File diubah (minimal touch):** `config/__init__.py` (re-export),
+`public.py` (`--backend` += `chatgpt`), `.env.example` (blok
+`CHATGPT_EMAIL`/`CHATGPT_PASSWORD`), `PublicForward/ForVPS/vps_server.py`
+(`MODEL_ID_RE` += `chatgpt`, branch `task_fields` untuk `backend=="chatgpt"`,
+komentar normalisasi hasil `deepseek | chatgpt`), `tests/test_vps_smoke.py`,
+`tests/test_http_e2e.py`, `README.md`, `API_USAGE.md`.
+
+Mengikuti keputusan FINAL di `design_chatgpt_backend.md` /
+`implementation.md`:
+
+- **Port penuh ke Python + Playwright**, satu stack dengan deepseek/qwen.
+  ChatGPT mengikuti pola persistent-profile email+password milik Qwen
+  (`base_qwen.py`), bukan pola cookie-file legacy.
+- **Login otomatis email+password** via `cookies/authchatgpt.json` (format
+  identik `auth.json`/`authqwen.json`, di-reuse langsung oleh `AuthStore`).
+  Tanpa SSO. Flow sesuai screenshot owner: klik "Log in" (POPUP *atau*
+  redirect same-tab — keduanya ditangani via listener `context.on("page")`)
+  → isi email → klik "Continue" → halaman "Check your inbox" → **klik
+  "Continue with password"** (jalur utama, BUKAN mengisi kode verifikasi
+  email) → isi password → klik "Continue" → tunggu tombol "Log in" hilang.
+- **Deteksi login HANYA via absennya tombol "Log in"** di DOM — BUKAN
+  keberadaan input chat, karena homepage logged-out ChatGPT tetap
+  menampilkan input "Ask ChatGPT" (poin kritis dari screenshot owner, cermin
+  `detectSignOut` di referensi openai.js).
+- **Login WAJIB headless=true** (constraint owner, diverifikasi manual
+  terhadap flow "Continue with password" yang live).
+- **Ekstraksi response**: DOM selector utama
+  `[data-message-author-role="assistant"]` (elemen terakhir) → fallback
+  innerText `<main>` yang di-anchor pada occurrence TERAKHIR dari prompt,
+  dibersihkan (buang label "You said:"/"ChatGPT said:", baris UI seperti
+  Copy/Share/Regenerate, dedupe baris berturutan) — port 1:1 strategi
+  referensi openai.js.
+- **Profile terisolasi**: `profiles/chatgpt/<account>/`, terpisah dari
+  `profiles/deepseek/<account>/` dan `profiles/qwen/<account>/` — mencegah
+  Chrome `SingletonLock` collision yang sudah pernah diperbaiki untuk
+  deepseek/qwen di entri CHANGELOG sebelumnya.
+- **Attachments**: `set_input_files` pada `input[type=file]` tersembunyi,
+  tunggu preview chip muncul (timeout 15s) sebelum mengirim prompt.
+- **Rate limit & rotasi**: deteksi frasa "you've reached"/"usage cap"/"limit
+  reached"; mode `new` → rotasi akun via `authchatgpt.json` lalu retry 1x;
+  mode `continue` → fail jelas (session terikat akun, rotasi akan
+  menghilangkan konteks percakapan — konsisten dengan deepseek/qwen).
+- **Gateway**: `model` valid `chatgpt` \| `chatgpt(account1)`. Worker
+  register dengan `"backend": "chatgpt"` — routing least-loaded, session
+  affinity, `/v1/models`, `x_meta`, dan `DELETE /v1/sessions/{id}` semua
+  bekerja otomatis tanpa perubahan tambahan (generik lewat field `backend`).
+  Task envelope memakai format deepseek (`{"type":"task","task_id","request"}`)
+  karena ini worker baru tanpa protokol lama yang harus dijaga kompatibel.
+- **v1 scope**: chat + code blocks + attachments saja. TIDAK ada
+  think_mode/model picker (default model UI). Tool calling **diterima**
+  di request body tapi **belum dieksekusi** ke UI ChatGPT (ditandai untuk
+  v1.1). `stream: true` diabaikan (non-streaming, konsisten dengan deepseek).
+- **Regresi**: perilaku backend deepseek & qwen TIDAK berubah. Semua
+  perubahan pada file existing bersifat minimal-touch (§F implementation.md).
+
+---
+
 ## [Unreleased] — 2026-09-03 (sesi 5)
 
 ### Change — Session tidak lagi punya TTL otomatis; dihapus lewat API/console command secara eksplisit

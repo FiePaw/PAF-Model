@@ -9,3 +9,15 @@ playwright>=1.44.0
 websockets>=12.0
 python-dotenv>=1.0.1
 tiktoken>=0.5.0          # optional but recommended (accurate token usage)
+playwright-stealth>=2.0.0  # ChatGPT backend only: masks Playwright's CDP
+                           # automation fingerprint when running on the
+                           # vanilla playwright driver. Optional: skipped
+                           # automatically when the patchright driver below
+                           # is used.
+# patchright>=1.52        # ChatGPT backend, Cloudflare Turnstile workaround
+#                         # #1: patched Playwright that removes CDP
+#                         # automation leaks (Runtime.enable, getPlaywright,
+#                         # ...). Uncomment to install, then ALSO run:
+#                         #   python -m patchright install chromium
+#                         # When installed, the ChatGPT backend picks it up
+#                         # automatically (CHATGPT_BROWSER_DRIVER=auto).

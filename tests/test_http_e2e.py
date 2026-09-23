@@ -1,4 +1,16 @@
-"""True loopback integration test: uvicorn + real WS worker + httpx POST."""
+"""True loopback integration test: uvicorn + real WS worker + httpx POST.
+
+Extended (Tahap G2) with a fake chatgpt worker (`backend="chatgpt"`) exercising
+the deepseek-style envelope/result shape, plus a `chatgpt(account1)` account-
+routed case.
+
+Fix (regression found while adding chatgpt): the deepseek case previously used
+model="deepseek-chat", which does NOT match the current MODEL_ID_RE in
+vps_server.py (only bare "deepseek"/"qwen"/"chatgpt" or "<backend>(<account>)"
+are accepted). That model string caused chat_completions() to raise a 400
+immediately, while the test still awaited `ws.recv()` for a task envelope
+that was never dispatched -- hanging forever. Fixed to use "deepseek".
+"""
 import asyncio
 import json
 import sys
@@ -29,7 +41,7 @@ async def run_case(backend, model, register_msg, make_result, expect_text, use_q
                 "model": model,
                 "messages": [{"role": "user", "content": "ping"}],
             }))
-            task = json.loads(await ws.recv())          # VPS → worker task
+            task = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))  # VPS → worker task
             assert task["type"] == "task", task
             tid = task.get("task_id") or task.get("request_id")
             await ws.send(json.dumps(make_result(tid)))  # worker → VPS result
@@ -47,13 +59,13 @@ async def run_case(backend, model, register_msg, make_result, expect_text, use_q
 
     ids = {m["id"] for m in models["data"]}
     assert backend in ids, models
-    print(f"[{backend}] e2e OK — content={body['choices'][0]['message']['content']!r} "
+    print(f"[{backend}] e2e OK — model={model!r} content={body['choices'][0]['message']['content']!r} "
           f"session={r.headers['x-session-id'][:14]} backend_hdr={r.headers['x-backend']}")
 
 
 async def main():
     await run_case(
-        backend="deepseek", model="deepseek-chat",
+        backend="deepseek", model="deepseek",
         register_msg={"type": "register", "backend": "deepseek", "token": "change-me",
                       "hostname": "win1", "max_concurrent": 2, "accounts": ["account1"]},
         make_result=lambda tid: {"type": "result", "task_id": tid,
@@ -74,6 +86,28 @@ async def main():
                                           "usage": {"prompt_tokens": 1, "completion_tokens": 1}}},
         expect_text="pong-qwen",
         use_query_token=True,
+    )
+    # ChatGPT — bare "chatgpt" model, deepseek-style envelope/result shape.
+    await run_case(
+        backend="chatgpt", model="chatgpt",
+        register_msg={"type": "register", "backend": "chatgpt", "token": "change-me",
+                      "hostname": "win2", "max_concurrent": 1, "accounts": ["account1"]},
+        make_result=lambda tid: {"type": "result", "task_id": tid,
+                                 "result": {"ok": True, "text": "pong-chatgpt", "account": "account1",
+                                            "conversation_url": "https://chatgpt.com/c/abc",
+                                            "usage": {"prompt_tokens": 1, "completion_tokens": 1}}},
+        expect_text="pong-chatgpt",
+    )
+    # Account-routed model id: chatgpt(account1)
+    await run_case(
+        backend="chatgpt", model="chatgpt(account1)",
+        register_msg={"type": "register", "backend": "chatgpt", "token": "change-me",
+                      "hostname": "win3", "max_concurrent": 1, "accounts": ["account1"]},
+        make_result=lambda tid: {"type": "result", "task_id": tid,
+                                 "result": {"ok": True, "text": "pong-chatgpt-acc1", "account": "account1",
+                                            "conversation_url": "https://chatgpt.com/c/def",
+                                            "usage": {"prompt_tokens": 1, "completion_tokens": 1}}},
+        expect_text="pong-chatgpt-acc1",
     )
     print("\nALL HTTP E2E TESTS PASSED")
 

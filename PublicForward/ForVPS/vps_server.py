@@ -71,7 +71,7 @@ THINK_MODE_ALIASES = {
 # "any available account for that backend". Session continuity is driven
 # exclusively by the X-Session-ID header (see chat_completions). See
 # GET /v1/models for the list of currently connected account-based ids.
-MODEL_ID_RE = re.compile(r"^(deepseek|qwen)(?:\(([^)]+)\))?$")
+MODEL_ID_RE = re.compile(r"^(deepseek|qwen|chatgpt)(?:\(([^)]+)\))?$")
 
 
 def resolve_backend_and_account(model: str) -> tuple[str, Optional[str]]:
@@ -86,9 +86,10 @@ def resolve_backend_and_account(model: str) -> tuple[str, Optional[str]]:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Unknown model: {model!r}. Use 'deepseek', 'qwen', or "
+                f"Unknown model: {model!r}. Use 'deepseek', 'qwen', 'chatgpt', or "
                 "'<backend>(<account_id>)' e.g. 'deepseek(account1)', "
-                "'qwen(account1)'. See GET /v1/models for connected accounts."
+                "'qwen(account1)', 'chatgpt(account1)'. See GET /v1/models for "
+                "connected accounts."
             ),
         )
     backend, account_id = match.group(1), match.group(2)
@@ -771,6 +772,20 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
                 "tool_messages": tool_messages,
                 "messages": messages_payload,
             }
+        elif backend == "chatgpt":
+            # v1: chat-only, no think_mode/model_tab/deep_think/web_search.
+            # Uses the deepseek-style envelope/result shape (ok/text/account/
+            # conversation_url) since it is a brand-new worker with no legacy
+            # protocol to preserve.
+            task_fields = {
+                "prompt": req.last_user_message(),
+                "mode": mode,
+                "session_id": session_id,
+                "preferred_account": preferred_account,
+                "attachments": attachments,
+                "messages": messages_payload,
+                "max_tokens": req.max_tokens,
+            }
         else:  # backend == "qwen"
             # think_mode passed through as-is; the Qwen worker derives its own
             # prompt/mode from messages + its session store.
@@ -814,11 +829,11 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             conversation_url = result.get("conversation_url")
             actual_mode = mode
             mode_fallback = False
-        else:  # deepseek
+        else:  # deepseek | chatgpt (same result shape: ok/text/account/conversation_url)
             if not result.get("ok"):
                 raise HTTPException(
                     status_code=500,
-                    detail=result.get("error", "DeepSeek worker error"),
+                    detail=result.get("error", f"{backend} worker error"),
                 )
             response_text = result.get("text", "")
             worker_usage = result.get("usage") or {}

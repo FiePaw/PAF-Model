@@ -37,6 +37,7 @@ from config.deepseek import (
     JSON_API_CONFIG,
 )
 from config.qwen import QWEN_CONFIG, QWEN_AUTH_CONFIG
+from config.chatgpt import CHATGPT_CONFIG, CHATGPT_AUTH_CONFIG
 
 __all__ = [
     # paths
@@ -65,4 +66,7 @@ __all__ = [
     # qwen
     "QWEN_CONFIG",
     "QWEN_AUTH_CONFIG",
+    # chatgpt
+    "CHATGPT_CONFIG",
+    "CHATGPT_AUTH_CONFIG",
 ]

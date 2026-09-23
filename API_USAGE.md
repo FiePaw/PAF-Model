@@ -9,7 +9,10 @@
 > `example/foto_qwen.py`).
 >
 > For system architecture, install steps, and how to run the VPS/workers, see
-> [`README.md`](./README.md). This file only covers **how to call the API**.
+> [`README.md`](./README.md). For a full deep-dive on the ChatGPT backend
+> specifically (login flow, the Cloudflare Turnstile mitigation ladder, and
+> how it's tested), see [`CHATGPT_BACKEND.md`](./CHATGPT_BACKEND.md). This
+> file only covers **how to call the API**.
 
 ---
 
@@ -19,17 +22,18 @@
 YOU (HTTP client) ──POST /v1/chat/completions──▶ vps_server.py (FastAPI, public)
                                                        │  WebSocket /ws/worker
                                                        ▼
-                                     public.py --backend deepseek|qwen (worker)
+                              public.py --backend deepseek|qwen|chatgpt (worker)
                                                        │  Playwright
                                                        ▼
-                                        chat.deepseek.com  /  chat.qwen.ai
+                        chat.deepseek.com / chat.qwen.ai / chatgpt.com
 ```
 
 `vps_server.py` is a single OpenAI-Chat-Completions-**compatible** gateway
-that fronts two different backends (DeepSeek and Qwen), each driven by a real
-logged-in browser session on a "worker" machine. Your HTTP request never
-touches the model provider directly — it is queued and dispatched to whichever
-worker process is currently registered and idle for the backend you asked for.
+that fronts three different backends (DeepSeek, Qwen, and ChatGPT), each
+driven by a real logged-in browser session on a "worker" machine. Your HTTP
+request never touches the model provider directly — it is queued and
+dispatched to whichever worker process is currently registered and idle for
+the backend you asked for.
 
 There is **no streaming support**. `stream: true` is accepted in the request
 body but is currently **ignored** by the gateway (the whole reply is returned
@@ -58,7 +62,7 @@ they are easy to confuse:
 
 | Token | Protects | Where it's checked |
 |---|---|---|
-| `PAF_TOKEN` / `AUTH_TOKEN` (env `PAF_TOKEN`, default `"change-me"`) | The **WebSocket worker connection** (`/ws/worker`) — i.e. which `public.py` processes are allowed to register as a backend worker | Inside `worker_endpoint()`, comparing the `token` field in the worker's `register` message (or `?token=` query param) |
+| `PAF_TOKEN` / `AUTH_TOKEN` (env `PAF_TOKEN`, default `"change-me"`) | The **WebSocket worker connection** (`/ws/worker`) — i.e. which `public.py` processes are allowed to register as a backend worker | Inside `worker_endpoint()`, comparing the `token` field in the worker's `register` message (DeepSeek and ChatGPT workers) or the `?token=` query param (Qwen worker) |
 | — none — | The **public REST API** (`/v1/chat/completions`, `/v1/models`, `/health`, `/`) | **Not checked at all.** There is no `Authorization` header, no API key, no bearer-token check anywhere in the REST handlers. |
 
 **Practical implication:** as shipped, anyone who can reach the VPS's HTTP
@@ -112,10 +116,13 @@ this before hard-coding a model id, especially per-account ids.
   "data": [
     { "id": "deepseek", "object": "model", "owned_by": "PAF-ai", "x_backend": "deepseek" },
     { "id": "qwen",     "object": "model", "owned_by": "PAF-ai", "x_backend": "qwen" },
+    { "id": "chatgpt",  "object": "model", "owned_by": "PAF-ai", "x_backend": "chatgpt" },
     { "id": "deepseek(account1)", "object": "model", "owned_by": "PAF-ai",
       "x_backend": "deepseek", "x_account": "account1" },
     { "id": "qwen(account1.json)", "object": "model", "owned_by": "PAF-ai",
-      "x_backend": "qwen", "x_account": "account1.json" }
+      "x_backend": "qwen", "x_account": "account1.json" },
+    { "id": "chatgpt(account1)", "object": "model", "owned_by": "PAF-ai",
+      "x_backend": "chatgpt", "x_account": "account1" }
   ]
 }
 ```
@@ -140,7 +147,7 @@ details, response shape, and client-side TTL guidance in §6.2.1 below.
 Internal protocol used by `public.py` workers to register and exchange tasks
 with the gateway. You do not call this as an API consumer — documented in
 `PublicForward/ForVPS/vps_server.py` / `public_deepseek.py` / `public_qwen.py`
-for anyone extending the worker side.
+/ `public_chatgpt.py` for anyone extending the worker side.
 
 ---
 
@@ -196,24 +203,24 @@ path — check that script if you need Qwen system prompts).
 
 ### 6.1 The `model` field (backend + account routing)
 
-Regex enforced by the gateway: `^(deepseek|qwen)(?:\(([^)]+)\))?$`
+Regex enforced by the gateway: `^(deepseek|qwen|chatgpt)(?:\(([^)]+)\))?$`
 
 | `model` value | Meaning |
 |---|---|
 | `"deepseek"` | Any available DeepSeek worker/account |
 | `"qwen"` | Any available Qwen worker/account |
+| `"chatgpt"` | Any available ChatGPT worker/account |
 | `"deepseek(account1)"` | Specifically the DeepSeek worker holding account `account1` |
 | `"qwen(account1.json)"` | Specifically the Qwen worker holding cookie file `account1.json` |
-| anything else (e.g. `"gpt-4"`, `"deepseek-chat"`\*) | **400 Bad Request** |
+| `"chatgpt(account1)"` | Specifically the ChatGPT worker holding account `account1` |
+| anything else (e.g. `"gpt-4"`, `"deepseek-chat"`) | **400 Bad Request** |
 
-\* Note: the repo's own end-to-end test (`tests/test_http_e2e.py`) posts
-`model: "deepseek-chat"` and `model: "qwen"` and gets `200` — that test talks
-to a **stub worker** it registers itself, so it never actually exercises the
-regex with `"deepseek-chat"` failing... in fact `"deepseek-chat"` **does not
-match** `^(deepseek|qwen)(?:\(...\))?$` and would raise 400 against the real
-`resolve_backend_and_account()`. **Use exactly `"deepseek"` or `"qwen"`** (or
-the account-parenthesized form) — do not use OpenAI-style model names like
-`deepseek-chat` / `deepseek-reasoner` / `qwen-max`, they will be rejected.
+**Use exactly `"deepseek"`, `"qwen"`, or `"chatgpt"`** (or the
+account-parenthesized form) — do not use OpenAI-style model names like
+`deepseek-chat` / `deepseek-reasoner` / `qwen-max` / `gpt-4`, they will be
+rejected with a 400. This is fixed and verified by
+`tests/test_vps_smoke.py::test_resolve_backend_and_account` and
+`tests/test_http_e2e.py` for all three backends.
 
 Call `GET /v1/models` to discover live per-account ids rather than guessing
 account names.
@@ -270,7 +277,7 @@ of inactivity"), **implement it on the client side**:
 #### `DELETE /v1/sessions/{session_id}`
 
 Deletes the server-side session → conversation mapping. The request is
-broadcast to every connected worker (both backends); whichever one (if
+broadcast to every connected worker (all three backends); whichever one (if
 any) actually holds that `session_id` removes it from its store.
 
 ```bash
@@ -301,9 +308,9 @@ Every successful response includes:
 | Header | Always present? | Meaning |
 |---|---|---|
 | `X-Session-ID` | Yes | The session id to reuse for the next turn. |
-| `X-Backend` | Yes | `"deepseek"` or `"qwen"` — confirms which backend actually served you. |
+| `X-Backend` | Yes | `"deepseek"`, `"qwen"`, or `"chatgpt"` — confirms which backend actually served you. |
 | `X-Account-Name` | Only if the worker reported one | The account/cookie-file that served the request. |
-| `X-Conversation-URL` | Only if the worker reported one | Direct URL to the underlying chat.deepseek.com / chat.qwen.ai conversation. |
+| `X-Conversation-URL` | Only if the worker reported one | Direct URL to the underlying chat.deepseek.com / chat.qwen.ai / chatgpt.com conversation. |
 
 ---
 
@@ -334,6 +341,11 @@ one of `"auto"` \| `"thinking"` \| `"fast"` (matches `QWEN_CONFIG` labels in
 `config/qwen.py`). There is no alias table on the Qwen side — send the exact
 string the worker/scraper expects.
 
+### ChatGPT
+**Not supported in v1.** ChatGPT has no model picker / think_mode toggle —
+every request uses the ChatGPT UI's default model. Any `think_mode` value
+sent with `model: "chatgpt"` is silently ignored (no error).
+
 ---
 
 ## 8. Attachments (images / files)
@@ -357,6 +369,10 @@ string the worker/scraper expects.
   attachments in the underlying UI.
 - For **Qwen**, no special tab/mode is required for images (per
   `example/foto_qwen.py`).
+- For **ChatGPT**, attachments are uploaded via the hidden file input
+  (`set_input_files`) and the worker waits for the attachment preview chip
+  to appear before sending the prompt; a per-file timeout produces a clear
+  error (no silent partial upload).
 - `mime_type` is taken as given — the example above passes `image/png` while
   reading a `.jpg` file, and it still worked in testing; the field is mostly
   advisory for the client/browser upload step, but pass the correct value for
@@ -364,7 +380,12 @@ string the worker/scraper expects.
 
 ---
 
-## 9. Tool / function calling (both backends)
+## 9. Tool / function calling (deepseek, qwen)
+
+ChatGPT (v1) accepts `tools` in the request body without erroring, but does
+**not** execute tool calls against the ChatGPT UI — this is recorded as a
+v1.1 follow-up in `CHANGELOG.md`. Only DeepSeek and Qwen actually resolve
+tool calls end-to-end today.
 
 Send `tools` in the OpenAI function-calling shape:
 
@@ -468,7 +489,7 @@ this is fixed upstream.
 
 ---
 
-## 11. Response — success shape (both backends, normalized)
+## 11. Response — success shape (all three backends, normalized)
 
 ```json
 {
@@ -507,7 +528,13 @@ Notes on fields you can rely on:
   worker itself doesn't report real counts — treat as approximate, not
   billing-grade.
 - `x_meta.model_tab` / `deep_think` / `web_search` only appear when
-  `backend == "deepseek"`.
+  `backend == "deepseek"` (ChatGPT and Qwen never set these — ChatGPT has no
+  model picker in v1).
+- ChatGPT's result shape is **identical** to DeepSeek's
+  (`ok`/`text`/`account`/`conversation_url`/`mode`) — the gateway normalizes
+  both through the same code path (`else: # deepseek | chatgpt` branch in
+  `vps_server.py`), so everything in this section applies to `chatgpt`
+  exactly as written for `deepseek`.
 - `x_meta.mode_fallback: true` (DeepSeek only) signals the browser session
   behind your `X-Session-ID` was lost/expired and the worker silently started
   a **new** conversation instead of continuing — check this if a "continue"
@@ -523,9 +550,12 @@ Notes on fields you can rely on:
 
 | HTTP status | When | Body shape |
 |---|---|---|
-| `400` | `model` doesn't match `^(deepseek\|qwen)(?:\(...\))?$` | `{"detail": "Unknown model: '...'. Use 'deepseek', 'qwen', or '<backend>(<account_id>)' ..."}` |
+| `400` | `model` doesn't match `^(deepseek\|qwen\|chatgpt)(?:\(...\))?$` | `{"detail": "Unknown model: '...'. Use 'deepseek', 'qwen', 'chatgpt', or '<backend>(<account_id>)' ..."}` |
+| `401` | ChatGPT worker's automated login failed (bad credentials, or the session expired and no fallback credentials are configured) | `{"detail": "<auth error message>"}` — see [`CHATGPT_BACKEND.md`](./CHATGPT_BACKEND.md#6-cloudflare-turnstile--the-mitigation-ladder) if this coincides with a Cloudflare Turnstile challenge |
+| `404` | ChatGPT CONTINUE request whose `session_id` has no saved `conversation_url` (session was deleted, or never existed) | `{"detail": "Session tidak ditemukan atau conversation_url kosong — client harus membuat session baru"}` — start a new session (omit `X-Session-ID`) |
 | `422` | Request body fails Pydantic validation (e.g. missing `messages`) | Standard FastAPI validation error body |
-| `500` | Worker reported `ok: false` (DeepSeek) / generic exception in the handler | `{"detail": "<error message from worker>"}` |
+| `429` | Backend reported a rate limit / usage cap (all backends) | `{"detail": "<rate limit message>"}` — back off and retry later, or target a different account |
+| `500` | Worker reported `ok: false` (DeepSeek / ChatGPT) / generic exception in the handler | `{"detail": "<error message from worker>"}` |
 | `502` | Worker reported `success: false` (Qwen) | `{"detail": "<error message from worker>"}` |
 | `504` | No worker of the requested backend became available within `WORKER_WAIT_TIMEOUT` (default 60s — env `WORKER_WAIT_TIMEOUT`) | `{"detail": "No available '<backend>' worker within timeout"}` |
 
@@ -589,7 +619,30 @@ curl -X POST http://VPS_HOST:9000/v1/chat/completions \
       }'
 ```
 
-### 13.5 Python — minimal client
+### 13.5 curl — ChatGPT chat (new session, then continue)
+```bash
+# New session — omit X-Session-ID
+curl -i -X POST http://VPS_HOST:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "chatgpt",
+        "messages": [{"role": "user", "content": "Explain the CAP theorem simply"}]
+      }'
+# → read X-Session-ID and X-Conversation-URL from the response headers
+
+# Continue — reuse the X-Session-ID from above
+curl -X POST http://VPS_HOST:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Session-ID: sess-7f3a9c1d0e2b4f6a" \
+  -d '{
+        "model": "chatgpt",
+        "messages": [{"role": "user", "content": "Now give a one-sentence summary"}]
+      }'
+```
+No `think_mode`/`model_tab`/`deep_think`/`web_search`/`task_type` fields for
+ChatGPT — it's chat-only in v1 (see §7 and §14).
+
+### 13.6 Python — minimal client
 ```python
 import requests
 
@@ -615,7 +668,7 @@ print(ask("Hi, who are you?"))
 print(ask("What did I just ask you?"))   # continues the same session
 ```
 
-### 13.6 Ready-made reference clients in this repo
+### 13.7 Ready-made reference clients in this repo
 - `example/chat_deepseek.py` — full interactive CLI for the DeepSeek path
   (`/new`, `/status`, `/think <mode>` commands); this file's own docstring
   explicitly says it mirrors the flow documented here.
@@ -624,6 +677,9 @@ print(ask("What did I just ask you?"))   # continues the same session
   HTTP layer, see §1).
 - `example/foto_qwen.py` — minimal image-attachment example (§8).
 - `example/newChat_qwen.py` — forcing a brand-new Qwen session.
+- There is no dedicated `example/chat_chatgpt.py` yet in v1 — use §13.5/13.6
+  above (a bare `"model": "chatgpt"` request works with the same generic
+  Python client in §13.6, just change the `model` value).
 
 ---
 
@@ -645,16 +701,19 @@ Decision rules:
   `"deep_think": true` for finer control).
 - **Want DeepSeek web search** → `"web_search": true`.
 - **Want a specific backend account** → `"model": "deepseek(account1)"` or
-  set `"preferred_account": "account1"` with `"model": "deepseek"`.
+  set `"preferred_account": "account1"` with `"model": "deepseek"` (works
+  the same way for `chatgpt(account1)` / `qwen(account1.json)`).
 - **Sending an image** → `attachments: [{filename, data (base64), mime_type}]`,
-  and for DeepSeek also set `"model_tab": "vision"`.
+  and for DeepSeek also set `"model_tab": "vision"` (ChatGPT and Qwen need no
+  extra field for image attachments).
 - **Calling a tool** → declare `tools`, read `finish_reason == "tool_calls"`
   and `message.tool_calls`, execute locally, then POST back a `tool` message
-  with the same `X-Session-ID`.
-- **Do not** send `model_tab`/`deep_think`/`web_search`/`task_type` to the
-  backend that doesn't own them (they're backend-specific extensions, listed
-  per-backend in §5.1) — the other backend simply ignores fields it doesn't
-  understand, but keep requests clean.
+  with the same `X-Session-ID`. **Not supported for `chatgpt`** — `tools` is
+  accepted without erroring but never resolved against the ChatGPT UI (§9).
+- **Do not** send `model_tab`/`deep_think`/`web_search`/`task_type`/
+  `think_mode` to `chatgpt` — it's chat-only in v1 and ignores all of these
+  (no error, just no effect). Same rule as before for not sending a
+  backend's fields to a *different* backend that doesn't own them.
 - **Always** treat `usage.*` as approximate, `detail` (not `error.message`)
   as the error field, and `x_meta.mode_fallback` as a "session may have reset"
   signal.
@@ -667,6 +726,13 @@ For anyone auditing this document against the code:
 - Endpoint behavior, schema, headers, error codes → `PublicForward/ForVPS/vps_server.py`
 - DeepSeek worker task execution / result shape → `public_deepseek.py`, `scrapers/deepseek_scraper.py`
 - Qwen worker task execution / result shape → `public_qwen.py`, `scrapers/qwen_scraper.py`
-- Config values (`think_mode` labels, tabs, defaults) → `config/deepseek.py`, `config/qwen.py`
+- ChatGPT worker task execution / result shape → `public_chatgpt.py`,
+  `scrapers/chatgpt_scraper.py`, `scrapers/base_chatgpt.py`,
+  `browser_pool_chatgpt.py`
+- ChatGPT architecture, login flow, and Cloudflare Turnstile mitigations →
+  [`CHATGPT_BACKEND.md`](./CHATGPT_BACKEND.md) (dedicated deep-dive)
+- Config values (`think_mode` labels, tabs, defaults) → `config/deepseek.py`, `config/qwen.py`, `config/chatgpt.py`
 - Confirmed request/response wire examples → `tests/test_http_e2e.py`, `tests/test_vps_smoke.py`
+- ChatGPT-specific test verification → `tests/_manual_*.py` (see
+  [`CHATGPT_BACKEND.md` §7](./CHATGPT_BACKEND.md#7-testing--how-this-passes))
 - Client-side usage patterns → `example/chat_deepseek.py`, `example/chat_qwen.py`, `example/foto_qwen.py`
