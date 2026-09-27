@@ -1,15 +1,16 @@
 """
-config package — unified configuration for PAF-Model (DeepSeek + Qwen).
+config package — unified configuration for PAF-Model (DeepSeek + Qwen + Grok).
 
 Re-exports every name from the sub-modules so that legacy imports keep working
 unchanged, e.g.:
 
-    from config import DEEPSEEK_CONFIG, QWEN_CONFIG, BROWSER_CONFIG, COOKIES_DIR
+    from config import DEEPSEEK_CONFIG, QWEN_CONFIG, GROK_CONFIG, BROWSER_CONFIG, COOKIES_DIR
 
 Layout:
     config/common.py    → shared paths, browser, rotation, output, logging
     config/deepseek.py  → DEEPSEEK_CONFIG, AUTH_CONFIG, JSON_API_CONFIG
     config/qwen.py      → QWEN_CONFIG
+    config/grok.py      → GROK_CONFIG, GROK_AUTH_CONFIG (replaces config/chatgpt.py)
 """
 from __future__ import annotations
 
@@ -37,7 +38,7 @@ from config.deepseek import (
     JSON_API_CONFIG,
 )
 from config.qwen import QWEN_CONFIG, QWEN_AUTH_CONFIG
-from config.chatgpt import CHATGPT_CONFIG, CHATGPT_AUTH_CONFIG
+from config.grok import GROK_CONFIG, GROK_AUTH_CONFIG
 
 __all__ = [
     # paths
@@ -66,7 +67,7 @@ __all__ = [
     # qwen
     "QWEN_CONFIG",
     "QWEN_AUTH_CONFIG",
-    # chatgpt
-    "CHATGPT_CONFIG",
-    "CHATGPT_AUTH_CONFIG",
+    # grok
+    "GROK_CONFIG",
+    "GROK_AUTH_CONFIG",
 ]

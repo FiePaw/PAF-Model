@@ -1,9 +1,10 @@
 """Isolated functional test for the unified vps_server (no browsers/network).
 
-Extended (Tahap G1) to cover the chatgpt backend:
-  - resolve_backend_and_account() routing incl. chatgpt / chatgpt(account1)
-  - dispatch envelope for chatgpt == deepseek-style (task_id + request)
-  - chatgpt result shape normalises the same way deepseek's does
+Extended to cover the grok backend (replaces the retired chatgpt backend —
+see GROK_BACKEND.md for the migration):
+  - resolve_backend_and_account() routing incl. grok / grok(account1)
+  - dispatch envelope for grok == deepseek-style (task_id + request)
+  - grok result shape normalises the same way deepseek's does
 
 Note: this file previously referenced a `V.resolve_backend(...)` helper that
 no longer exists in vps_server.py (the current gateway exposes
@@ -30,16 +31,16 @@ class FakeWS:
 def test_resolve_backend_and_account():
     assert V.resolve_backend_and_account("deepseek") == ("deepseek", None)
     assert V.resolve_backend_and_account("qwen") == ("qwen", None)
-    assert V.resolve_backend_and_account("chatgpt") == ("chatgpt", None)
+    assert V.resolve_backend_and_account("grok") == ("grok", None)
     assert V.resolve_backend_and_account("deepseek(account1)") == ("deepseek", "account1")
     assert V.resolve_backend_and_account("qwen(account1)") == ("qwen", "account1")
-    assert V.resolve_backend_and_account("chatgpt(account1)") == ("chatgpt", "account1")
+    assert V.resolve_backend_and_account("grok(account1)") == ("grok", "account1")
     try:
         V.resolve_backend_and_account("gpt-4")
         assert False, "should raise"
     except V.HTTPException as e:
         assert e.status_code == 400
-        assert "chatgpt" in e.detail
+        assert "grok" in e.detail
     print("resolve_backend_and_account: OK")
 
 
@@ -66,7 +67,7 @@ async def _run_backend(backend, model_result):
         tid = env.get("task_id") or env.get("request_id")
         if backend == "qwen":
             msg = {"type": "result", "request_id": tid, "data": model_result}
-        else:  # deepseek | chatgpt (same deepseek-style envelope/result shape)
+        else:  # deepseek | grok (same deepseek-style envelope/result shape)
             msg = {"type": "result", "task_id": tid, "result": model_result}
         await mgr.handle_result(msg)
 
@@ -78,7 +79,7 @@ async def _run_backend(backend, model_result):
     env = ws.sent[-1]
     if backend == "qwen":
         assert env["type"] == "task" and "request_id" in env and env["payload"] is task_fields, env
-    else:  # deepseek | chatgpt
+    else:  # deepseek | grok
         assert env["type"] == "task" and "task_id" in env and env["request"] is task_fields, env
     payload_key = "payload" if backend == "qwen" else "request"
     print(f"{backend}: envelope OK ->",
@@ -99,12 +100,12 @@ def test_dispatch_all_backends():
     r2 = asyncio.run(_run_backend("qwen", qw_result))
     assert r2["success"] and r2["response"] == "halo dari qwen"
 
-    # ChatGPT result shape (deepseek-style: ok/text/account/conversation_url)
-    gpt_result = {"ok": True, "text": "hello from chatgpt",
+    # Grok result shape (deepseek-style: ok/text/account/conversation_url)
+    gpt_result = {"ok": True, "text": "hello from grok",
                   "usage": {"prompt_tokens": 3, "completion_tokens": 4},
-                  "account": "account1", "conversation_url": "https://chatgpt.com/c/abc", "mode": "new"}
-    r3 = asyncio.run(_run_backend("chatgpt", gpt_result))
-    assert r3["ok"] and r3["text"] == "hello from chatgpt"
+                  "account": "account1", "conversation_url": "https://grok.com/c/abc", "mode": "new"}
+    r3 = asyncio.run(_run_backend("grok", gpt_result))
+    assert r3["ok"] and r3["text"] == "hello from grok"
 
     print("dispatch_all_backends: OK")
 
@@ -114,14 +115,14 @@ def test_stats_and_accounts():
         mgr = V.WorkerManager()
         await mgr.register(FakeWS(), "h1", 4, ["account1", "account2"], "deepseek")
         await mgr.register(FakeWS(), "h2", 2, [{"account": "qacc1"}, {"cookie_file": "qacc2.json"}], "qwen")
-        await mgr.register(FakeWS(), "h3", 1, ["gptacc1"], "chatgpt")
+        await mgr.register(FakeWS(), "h3", 1, ["gptacc1"], "grok")
         stats = mgr.get_stats()
         accts = mgr.list_all_accounts()
         return stats, accts
     stats, accts = asyncio.run(run())
     assert stats["total_workers"] == 3
     backends = {a["backend"] for a in accts}
-    assert backends == {"deepseek", "qwen", "chatgpt"}, accts
+    assert backends == {"deepseek", "qwen", "grok"}, accts
     ids = {a["id"] for a in accts}
     assert "qacc1" in ids and "qacc2.json" in ids and "account1" in ids and "gptacc1" in ids, accts
     print("stats_and_accounts: OK ->", accts)

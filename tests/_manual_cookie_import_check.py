@@ -1,4 +1,4 @@
-"""Ad-hoc check for import_chatgpt_cookies.load_and_convert_cookies() and
+"""Ad-hoc check for import_grok_cookies.load_and_convert_cookies() and
 _diagnose() — parsing/conversion of Cookie-Editor exports (no browser needed).
 
 Run: python3 tests/_manual_cookie_import_check.py
@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from import_chatgpt_cookies import load_and_convert_cookies, _diagnose
+from import_grok_cookies import load_and_convert_cookies, _diagnose
 from scrapers.utils import cookie_editor_json_to_playwright
 
 
@@ -26,14 +26,16 @@ def _write(tmp: str, name: str, content) -> Path:
 
 def main():
     with tempfile.TemporaryDirectory() as tmp:
-        # Case 1: valid Cookie-Editor export (list form).
+        # Case 1: valid Cookie-Editor export (list form) — using grok.com's
+        # real essential cookie name "sso" (confirmed from a live export,
+        # see GROK_BACKEND.md), analogous to ChatGPT's session-token check.
         good = [
-            {"name": "__Secure-next-auth.session-token", "value": "abc",
-             "domain": ".chatgpt.com", "path": "/", "secure": True,
+            {"name": "sso", "value": "abc",
+             "domain": ".grok.com", "path": "/", "secure": True,
              "httpOnly": True, "sameSite": "lax"},
-            {"name": "cf_clearance", "value": "xyz",
-             "domain": ".chatgpt.com", "path": "/", "secure": True,
-             "httpOnly": True, "sameSite": "none"},
+            {"name": "sso-rw", "value": "xyz",
+             "domain": ".grok.com", "path": "/", "secure": True,
+             "httpOnly": True, "sameSite": "strict"},
         ]
         p1 = _write(tmp, "good.json", good)
         converted, raw = load_and_convert_cookies(p1)
@@ -73,10 +75,10 @@ def main():
             assert "Cookie-Editor" in str(e)
         print("Case 5 (missing file) -> actionable error           OK")
 
-        # Case 6: _diagnose hints.
+        # Case 6: _diagnose hints (wrong domain + missing 'sso' cookie).
         hints = _diagnose([{"name": "foo", "domain": ".example.com"}])
-        assert any("chatgpt" in h for h in hints), hints
-        assert any("session-token" in h for h in hints), hints
+        assert any("grok.com" in h for h in hints), hints
+        assert any("sso" in h for h in hints), hints
         print("Case 6 (_diagnose hints for a bad export) -> OK")
 
     print("\nAll cookie-import checks passed.")

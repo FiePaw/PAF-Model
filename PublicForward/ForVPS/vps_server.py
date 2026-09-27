@@ -67,11 +67,11 @@ THINK_MODE_ALIASES = {
 # The `model` field in the request body selects both the backend and,
 # optionally, a specific connected account, using the format:
 #   "<backend>(<account_id>)"   e.g. "deepseek(account1)", "qwen(account1)"
-# A bare backend name ("deepseek" / "qwen") is also accepted and means
-# "any available account for that backend". Session continuity is driven
-# exclusively by the X-Session-ID header (see chat_completions). See
-# GET /v1/models for the list of currently connected account-based ids.
-MODEL_ID_RE = re.compile(r"^(deepseek|qwen|chatgpt)(?:\(([^)]+)\))?$")
+# A bare backend name ("deepseek" / "qwen" / "grok") is also accepted and
+# means "any available account for that backend". Session continuity is
+# driven exclusively by the X-Session-ID header (see chat_completions).
+# See GET /v1/models for the list of currently connected account-based ids.
+MODEL_ID_RE = re.compile(r"^(deepseek|qwen|grok)(?:\(([^)]+)\))?$")
 
 
 def resolve_backend_and_account(model: str) -> tuple[str, Optional[str]]:
@@ -86,9 +86,9 @@ def resolve_backend_and_account(model: str) -> tuple[str, Optional[str]]:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Unknown model: {model!r}. Use 'deepseek', 'qwen', 'chatgpt', or "
+                f"Unknown model: {model!r}. Use 'deepseek', 'qwen', 'grok', or "
                 "'<backend>(<account_id>)' e.g. 'deepseek(account1)', "
-                "'qwen(account1)', 'chatgpt(account1)'. See GET /v1/models for "
+                "'qwen(account1)', 'grok(account1)'. See GET /v1/models for "
                 "connected accounts."
             ),
         )
@@ -772,11 +772,11 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
                 "tool_messages": tool_messages,
                 "messages": messages_payload,
             }
-        elif backend == "chatgpt":
+        elif backend == "grok":
             # v1: chat-only, no think_mode/model_tab/deep_think/web_search.
             # Uses the deepseek-style envelope/result shape (ok/text/account/
-            # conversation_url) since it is a brand-new worker with no legacy
-            # protocol to preserve.
+            # conversation_url) — same shape the retired ChatGPT worker used,
+            # REUSED unchanged for Grok (see GROK_BACKEND.md).
             task_fields = {
                 "prompt": req.last_user_message(),
                 "mode": mode,
@@ -829,7 +829,7 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             conversation_url = result.get("conversation_url")
             actual_mode = mode
             mode_fallback = False
-        else:  # deepseek | chatgpt (same result shape: ok/text/account/conversation_url)
+        else:  # deepseek | grok (same result shape: ok/text/account/conversation_url)
             if not result.get("ok"):
                 raise HTTPException(
                     status_code=500,

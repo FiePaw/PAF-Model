@@ -5,12 +5,101 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased] — ChatGPT backend (major update)
+## [Unreleased] — Grok backend replaces ChatGPT backend entirely (migration)
 
 > **Full architecture + operational deep-dive:** see
-> **[`CHATGPT_BACKEND.md`](./CHATGPT_BACKEND.md)**. This section is the
-> chronological engineering log; the deep-dive doc is the organized
-> reference (structure, flows, testing, troubleshooting).
+> **[`GROK_BACKEND.md`](./GROK_BACKEND.md)**. `CHATGPT_BACKEND.md` has been
+> removed — its content is superseded by `GROK_BACKEND.md`.
+
+**Summary:** the ChatGPT backend (third backend slot, chatgpt.com) has been
+**fully replaced** by a Grok backend (grok.com), built from an
+owner-supplied reference scraper (`grok.js` / `grokdebug.js` /
+`login-capture-grok.js`, Puppeteer-based). The proven Cloudflare/anti-bot
+CDP mitigation ladder built for ChatGPT (see the retired entries below)
+is **reused verbatim** — only naming changed (`CHATGPT_*` → `GROK_*` env
+vars, `chatgpt.com` → `grok.com`, `profiles/chatgpt` → `profiles/grok`).
+
+**Removed files:** `config/chatgpt.py`, `scrapers/base_chatgpt.py`,
+`scrapers/chatgpt_scraper.py`, `browser_pool_chatgpt.py`,
+`public_chatgpt.py`, `login_chatgpt.py`, `import_chatgpt_cookies.py`,
+`start_chatgpt_chrome.py`, `CHATGPT_BACKEND.md`,
+`tests/_manual_continue_button_check.py` (tested a ChatGPT-only login-form
+bug that has no Grok equivalent — see below).
+
+**New files:** `config/grok.py`, `scrapers/base_grok.py`,
+`scrapers/grok_scraper.py`, `browser_pool_grok.py`, `public_grok.py`,
+`login_grok.py`, `import_grok_cookies.py`, `start_grok_chrome.py`,
+`GROK_BACKEND.md`.
+
+**Load-bearing deviation from ChatGPT — auth model:** grok.com
+authenticates via SSO (Google / X / Apple / email-link), not
+email+password. The owner-supplied reference scraper never automates a
+login either — it only ever loads cookies captured from a fully manual
+login. `GrokScraper` therefore has **no automated `login()` method at
+all**: `ensure_authenticated()` only checks whether the persisted profile
+already holds a valid session, and fails loud (with instructions to run
+`login_grok.py` or `import_grok_cookies.py`) otherwise. `cookies/
+authgrok.json`'s `email`/`password` fields are optional/reserved, not
+required.
+
+**Chat-flow logic ported 1:1 from `grok.js`:**
+- Composer/send-button selector cascades (grok.com has no stable
+  `data-testid`, unlike ChatGPT's `#prompt-textarea` / `[data-testid=
+  "send-button"]`) — falls back through generic element types and a
+  text/aria-label scan.
+- Response-choice A/B dialog handling ("Which response do you prefer?") —
+  a Grok-specific UI quirk with no ChatGPT equivalent.
+- Richer "still generating" detection (stop button + web-search progress
+  text like "Membaca"/"Menelusuri"/"Thinking…", not just a stop button).
+- Response-text cleaning regex cascade (strips image credits, search
+  status text, timestamps, speed labels, copy/share button text).
+- Canvas/code-block extraction (`pre, code, [class*="code"],
+  [class*="canvas"]` scan with SHA-256 dedup), in addition to fenced
+  ``` code blocks in the plain-text response.
+
+**Gateway (`vps_server.py`) changes:** `MODEL_ID_RE` now accepts
+`grok`/`grok(account1)` instead of `chatgpt`/`chatgpt(account1)`; the
+`backend == "chatgpt"` dispatch branch renamed to `backend == "grok"`
+(same deepseek-style envelope/result shape, unchanged). `public.py
+--backend` choices updated to `deepseek`/`qwen`/`grok`.
+
+**Tests updated (all passing after migration):**
+- `tests/test_vps_smoke.py`, `tests/test_http_e2e.py` — every
+  `chatgpt`/`chatgpt(account1)` case replaced with the `grok` equivalent;
+  `test_delete_session_e2e.py` required no changes (backend-agnostic).
+- `tests/_manual_login_detection_check.py`,
+  `tests/_manual_login_wait_check.py`, `tests/_manual_driver_check.py`,
+  `tests/_manual_stealth_check.py`, `tests/_manual_cookie_import_check.py`,
+  `tests/_manual_confirm_close_check.py` — all re-pointed at
+  `GrokScraper`/`login_grok`/`import_grok_cookies`, HTML stub domains
+  changed to `grok.com`, cookie-diagnostic essential-cookie check changed
+  from ChatGPT's `__Secure-next-auth.session-token` to Grok's `sso` cookie
+  (confirmed from a real grok.com Cookie-Editor export). All ran clean.
+- `tests/_manual_continue_button_check.py` **removed** — it tested a
+  ChatGPT-only bug (`button:has-text("Continue")` substring-matching
+  "Continue with phone number"), which cannot occur in Grok's SSO-only,
+  no-login-form model.
+
+**Docs updated:** `README.md`, `API_USAGE.md` — every ChatGPT reference
+replaced with the Grok equivalent (routing tables, curl examples, auth
+section, error-code table, cross-references to `GROK_BACKEND.md`).
+`requirements.txt` comments (`playwright-stealth`/`patchright` — "ChatGPT
+backend only" → "Grok backend only").
+
+**Known v1 limitations (see `GROK_BACKEND.md` §8):** no `think_mode`;
+attachments support is generic/best-effort (the reference scraper doesn't
+cover attachments); `rate_limited` text patterns are best-effort
+placeholders pending confirmation against a live grok.com account.
+
+---
+
+## [Retired] — ChatGPT backend (major update, SUPERSEDED BY GROK ABOVE)
+
+> **This backend no longer exists in the codebase.** The entries below are
+> kept as the historical engineering record explaining *why* the
+> Cloudflare/CDP mitigation ladder — now reused by the Grok backend — was
+> built the way it was. For current behavior, see the migration entry
+> above and [`GROK_BACKEND.md`](./GROK_BACKEND.md).
 
 **Index of entries below (newest first):**
 1. Feature — CDP attach ke Chrome asli yang sudah berjalan (workaround Turnstile terkuat)

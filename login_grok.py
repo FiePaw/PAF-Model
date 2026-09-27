@@ -1,31 +1,36 @@
 #!/usr/bin/env python3
 """
-login_chatgpt.py — one-time MANUAL login helper for the ChatGPT backend.
+login_grok.py — one-time MANUAL login helper for the Grok backend.
+REPLACES login_chatgpt.py entirely.
 
-Use this when automatic headless login gets stuck behind a Cloudflare
-Turnstile challenge on auth.openai.com (see CHANGELOG — this is a known,
-documented risk; Turnstile detects Playwright/CDP as an automation
-controller regardless of stealth patches or `channel="chrome"`, and no
-client-side workaround can guarantee bypassing it).
-
-This script opens a VISIBLE (headless=False) browser bound to the exact
-SAME persistent profile the worker/pool uses in production
-(profiles/chatgpt/<account>/ — see config/chatgpt.py / base_chatgpt.py).
-You log in by hand once — including solving the Turnstile checkbox
-yourself if it appears, entering email/password, clicking through
-"Continue with password", etc. — and this script polls in the background
+grok.com authenticates via SSO (Google / X (Twitter) / Apple / email-link)
+— there is no stable credential form to automate the way ChatGPT's
+"email → Continue → password" flow could be. This script therefore never
+tries to fill anything: it opens a VISIBLE (headless=False) browser bound
+to the exact SAME persistent profile the worker/pool uses in production
+(profiles/grok/<account>/ — see config/grok.py / base_grok.py), you log in
+by hand once — pick whichever SSO provider you use, solve any Cloudflare
+checkbox yourself if it appears — and this script polls in the background
 until it detects a successful login (the same `_is_logged_in()` check used
-everywhere else in this backend: the "Log in" button is gone from the DOM).
+everywhere else in this backend: no "Sign in"/"Log in" button, app shell
+rendered).
+
+The CDP/Cloudflare mitigation ladder here is REUSED VERBATIM from the
+ChatGPT backend's login_chatgpt.py (see GROK_BACKEND.md §6): a visible,
+persistent-profile browser is itself the "layer 4" mitigation. If
+Cloudflare still challenges this visible flow, escalate to
+import_grok_cookies.py (layer 5) or start_grok_chrome.py + GROK_CDP_ATTACH
+(layer 6 — the strongest).
 
 Once you're logged in, the persistent Chromium profile remembers the
 session on disk. From then on, running the worker normally in HEADLESS
-mode reuses that same profile and skips the login flow entirely —
-`ChatGPTScraper.ensure_authenticated()` checks `_is_logged_in()` FIRST and
-only falls back to the automated login() flow (and therefore only ever
-hits the Cloudflare-challenged path) if that check fails:
+mode reuses that same profile and skips straight to a valid session —
+`GrokScraper.ensure_authenticated()` checks `_is_logged_in()` FIRST and,
+unlike the ChatGPT backend, has NO automated login fallback at all if that
+check fails (see scrapers/grok_scraper.py) — it fails loud instead:
 
-    python login_chatgpt.py --account account1        # ONE-TIME, visible
-    python public.py --backend chatgpt --headless ...  # every run after, headless
+    python login_grok.py --account account1           # ONE-TIME, visible
+    python public.py --backend grok --headless ...     # every run after, headless
 
 This script never closes the browser on its own — after it detects login
 (or times out), it always pauses and asks you to confirm before closing.
@@ -33,27 +38,25 @@ Answer "n" (or just Ctrl+C / EOF) at that prompt to leave the browser
 window open for as long as you like.
 
 The account name only needs to match the name your worker/pool will use
-later (see cookies/authchatgpt.json). It does NOT need real credentials to
-be present there for this script to work — you can log in with whatever
-credentials you type into the browser by hand. Credentials in
-authchatgpt.json are only used as a fallback if the saved session
-eventually expires and the automated login() flow gets triggered again.
+later (see cookies/authgrok.json). It does NOT need real credentials to be
+present there for this script to work — log in with whatever SSO account
+you type/click into the browser by hand.
 
 Run one instance of this script PER account you need to warm up:
 
-    python login_chatgpt.py --account account1
-    python login_chatgpt.py --account account2
+    python login_grok.py --account account1
+    python login_grok.py --account account2
     ...
 
 Flags:
     --account NAME     Profile / account name (default: account1). Maps to
-                        profiles/chatgpt/<NAME>/.
-    --url URL          Page to open first (default: CHATGPT_CONFIG['base_url']).
+                        profiles/grok/<NAME>/.
+    --url URL          Page to open first (default: GROK_CONFIG['base_url']).
     --timeout SECONDS  How long to wait for you to finish logging in by hand
                         before giving up (default: 900s = 15 minutes).
     --channel NAME     Optional Playwright browser channel, e.g. "chrome" to
                         use a real installed Google Chrome instead of the
-                        bundled Chromium (same CHATGPT_BROWSER_CHANNEL
+                        bundled Chromium (same GROK_BROWSER_CHANNEL
                         contingency used by the headless worker).
 """
 from __future__ import annotations
@@ -63,31 +66,28 @@ import asyncio
 import sys
 import time
 
-from config import CHATGPT_CONFIG
-from scrapers.chatgpt_scraper import ChatGPTScraper
+from config import GROK_CONFIG
+from scrapers.grok_scraper import GrokScraper
 from scrapers.utils import get_logger
 
-log = get_logger("paf_chatgpt.manual_login")
+log = get_logger("paf_grok.manual_login")
 
 
-async def _find_logged_in_page(scraper: ChatGPTScraper):
+async def _find_logged_in_page(scraper: GrokScraper):
     """Check EVERY currently open page/tab in the browser context (not just
-    scraper.page) and return the first one that is chatgpt.com + logged in.
+    scraper.page) and return the first one that is grok.com + logged in.
 
-    BUG FIX: clicking "Log in" can open a POPUP window — a separate
+    Needed because an SSO click can open a POPUP window — a separate
     Playwright Page object. Polling only `scraper.page` (the original tab)
     while a popup is open checks the WRONG tab: the original tab can still
-    show stale ChatGPT app markup in the background (satisfying the
-    "Log in absent + app shell present" heuristic) while the real
-    Cloudflare/auth flow is happening on the popup the user is actually
-    looking at — causing a false "login detected" long before the user
-    finished anything. Checking every open page avoids needing to know in
-    advance whether a popup will appear, and self-heals once the popup
-    closes or navigates back to chatgpt.com (whichever page ends up
-    logged in is picked up automatically on the next poll).
+    show stale app markup in the background while the real SSO/Cloudflare
+    flow is happening on the popup the user is actually looking at.
+    Checking every open page avoids needing to know in advance whether a
+    popup will appear, and self-heals once the popup closes or navigates
+    back to grok.com.
 
     Returns the matching Page, or None if none of the open pages currently
-    qualify as "logged in on chatgpt.com".
+    qualify as "logged in on grok.com".
     """
     context = scraper._context
     if context is None:
@@ -102,30 +102,22 @@ async def _find_logged_in_page(scraper: ChatGPTScraper):
 
 
 async def wait_for_manual_login(
-    scraper: ChatGPTScraper, timeout: float, poll_interval: float = 2.0,
+    scraper: GrokScraper, timeout: float, poll_interval: float = 2.0,
 ) -> bool:
-    """Poll every open tab/popup until one of them is chatgpt.com + logged
-    in, on 2 CONSECUTIVE polls (debounced), or `timeout` elapses.
+    """Poll every open tab/popup until one of them is grok.com + logged in,
+    on 2 CONSECUTIVE polls (debounced), or `timeout` elapses.
 
     On success, `scraper._page` is updated to point at whichever page
-    object actually ended up logged in (which may be a popup that was
-    opened partway through, not the original tab) so everything after this
-    (save_cookies(), printing the profile path, etc.) operates on the
-    correct page.
+    object actually ended up logged in (which may be an SSO popup that
+    was opened partway through, not the original tab).
 
-    Debouncing guards against any residual one-poll race (e.g. a page
-    transitioning between two states exactly when polled) by requiring the
+    Debouncing guards against a residual one-poll race by requiring the
     signal to hold steady across two polls before trusting it — the same
-    "stability" pattern used by wait_for_response() elsewhere in this
-    codebase.
-
-    Kept as a standalone, testable function (no real browser needed to
-    unit-test the polling logic itself — see tests/_manual_login_wait_check.py).
+    "stability" pattern used by wait_for_response() elsewhere.
     """
     deadline = time.monotonic() + timeout
     last_notice = 0.0
     consecutive_true = 0
-    last_page_count = 1
     while time.monotonic() < deadline:
         found = await _find_logged_in_page(scraper)
         if found is not None:
@@ -140,14 +132,13 @@ async def wait_for_manual_login(
             remaining = int(deadline - now)
             page_count = len(scraper._context.pages) if scraper._context else 1
             popup_note = (
-                f" ({page_count} tab/window terbuka — popup terdeteksi, semua dipantau)"
+                f" ({page_count} tab/window terbuka — popup SSO terdeteksi, semua dipantau)"
                 if page_count > 1 else ""
             )
             print(
                 f"⏳ Waiting for you to finish logging in manually... "
-                f"({remaining}s left){popup_note} — solve any Cloudflare challenge, "
-                f"enter your email/password, click through 'Continue with "
-                f"password' if shown."
+                f"({remaining}s left){popup_note} — pick your SSO provider "
+                f"(Google/X/Apple/email), solve any Cloudflare challenge yourself."
             )
             last_notice = now
         await asyncio.sleep(poll_interval)
@@ -177,41 +168,39 @@ async def confirm_close(prompt_prefix: str, default_yes: bool = True) -> bool:
 
 async def _amain(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        description="One-time manual login helper for the PAF-Model ChatGPT backend.",
+        description="One-time manual login helper for the PAF-Model Grok backend.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument("--account", default="account1", help="Account/profile name (default: account1)")
-    parser.add_argument("--url", default=None, help="Page to open first (default: ChatGPT base_url)")
+    parser.add_argument("--url", default=None, help="Page to open first (default: Grok base_url)")
     parser.add_argument("--timeout", type=float, default=900.0, help="Seconds to wait for manual login (default 900)")
     parser.add_argument("--channel", default=None, help='Playwright browser channel, e.g. "chrome"')
     args = parser.parse_args(argv)
 
     if args.channel:
         import os
-        os.environ["CHATGPT_BROWSER_CHANNEL"] = args.channel
+        os.environ["GROK_BROWSER_CHANNEL"] = args.channel
 
-    url = args.url or CHATGPT_CONFIG["base_url"]
+    url = args.url or GROK_CONFIG["base_url"]
 
     print("=" * 70)
-    print(f"ChatGPT manual login — account: {args.account!r}")
-    print(f"Profile: profiles/chatgpt/{args.account}/")
-    from scrapers.base_chatgpt import DRIVER_NAME
+    print(f"Grok manual login — account: {args.account!r}")
+    print(f"Profile: profiles/grok/{args.account}/")
+    from scrapers.base_grok import DRIVER_NAME
     _drv_note = ("  (patched Playwright — CDP automation leaks removed)"
                  if DRIVER_NAME == "patchright" else "")
     print(f"Browser driver: {DRIVER_NAME}{_drv_note}")
     print("A VISIBLE browser window will open now. Log in by hand:")
-    print("  1. Click 'Log in' if shown (skip if already on the chat UI).")
-    print("  2. Solve any Cloudflare 'Verify you are human' checkbox yourself.")
-    print("  3. Enter your email -> Continue.")
-    print("  4. If a 'Check your inbox' page appears, click 'Continue with password'.")
-    print("  5. Enter your password -> Continue.")
-    print("  6. Wait for the normal ChatGPT chat UI to load.")
+    print("  1. Click 'Sign in' / 'Log in' if shown (skip if already on the chat UI).")
+    print("  2. Pick whichever SSO provider you use (Google / X / Apple / email-link).")
+    print("  3. Solve any Cloudflare 'Verify you are human' checkbox yourself.")
+    print("  4. Wait for the normal Grok chat UI to load.")
     print("This script detects success automatically, then ASKS before closing —")
     print("it will never close the browser without your confirmation.")
     print("=" * 70 + "\n")
 
-    scraper = ChatGPTScraper(headless=False, account=args.account)
+    scraper = GrokScraper(headless=False, account=args.account)
     await scraper.launch_browser(account=args.account)
     assert scraper.page is not None
 
@@ -245,11 +234,7 @@ async def _amain(argv: list[str]) -> int:
                 print("Browser dibiarkan terbuka supaya Anda bisa lanjut login manual atau memeriksa error nya.")
             return 1
 
-        await asyncio.sleep(CHATGPT_CONFIG.get("timeouts", {}).get("between_actions", 600) / 1000)
-        try:
-            await scraper.save_cookies()
-        except Exception:
-            pass
+        await asyncio.sleep(GROK_CONFIG.get("timeouts", {}).get("between_actions", 800) / 1000)
         profile_dir = scraper._profile_dir_for(args.account)
         sentinel = profile_dir / "cookies_seeded"
         try:
@@ -260,9 +245,9 @@ async def _amain(argv: list[str]) -> int:
         print(f"\n✅ Login detected — account '{args.account}' is now authenticated.")
         print(f"   Session saved in profile: {profile_dir}")
         print("   You can now run the headless worker normally, e.g.:")
-        print(f"   python public.py --backend chatgpt --vps ws://VPS_IP:PORT/ws/worker "
+        print(f"   python public.py --backend grok --vps ws://VPS_IP:PORT/ws/worker "
               f"--token YOUR_TOKEN")
-        print("   It will reuse this profile and skip the login flow entirely.\n")
+        print("   It will reuse this profile and skip straight to a valid session.\n")
 
         if await confirm_close("Login terkonfirmasi."):
             await scraper.close_browser()

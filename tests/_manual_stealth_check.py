@@ -1,4 +1,4 @@
-"""Ad-hoc check: playwright-stealth integration in base_chatgpt._apply_stealth
+"""Ad-hoc check: playwright-stealth integration in base_grok._apply_stealth
 doesn't throw, and navigator.webdriver is masked afterwards.
 
 Run: python3 tests/_manual_stealth_check.py
@@ -10,11 +10,11 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from playwright.async_api import async_playwright
-from scrapers.chatgpt_scraper import ChatGPTScraper
+from scrapers.grok_scraper import GrokScraper
 
 
 async def main():
-    scraper = ChatGPTScraper(headless=True, account="stub-test")
+    scraper = GrokScraper(headless=True, account="stub-test")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context()

@@ -1,29 +1,34 @@
 """
-browser_pool_chatgpt.py — Pre-warmed Browser Pool untuk ChatGPTScraper.
+browser_pool_grok.py — Pre-warmed Browser Pool untuk GrokScraper.
 ========================================================================
 
-AUTH MODEL (identik dengan Qwen/DeepSeek email+password mode):
-  • Semua account didefinisikan di cookies/authchatgpt.json
+AUTH MODEL (DEVIASI dari ChatGPT/Qwen/DeepSeek — lihat GROK_BACKEND.md §Auth):
+  • Semua account didefinisikan di cookies/authgrok.json
     Format: [{"name": "account1", "email": "...", "password": "..."}]
-  • Setiap account → persistent browser profile di profiles/chatgpt/<account>/
+    ("email"/"password" bersifat opsional/reserved — TIDAK dipakai untuk
+    automated login. grok.com adalah SSO-only, jadi field ini hanya
+    catatan, bukan sumber automated-fill.)
+  • Setiap account → persistent browser profile di profiles/grok/<account>/
   • Saat warmup (start()), setiap slot:
       1. launch_browser(account) → buka persistent context
       2. ensure_authenticated():
-           - Profile lama & session valid  → langsung siap (tanpa login)
-           - Profile baru / expired        → login otomatis (headless=true,
-             via "Continue with password")
+           - Profile lama & session valid → langsung siap (tanpa login)
+           - Profile baru / expired       → GAGAL LOUD (tidak ada automated
+             login/fallback). Operator harus menjalankan salah satu:
+               python login_grok.py --account <name>          (manual, visible)
+               python import_grok_cookies.py --account <name> --cookies <file>
 
-Deviasi dari browser_pool_qwen.py (per design v1, Tahap D):
-  • TIDAK ada legacy cookie-file mode (ChatGPT hanya auth.json).
+Deviasi dari browser_pool_qwen.py / browser_pool_chatgpt.py (per migrasi ke Grok):
+  • TIDAK ada automated email+password login flow sama sekali.
   • TIDAK ada think_mode / no-headless-per-slot runtime toggle.
   • 1 slot per account (pool_size = len(accounts) secara default; bisa
     di-override tapi tetap wrap round-robin bila pool_size > jumlah account).
   • run_task() TIDAK melakukan goto()/skip-goto optimisation sendiri —
-    ChatGPTScraper.send_prompt() sudah menangani navigasi NEW/CONTINUE
+    GrokScraper.send_prompt() sudah menangani navigasi NEW/CONTINUE
     (termasuk continue_url) di dalam scrape(), jadi pool hanya
     acquire → scrape → release.
 
-Usage (di public_chatgpt.py):
+Usage (di public_grok.py):
     pool = BrowserPool(pool_size=2, headless=True)
     await pool.start()
 
@@ -40,11 +45,11 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import AsyncIterator, Optional
 
-from config import CHATGPT_AUTH_CONFIG
-from scrapers.chatgpt_scraper import ChatGPTScraper
+from config import GROK_AUTH_CONFIG
+from scrapers.grok_scraper import GrokScraper
 from scrapers.utils import AuthStore, setup_logger
 
-logger = setup_logger("browser_pool_chatgpt")
+logger = setup_logger("browser_pool_grok")
 
 
 # ─── Slot Status ──────────────────────────────────────────────────────── #
@@ -62,7 +67,7 @@ class SlotStatus(Enum):
 class BrowserSlot:
     slot_id: int
     account_name: str
-    scraper: Optional[ChatGPTScraper] = None
+    scraper: Optional[GrokScraper] = None
     status: SlotStatus = SlotStatus.STARTING
     last_used: float = field(default_factory=time.time)
     error_count: int = 0
@@ -91,22 +96,24 @@ class BrowserPool:
     def __init__(self, pool_size: int | None = None, headless: bool = True) -> None:
         self.headless = headless
 
-        auth_store = AuthStore(CHATGPT_AUTH_CONFIG["auth_file"])
+        auth_store = AuthStore(GROK_AUTH_CONFIG["auth_file"])
         self._auth_accounts: list[str] = auth_store.account_names()
 
         if not self._auth_accounts:
             raise RuntimeError(
-                f"Tidak ada account di {CHATGPT_AUTH_CONFIG['auth_file']}.\n"
+                f"Tidak ada account di {GROK_AUTH_CONFIG['auth_file']}.\n"
                 f"Buat file tersebut dengan format:\n"
-                f'  [{{"name": "account1", "email": "you@email.com", "password": "secret"}}]\n'
-                f"Lihat .env.example untuk petunjuk lengkap."
+                f'  [{{"name": "account1"}}]\n'
+                f"Nama account cukup — session-nya berasal dari login_grok.py atau "
+                f"import_grok_cookies.py, bukan email/password (grok.com adalah "
+                f"SSO-only). Lihat GROK_BACKEND.md."
             )
 
         # Default: 1 slot per account.
         self.pool_size = pool_size if pool_size else len(self._auth_accounts)
 
         logger.info(
-            "BrowserPool(chatgpt): authchatgpt.json — %d account(s): %s, pool_size=%d",
+            "BrowserPool(grok): authgrok.json — %d account(s): %s, pool_size=%d",
             len(self._auth_accounts), self._auth_accounts, self.pool_size,
         )
 
@@ -130,16 +137,17 @@ class BrowserPool:
         await asyncio.gather(*[self._init_slot(slot) for slot in self._slots])
 
         idle_count = sum(1 for s in self._slots if s.status == SlotStatus.IDLE)
-        logger.info("BrowserPool(chatgpt): %d/%d slot berhasil IDLE", idle_count, self.pool_size)
+        logger.info("BrowserPool(grok): %d/%d slot berhasil IDLE", idle_count, self.pool_size)
         if idle_count == 0:
             raise RuntimeError(
-                "Tidak ada slot ChatGPT yang berhasil diinisialisasi. "
-                "Cek credentials di authchatgpt.json dan koneksi internet."
+                "Tidak ada slot Grok yang berhasil diinisialisasi. "
+                "Jalankan login_grok.py atau import_grok_cookies.py untuk setiap "
+                "account di authgrok.json, lalu cek koneksi internet."
             )
         self._started = True
 
     async def stop(self) -> None:
-        logger.info("BrowserPool(chatgpt): menutup semua slot...")
+        logger.info("BrowserPool(grok): menutup semua slot...")
 
         async def _close(slot: BrowserSlot) -> None:
             if slot.scraper:
@@ -153,7 +161,7 @@ class BrowserPool:
 
         await asyncio.gather(*[_close(s) for s in self._slots])
         self._started = False
-        logger.info("BrowserPool(chatgpt): semua slot ditutup")
+        logger.info("BrowserPool(grok): semua slot ditutup")
 
     # ── Slot initialization ──────────────────────────────────────── #
 
@@ -164,14 +172,15 @@ class BrowserPool:
             logger.info("Slot#%d: warming up account '%s' (headless=%s) …",
                         slot.slot_id, account, self.headless)
 
-            scraper = ChatGPTScraper(headless=self.headless, account=account)
+            scraper = GrokScraper(headless=self.headless, account=account)
             await scraper.launch_browser(account=account)
 
             ok = await scraper.ensure_authenticated()
             if not ok:
                 raise RuntimeError(
-                    f"Autentikasi ChatGPT gagal untuk account '{account}'. "
-                    f"Periksa credentials di {CHATGPT_AUTH_CONFIG['auth_file']}."
+                    f"Autentikasi Grok gagal untuk account '{account}'. "
+                    f"Jalankan login_grok.py --account {account} atau "
+                    f"import_grok_cookies.py --account {account} --cookies <file>."
                 )
 
             logger.info("Slot#%d ✅ siap (account: %s)", slot.slot_id, account)
@@ -272,7 +281,7 @@ class BrowserPool:
                     self._idle_event.clear()
 
             if time.monotonic() >= deadline:
-                raise TimeoutError("No available ChatGPT worker slot within timeout")
+                raise TimeoutError("No available Grok worker slot within timeout")
 
             try:
                 await asyncio.wait_for(self._idle_event.wait(), timeout=self.ACQUIRE_POLL)
@@ -290,26 +299,13 @@ class BrowserPool:
         continue_url: str | None = None,
         preferred_account: str | None = None,
         acquire_timeout: float = 120.0,
-        tools: list[dict] | None = None,
-        max_tokens: int | None = None,
-        system_prompt: str | None = None,
     ) -> dict:
         """Acquire a slot (pinned to preferred_account when given), scrape,
         release. On rate-limit in mode='new', rotate account and retry once.
-
-        tools / max_tokens / system_prompt: forwarded from the VPS so the
-        scraper can build the [SYSTEM CONTEXT]/[USER REQUEST] wrapper (see
-        scrapers/chatgpt_scraper.py::_build_wrapped_prompt).
         """
         async with self.acquire(preferred_account, timeout=acquire_timeout) as slot:
             result = await slot.scraper.scrape(
-                prompt,
-                mode=mode,
-                attachments=attachments,
-                continue_url=continue_url,
-                tools=tools,
-                max_tokens=max_tokens,
-                system_prompt=system_prompt,
+                prompt, mode=mode, attachments=attachments, continue_url=continue_url,
             )
 
             if not result.get("ok") and mode == "new":
@@ -321,13 +317,7 @@ class BrowserPool:
                     rotated = await slot.scraper._rotate_account()
                     if rotated:
                         result = await slot.scraper.scrape(
-                            prompt,
-                            mode=mode,
-                            attachments=attachments,
-                            continue_url=continue_url,
-                            tools=tools,
-                            max_tokens=max_tokens,
-                            system_prompt=system_prompt,
+                            prompt, mode=mode, attachments=attachments, continue_url=continue_url,
                         )
             elif not result.get("ok") and mode == "continue":
                 # Session terikat akun — rotasi akan kehilangan konteks percakapan.
@@ -341,15 +331,15 @@ class BrowserPool:
     # ── Account management / diagnostics ─────────────────────────── #
 
     def add_account(self, account_name: str) -> None:
-        """Register a new account name from authchatgpt.json into the pool
+        """Register a new account name from authgrok.json into the pool
         (runtime addition — actual browser init happens lazily via
         LocalWorker._add_account_runtime, mirroring DeepSeek's pattern)."""
         name = account_name.strip()
-        auth_store = AuthStore(CHATGPT_AUTH_CONFIG["auth_file"])
+        auth_store = AuthStore(GROK_AUTH_CONFIG["auth_file"])
         all_accounts = auth_store.account_names()
         if name not in all_accounts:
             raise ValueError(
-                f"Account '{name}' tidak ditemukan di {CHATGPT_AUTH_CONFIG['auth_file']}. "
+                f"Account '{name}' tidak ditemukan di {GROK_AUTH_CONFIG['auth_file']}. "
                 f"Account tersedia: {all_accounts}"
             )
         for slot in self._slots:

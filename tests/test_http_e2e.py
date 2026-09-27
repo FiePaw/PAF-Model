@@ -1,15 +1,18 @@
 """True loopback integration test: uvicorn + real WS worker + httpx POST.
 
-Extended (Tahap G2) with a fake chatgpt worker (`backend="chatgpt"`) exercising
-the deepseek-style envelope/result shape, plus a `chatgpt(account1)` account-
-routed case.
+Extended with a fake grok worker (`backend="grok"`) exercising the
+deepseek-style envelope/result shape, plus a `grok(account1)` account-
+routed case. Grok REPLACES the retired chatgpt backend entirely (see
+GROK_BACKEND.md) — this test previously exercised "chatgpt", now exercises
+"grok" with the exact same envelope/result shape.
 
-Fix (regression found while adding chatgpt): the deepseek case previously used
-model="deepseek-chat", which does NOT match the current MODEL_ID_RE in
-vps_server.py (only bare "deepseek"/"qwen"/"chatgpt" or "<backend>(<account>)"
-are accepted). That model string caused chat_completions() to raise a 400
-immediately, while the test still awaited `ws.recv()` for a task envelope
-that was never dispatched -- hanging forever. Fixed to use "deepseek".
+Fix (regression found while adding the (retired) chatgpt backend, still
+relevant to grok): the deepseek case previously used model="deepseek-chat",
+which does NOT match the current MODEL_ID_RE in vps_server.py (only bare
+"deepseek"/"qwen"/"grok" or "<backend>(<account>)" are accepted). That model
+string caused chat_completions() to raise a 400 immediately, while the test
+still awaited `ws.recv()` for a task envelope that was never dispatched --
+hanging forever. Fixed to use "deepseek".
 """
 import asyncio
 import json
@@ -87,27 +90,27 @@ async def main():
         expect_text="pong-qwen",
         use_query_token=True,
     )
-    # ChatGPT — bare "chatgpt" model, deepseek-style envelope/result shape.
+    # Grok — bare "grok" model, deepseek-style envelope/result shape.
     await run_case(
-        backend="chatgpt", model="chatgpt",
-        register_msg={"type": "register", "backend": "chatgpt", "token": "change-me",
+        backend="grok", model="grok",
+        register_msg={"type": "register", "backend": "grok", "token": "change-me",
                       "hostname": "win2", "max_concurrent": 1, "accounts": ["account1"]},
         make_result=lambda tid: {"type": "result", "task_id": tid,
-                                 "result": {"ok": True, "text": "pong-chatgpt", "account": "account1",
-                                            "conversation_url": "https://chatgpt.com/c/abc",
+                                 "result": {"ok": True, "text": "pong-grok", "account": "account1",
+                                            "conversation_url": "https://grok.com/c/abc",
                                             "usage": {"prompt_tokens": 1, "completion_tokens": 1}}},
-        expect_text="pong-chatgpt",
+        expect_text="pong-grok",
     )
-    # Account-routed model id: chatgpt(account1)
+    # Account-routed model id: grok(account1)
     await run_case(
-        backend="chatgpt", model="chatgpt(account1)",
-        register_msg={"type": "register", "backend": "chatgpt", "token": "change-me",
+        backend="grok", model="grok(account1)",
+        register_msg={"type": "register", "backend": "grok", "token": "change-me",
                       "hostname": "win3", "max_concurrent": 1, "accounts": ["account1"]},
         make_result=lambda tid: {"type": "result", "task_id": tid,
-                                 "result": {"ok": True, "text": "pong-chatgpt-acc1", "account": "account1",
-                                            "conversation_url": "https://chatgpt.com/c/def",
+                                 "result": {"ok": True, "text": "pong-grok-acc1", "account": "account1",
+                                            "conversation_url": "https://grok.com/c/def",
                                             "usage": {"prompt_tokens": 1, "completion_tokens": 1}}},
-        expect_text="pong-chatgpt-acc1",
+        expect_text="pong-grok-acc1",
     )
     print("\nALL HTTP E2E TESTS PASSED")
 

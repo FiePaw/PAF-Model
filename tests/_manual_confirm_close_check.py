@@ -1,4 +1,4 @@
-"""Ad-hoc check for login_chatgpt.confirm_close() -- verifies it always
+"""Ad-hoc check for login_grok.confirm_close() -- verifies it always
 waits for an explicit answer and never decides to close on its own.
 
 Run: python3 tests/_manual_confirm_close_check.py
@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from login_chatgpt import confirm_close
+from login_grok import confirm_close
 
 
 async def _case(answer_or_exc, default_yes, expected, label):

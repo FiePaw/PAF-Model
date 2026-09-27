@@ -1,51 +1,57 @@
 #!/usr/bin/env python3
 """
-import_chatgpt_cookies.py — seed a ChatGPT account profile from cookies
-exported manually out of a normal browser (Cookie-Editor extension).
+import_grok_cookies.py — seed a Grok account profile from cookies exported
+manually out of a normal browser (Cookie-Editor extension). REPLACES
+import_chatgpt_cookies.py entirely.
 
-This is the ZERO-AUTOMATION login path for when Cloudflare Turnstile blocks
-BOTH the automated headless login AND the visible manual-login helper
-(login_chatgpt.py): you log into chatgpt.com once in your everyday browser —
-no Playwright, no CDP, nothing for Cloudflare to detect — export the
-cookies, and this script injects them into the persistent profile the
-worker uses. The login flow (and therefore the Turnstile challenge on
-auth.openai.com) is never executed at all.
+This is the ZERO-AUTOMATION login path — REUSED VERBATIM from the ChatGPT
+backend's mitigation ladder (layer 5, see GROK_BACKEND.md §6) and the
+exact same technique the owner-supplied reference scraper relies on
+(login-capture-grok.js: capture cookies from a fully manual login, then
+load them into every subsequent automated run — grok.js itself never
+authenticates, it only ever loads pre-captured cookies): you log into
+grok.com once in your everyday browser — no Playwright, no CDP, nothing
+for Cloudflare/anti-bot checks to detect — export the cookies, and this
+script injects them into the persistent profile the worker uses. No login
+flow (and therefore no SSO/Cloudflare challenge) is ever executed here at
+all, for either the automated worker OR this import step.
 
 How to export the cookies:
-  1. In your NORMAL browser (the one you use daily), log into chatgpt.com.
+  1. In your NORMAL browser (the one you use daily), log into grok.com via
+     whichever SSO provider you use (Google / X / Apple / email-link).
   2. Install the "Cookie-Editor" browser extension.
-  3. While on chatgpt.com, open Cookie-Editor → Export → Export JSON
-     (this includes httpOnly cookies — required; "Export Header string"
-     will NOT work).
-  4. Save the file as e.g. cookies/chatgpt_account1.cookies.json.
+  3. While on grok.com, open Cookie-Editor → Export → Export JSON (this
+     includes httpOnly cookies — required; "Export Header string" will
+     NOT work).
+  4. Save the file as e.g. cookies/grok_account1.cookies.json.
 
 Then run:
-  python import_chatgpt_cookies.py --account account1 \
-      --cookies cookies/chatgpt_account1.cookies.json
+  python import_grok_cookies.py --account account1 \
+      --cookies cookies/grok_account1.cookies.json
 
 The script:
   1. Loads + converts the export (Cookie-Editor format → Playwright format,
-     via the same cookie_editor_json_to_playwright() helper the Qwen
-     legacy cookie-seeding path uses).
-  2. Opens the persistent profile profiles/chatgpt/<account>/ (the SAME
+     via the same cookie_editor_json_to_playwright() helper the ChatGPT/
+     Qwen cookie-seeding paths already use — no changes needed there).
+  2. Opens the persistent profile profiles/grok/<account>/ (the SAME
      profile the worker/pool uses later).
-  3. Navigates to chatgpt.com, injects the cookies, reloads.
+  3. Navigates to grok.com, injects the cookies, reloads.
   4. Verifies the session is actually valid (_page_is_logged_in()).
   5. On success writes the profile sentinel and asks before closing the
      browser (never closes without your confirmation).
 
-After this, run the headless worker normally — it reuses the seeded profile
-and skips the login flow entirely:
+After this, run the headless worker normally — it reuses the seeded
+profile and skips straight to a valid session (there is no login flow to
+skip past — see scrapers/grok_scraper.py):
 
-  python public.py --backend chatgpt --vps ws://VPS_IP:PORT/ws/worker --token YOUR_TOKEN
+  python public.py --backend grok --vps ws://VPS_IP:PORT/ws/worker --token YOUR_TOKEN
 
 Notes:
-  • The account name must exist in cookies/authchatgpt.json (email/password
-    can be left empty — credentials are only a fallback if the imported
-    session ever expires).
-  • Export cookies while LOGGED IN on chatgpt.com — exporting from
-    auth.openai.com or the logged-out homepage won't contain the session
-    token.
+  • The account name must exist in cookies/authgrok.json (email/password
+    fields are optional/reserved and not required for this backend).
+  • Export cookies while LOGGED IN on grok.com — exporting from an SSO
+    provider's own domain or the logged-out homepage won't contain the
+    session cookies.
   • If verification fails, the most common causes are: export taken while
     logged out, export without httpOnly cookies, or an expired session —
     re-export and try again.
@@ -57,12 +63,12 @@ import asyncio
 import sys
 from pathlib import Path
 
-from config import CHATGPT_CONFIG
-from login_chatgpt import confirm_close
-from scrapers.chatgpt_scraper import ChatGPTScraper
+from config import GROK_CONFIG
+from login_grok import confirm_close
+from scrapers.grok_scraper import GrokScraper
 from scrapers.utils import get_logger, load_json
 
-log = get_logger("paf_chatgpt.cookie_import")
+log = get_logger("paf_grok.cookie_import")
 
 
 def load_and_convert_cookies(path: str | Path) -> tuple[list[dict], list[dict]]:
@@ -76,7 +82,7 @@ def load_and_convert_cookies(path: str | Path) -> tuple[list[dict], list[dict]]:
     if not path.exists():
         raise FileNotFoundError(
             f"Cookie file not found: {path}\n"
-            "Export it via the Cookie-Editor extension on chatgpt.com "
+            "Export it via the Cookie-Editor extension on grok.com "
             "(Export → Export JSON) while LOGGED IN."
         )
     try:
@@ -109,29 +115,33 @@ def load_and_convert_cookies(path: str | Path) -> tuple[list[dict], list[dict]]:
 
 
 def _diagnose(raw: list[dict]) -> list[str]:
-    """Human-readable hints about a failed import, derived from the export."""
+    """Human-readable hints about a failed import, derived from the export.
+
+    The essential-cookie check targets "sso" (grok.com's httpOnly session
+    cookie, confirmed from a real grok.com Cookie-Editor export — see
+    GROK_BACKEND.md), analogous to ChatGPT's
+    "__Secure-next-auth.session-token"."""
     hints = []
     domains = sorted({str(c.get("domain", "")).lstrip(".") for c in raw if isinstance(c, dict)})
     names = {str(c.get("name", "")) for c in raw if isinstance(c, dict)}
-    if not any("chatgpt" in d for d in domains):
+    if not any("grok.com" in d for d in domains):
         hints.append(
-            "Tidak ada cookie untuk domain chatgpt.com — export kemungkinan "
+            "Tidak ada cookie untuk domain grok.com — export kemungkinan "
             f"diambil dari situs yang salah (domain di file: {domains}). "
-            "Buka chatgpt.com dulu, baru Export di Cookie-Editor."
+            "Buka grok.com dulu (setelah login SSO), baru Export di Cookie-Editor."
         )
-    if not any("session-token" in n for n in names):
+    if "sso" not in names:
         hints.append(
-            "Cookie session token (__Secure-next-auth.session-token) tidak "
-            "ditemukan — kemungkinan export dilakukan saat BELUM login, atau "
-            "ekstensi menyembunyikan httpOnly cookies. Pastikan sudah login "
-            "dan gunakan 'Export JSON'."
+            "Cookie sesi 'sso' (httpOnly) tidak ditemukan — kemungkinan export "
+            "dilakukan saat BELUM login, atau ekstensi menyembunyikan httpOnly "
+            "cookies. Pastikan sudah login via SSO dan gunakan 'Export JSON'."
         )
     return hints
 
 
 async def _amain(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        description="Seed a ChatGPT worker profile from manually exported cookies.",
+        description="Seed a Grok worker profile from manually exported cookies.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -144,7 +154,7 @@ async def _amain(argv: list[str]) -> int:
 
     if args.channel:
         import os
-        os.environ["CHATGPT_BROWSER_CHANNEL"] = args.channel
+        os.environ["GROK_BROWSER_CHANNEL"] = args.channel
 
     try:
         cookies, raw = load_and_convert_cookies(args.cookies)
@@ -153,18 +163,18 @@ async def _amain(argv: list[str]) -> int:
         return 1
 
     print("=" * 70)
-    print(f"ChatGPT cookie import — account: {args.account!r}")
+    print(f"Grok cookie import — account: {args.account!r}")
     print(f"Cookie file : {args.cookies} ({len(cookies)} cookie(s) setelah konversi)")
-    print(f"Profile     : profiles/chatgpt/{args.account}/")
+    print(f"Profile     : profiles/grok/{args.account}/")
     print("=" * 70 + "\n")
 
-    scraper = ChatGPTScraper(headless=args.headless, account=args.account)
+    scraper = GrokScraper(headless=args.headless, account=args.account)
     await scraper.launch_browser(account=args.account)
     page = scraper.page
     assert page is not None
 
     try:
-        await page.goto(CHATGPT_CONFIG["base_url"], wait_until="domcontentloaded", timeout=30_000)
+        await page.goto(GROK_CONFIG["base_url"], wait_until="domcontentloaded", timeout=30_000)
         await scraper._context.add_cookies(cookies)
         await page.reload(wait_until="domcontentloaded", timeout=30_000)
         await asyncio.sleep(2.0)  # beri waktu SPA menentukan state login
@@ -176,14 +186,10 @@ async def _amain(argv: list[str]) -> int:
                 sentinel.write_text("1", encoding="utf-8")
             except Exception:
                 pass
-            try:
-                await scraper.save_cookies()
-            except Exception:
-                pass
 
             print(f"\n✅ Session valid — account '{args.account}' ter-seed dari cookies.")
             print(f"   Profile: {profile_dir}")
-            print("   Jalankan worker headless seperti biasa; login flow tidak akan dieksekusi.\n")
+            print("   Jalankan worker headless seperti biasa; tidak ada login flow yang dieksekusi.\n")
             if await confirm_close("Import cookies selesai."):
                 await scraper.close_browser()
             else:

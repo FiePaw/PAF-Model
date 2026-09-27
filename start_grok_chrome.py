@@ -1,41 +1,43 @@
 #!/usr/bin/env python3
 """
-start_chatgpt_chrome.py — start a REAL Chrome with remote debugging enabled,
-bound to the SAME persistent profile the ChatGPT worker uses.
+start_grok_chrome.py — start a REAL Chrome with remote debugging enabled,
+bound to the SAME persistent profile the Grok worker uses.
 
-This is the strongest workaround for the Cloudflare Turnstile challenge on
-auth.openai.com / chatgpt.com: the browser is a real Chrome that started
-ITSELF (no Playwright launch flags, no AutomationControlled hints, nothing
-injected before pages load). The worker then ATTACHES to it over CDP and
-only reads the DOM / clicks — the process-level automation fingerprints
-Turnstile detects at browser-launch time simply don't exist.
+This is the strongest workaround for Cloudflare/anti-bot challenges on
+grok.com (REUSED VERBATIM from the retired ChatGPT backend's mitigation
+ladder — see GROK_BACKEND.md §6): the browser is a real Chrome that
+started ITSELF (no Playwright launch flags, no AutomationControlled
+hints, nothing injected before pages load). The worker then ATTACHES to
+it over CDP and only reads the DOM / clicks — the process-level
+automation fingerprints Cloudflare Turnstile detects at browser-launch
+time simply don't exist.
 
 Typical flow (one terminal for Chrome, one for the worker):
 
   # Terminal 1 — start real Chrome with the worker's profile:
-  python start_chatgpt_chrome.py --account account1
+  python start_grok_chrome.py --account account1
 
-  # Log into chatgpt.com in that window by hand ONCE
+  # Log into grok.com in that window by hand ONCE
   # (solve any Cloudflare checkbox yourself — it almost never appears here,
   #  because this is a real Chrome, not an automation-launched browser).
 
   # Terminal 2 — run the worker attached to that Chrome:
-  set CHATGPT_CDP_ATTACH=1        # (Windows; export on Linux/Mac)
-  python public.py --backend chatgpt --vps ws://VPS_IP:PORT/ws/worker --token YOUR_TOKEN
+  set GROK_CDP_ATTACH=1        # (Windows; export on Linux/Mac)
+  python public.py --backend grok --vps ws://VPS_IP:PORT/ws/worker --token YOUR_TOKEN
 
 The Chrome window stays open until you stop it:
-  python start_chatgpt_chrome.py --account account1 --stop
+  python start_grok_chrome.py --account account1 --stop
 
 Flags:
   --account NAME   Profile / account name (default: account1) →
-                   profiles/chatgpt/<NAME>/ (same dir the worker uses).
+                   profiles/grok/<NAME>/ (same dir the worker uses).
   --port PORT      CDP debugging port (default: 9222).
   --headless       Start Chrome headless (NOT recommended for the first
                    login — solve challenges visually first).
   --channel NAME   Browser binary: "chrome" (real Google Chrome, default),
                    "msedge", "brave", or "chromium" (Playwright's bundled
                    one — weakest option, avoid for Cloudflare).
-  --url URL        Page to open after start (default: ChatGPT base_url).
+  --url URL        Page to open after start (default: Grok base_url).
   --stop           Stop the Chrome started earlier for this account
                    (reads the PID file written on start).
 """
@@ -49,10 +51,10 @@ import sys
 import time
 from pathlib import Path
 
-from config import CHATGPT_CONFIG, PROFILES_DIR
+from config import GROK_CONFIG, PROFILES_DIR
 from scrapers.utils import get_logger
 
-log = get_logger("paf_chatgpt.chrome")
+log = get_logger("paf_grok.chrome")
 
 CHROME_ARGS = [
     "--no-first-run",
@@ -72,7 +74,7 @@ CHROME_ARGS = [
 
 
 def _pid_file(account: str, port: int) -> Path:
-    return PROFILES_DIR / "chatgpt" / f"{account}.chrome-{port}.pid"
+    return PROFILES_DIR / "grok" / f"{account}.chrome-{port}.pid"
 
 
 def _find_chrome_binary(channel: str) -> str | None:
@@ -118,7 +120,7 @@ def _wait_for_cdp(port: int, timeout: float = 30.0) -> bool:
 
 
 def start_chrome(account: str, port: int, headless: bool, channel: str, url: str) -> int:
-    profile_dir = PROFILES_DIR / "chatgpt" / account
+    profile_dir = PROFILES_DIR / "grok" / account
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     binary = _find_chrome_binary(channel)
@@ -153,11 +155,11 @@ def start_chrome(account: str, port: int, headless: bool, channel: str, url: str
     log.info("✅ Chrome siap — CDP: http://127.0.0.1:%s (pid %s, pid file: %s)",
              port, proc.pid, pid_file)
     print("\nSelanjutnya:")
-    print("  1. Log into chatgpt.com di jendela Chrome ini (sekali saja).")
-    print("  2. Jalankan worker dengan CHATGPT_CDP_ATTACH=1, mis.:")
-    print("       set CHATGPT_CDP_ATTACH=1   (Windows)")
-    print("       python public.py --backend chatgpt --vps ws://VPS_IP:PORT/ws/worker --token YOUR_TOKEN")
-    print(f"  3. Untuk menghentikan Chrome ini: python start_chatgpt_chrome.py --account {account} --stop\n")
+    print("  1. Log into grok.com di jendela Chrome ini (sekali saja).")
+    print("  2. Jalankan worker dengan GROK_CDP_ATTACH=1, mis.:")
+    print("       set GROK_CDP_ATTACH=1   (Windows)")
+    print("       python public.py --backend grok --vps ws://VPS_IP:PORT/ws/worker --token YOUR_TOKEN")
+    print(f"  3. Untuk menghentikan Chrome ini: python start_grok_chrome.py --account {account} --stop\n")
 
     try:
         proc.wait()
@@ -186,12 +188,12 @@ def stop_chrome(account: str, port: int) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Start a real Chrome for CDP attach (ChatGPT backend).")
+    parser = argparse.ArgumentParser(description="Start a real Chrome for CDP attach (Grok backend).")
     parser.add_argument("--account", default="account1", help="Account/profile name (default: account1)")
     parser.add_argument("--port", type=int, default=9222, help="CDP debugging port (default: 9222)")
     parser.add_argument("--headless", action="store_true", help="Start Chrome headless (not recommended for first login)")
     parser.add_argument("--channel", default="chrome", help='Browser binary: "chrome" (default), "msedge", "brave", "chromium"')
-    parser.add_argument("--url", default=CHATGPT_CONFIG["base_url"], help="Page to open after start")
+    parser.add_argument("--url", default=GROK_CONFIG["base_url"], help="Page to open after start")
     parser.add_argument("--stop", action="store_true", help="Stop the Chrome started earlier for this account")
     args = parser.parse_args()
 

@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-public_chatgpt.py — Local Worker for the ChatGPT backend, mirroring
+public_grok.py — Local Worker for the Grok backend. REPLACES
+public_chatgpt.py entirely (see GROK_BACKEND.md). Mirrors
 public_deepseek.py's Session persistence, envelope shape, and interactive
-CLI (per design_chatgpt_backend.md / implementation.md, Tahap E).
+CLI, exactly as the retired ChatGPT worker did.
 
 Deviations from public_deepseek.py (v1 scope):
   • NO model_tab / deep_think / web_search / tool_messages (chat-only, no
-    think_mode — see config/chatgpt.py).
+    think_mode — see config/grok.py).
+  • NO automated login — grok.com is SSO-only. Sessions come from
+    login_grok.py (manual) or import_grok_cookies.py (cookie import),
+    run once per account before starting this worker.
   • NO --session-ttl CLI flag — sessions have no automatic TTL at all
     (mirrors the CHANGELOG "sesi 5" TTL-removal decision that already
     applies to deepseek/qwen). cleanup_older_than() is kept as a manual,
     explicit console command / hook only.
-  • Registers with the VPS using "backend": "chatgpt" and the DeepSeek-style
+  • Registers with the VPS using "backend": "grok" and the DeepSeek-style
     task envelope {"type":"task","task_id","request":{...}} (a brand-new
     worker, no legacy protocol to keep compatible with).
 
 Usage
 -----
-  python public.py --backend chatgpt --vps ws://VPS_IP:8000/ws/worker \\
+  python public.py --backend grok --vps ws://VPS_IP:8000/ws/worker \\
       --workers 2 --token MY_SHARED_SECRET
 
 Commands (interactive REPL):
@@ -44,13 +48,13 @@ from typing import Optional
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from browser_pool_chatgpt import BrowserPool
+from browser_pool_grok import BrowserPool
 from config import DATA_SESSION_DIR
 from scrapers.utils import get_logger
 
-log = get_logger("paf_chatgpt.worker")
+log = get_logger("paf_grok.worker")
 
-_SESSION_STORAGE_DIR = Path(DATA_SESSION_DIR) / "chatgpt"
+_SESSION_STORAGE_DIR = Path(DATA_SESSION_DIR) / "grok"
 
 
 # =========================================================================== #
@@ -76,7 +80,7 @@ class Session:
 
 
 # =========================================================================== #
-# SessionStore — persist dataSession/chatgpt/*.json
+# SessionStore — persist dataSession/grok/*.json
 # =========================================================================== #
 class SessionStore:
     def __init__(self, storage_dir: Path = _SESSION_STORAGE_DIR) -> None:
@@ -134,7 +138,7 @@ class SessionStore:
             except Exception as exc:
                 log.warning("SessionStore: failed to read %s: %s", path.name, exc)
         if restored:
-            log.info("SessionStore(chatgpt): restored %d session(s) from disk", restored)
+            log.info("SessionStore(grok): restored %d session(s) from disk", restored)
         return restored
 
     def create(self, session_id: Optional[str] = None, account: Optional[str] = None) -> Session:
@@ -169,7 +173,7 @@ class SessionStore:
         existed = self._sessions.pop(session_id, None) is not None
         self._delete_from_disk(session_id)
         if existed:
-            log.info("SessionStore(chatgpt): session %s deleted", session_id[:8])
+            log.info("SessionStore(grok): session %s deleted", session_id[:8])
         return existed
 
     def cleanup_older_than(self, max_age: float) -> int:
@@ -179,7 +183,7 @@ class SessionStore:
             self._delete_from_disk(sid)
         if old:
             log.info(
-                "SessionStore(chatgpt): manually cleaned %d session(s) older than %.0fs",
+                "SessionStore(grok): manually cleaned %d session(s) older than %.0fs",
                 len(old), max_age,
             )
         return len(old)
@@ -189,7 +193,7 @@ class SessionStore:
 # LocalWorker
 # =========================================================================== #
 class LocalWorker:
-    BACKEND = "chatgpt"
+    BACKEND = "grok"
 
     def __init__(
         self, vps_url: str, token: str, num_workers: int, headless: bool = True,
@@ -219,7 +223,7 @@ class LocalWorker:
         await self.pool.start()
         _s = self.pool.status_summary()
         log.info(
-            "ChatGPT worker pool ready: %d idle, %d busy, %d dead (total %d)",
+            "Grok worker pool ready: %d idle, %d busy, %d dead (total %d)",
             _s["idle"], _s["busy"], _s["dead"], _s["total"],
         )
 
@@ -470,7 +474,7 @@ class LocalWorker:
     # ------------------------------------------------------------------ #
     def _run_cli_loop(self) -> None:
         print("\n" + "=" * 60)
-        print("🎮 ChatGPT Worker Console")
+        print("🎮 Grok Worker Console")
         print("=" * 60)
         print("Commands:")
         print("  list accounts      - Show all accounts")
@@ -482,7 +486,7 @@ class LocalWorker:
 
         while not self._stop.is_set():
             try:
-                cmd = input("chatgpt-worker> ").strip()
+                cmd = input("grok-worker> ").strip()
                 if not cmd:
                     continue
                 if self._loop:
@@ -567,7 +571,7 @@ class LocalWorker:
             log.warning("Failed to send account update: %s", exc)
 
     async def _shutdown(self) -> None:
-        print("\n🛑 Shutting down ChatGPT worker...")
+        print("\n🛑 Shutting down Grok worker...")
         self._stop.set()
         if self._keepalive_task:
             self._keepalive_task.cancel()
@@ -580,7 +584,7 @@ class LocalWorker:
 # Main
 # =========================================================================== #
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="PAF-Model ChatGPT local worker")
+    p = argparse.ArgumentParser(description="PAF-Model Grok local worker")
     p.add_argument("--vps", required=True, help="VPS WebSocket URL (e.g., ws://VPS_IP:8000/ws/worker)")
     p.add_argument("--token", required=True, help="Shared secret token for authentication")
     p.add_argument("--workers", type=int, default=1, help="Number of concurrent browser slots (default 1)")

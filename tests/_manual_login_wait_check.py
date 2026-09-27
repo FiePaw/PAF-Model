@@ -1,17 +1,17 @@
-"""Ad-hoc check for login_chatgpt.wait_for_manual_login() polling logic
+"""Ad-hoc check for login_grok.wait_for_manual_login() polling logic
 (no real network needed -- uses HTML stubs served via page.route() at a
-real https://chatgpt.com/ URL, since _is_logged_in() now also requires
-being on that domain -- see base_chatgpt.py bug fix).
+real https://grok.com/ URL, since _is_logged_in() requires being on that
+domain -- see base_grok.py, ported unchanged from the retired ChatGPT
+backend's fix).
 
 Covers TWO scenarios:
   1. Single tab, no popup -- basic timeout + eventual login detection.
-  2. POPUP scenario (the exact bug reported live): a second Page object
-     appears mid-wait (simulating the "Log in" button opening a popup),
-     while the ORIGINAL tab keeps showing stale logged-out-ish content.
-     Only the POPUP actually becomes logged in. wait_for_manual_login()
-     must detect success via the popup (not report a false positive from
-     the stale original tab) and must update scraper._page to point at the
-     popup.
+  2. POPUP scenario (an SSO provider like Google/X can open a popup): a
+     second Page object appears mid-wait, while the ORIGINAL tab keeps
+     showing stale logged-out-ish content. Only the POPUP actually becomes
+     logged in. wait_for_manual_login() must detect success via the popup
+     (not report a false positive from the stale original tab) and must
+     update scraper._page to point at the popup.
 
 Run: python3 tests/_manual_login_wait_check.py
 """
@@ -22,26 +22,26 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from playwright.async_api import async_playwright
-from scrapers.chatgpt_scraper import ChatGPTScraper
-from login_chatgpt import wait_for_manual_login
+from scrapers.grok_scraper import GrokScraper
+from login_grok import wait_for_manual_login
 
-LOGGED_OUT_HTML = '<html><body><button>Log in</button></body></html>'
+LOGGED_OUT_HTML = '<html><body><button>Sign in</button></body></html>'
 LOGGED_IN_HTML = (
     '<html><body><div class="avatar">A</div>'
     '<main><textarea id="prompt-textarea"></textarea></main>'
     '</body></html>'
 )
-# Simulates the ORIGINAL tab right after the user clicks "Log in": the
+# Simulates the ORIGINAL tab right after the user clicks "Sign in": the
 # button is gone (already clicked / hidden by the SPA) but the OLD app
-# shell markup is still sitting in the DOM underneath -- exactly the
-# false-positive trap from the reported bug.
+# shell markup is still sitting in the DOM underneath -- the exact
+# false-positive trap the ChatGPT-era fix guards against.
 STALE_BACKGROUND_HTML = (
     '<html><body><main><textarea id="prompt-textarea"></textarea></main></body></html>'
 )
 
 
 async def scenario_single_tab():
-    scraper = ChatGPTScraper(headless=True, account="stub-test")
+    scraper = GrokScraper(headless=True, account="stub-test")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context()
@@ -54,18 +54,18 @@ async def scenario_single_tab():
         async def _handle_route(route):
             await route.fulfill(body=current_html["body"], content_type="text/html")
 
-        await page.route("https://chatgpt.com/**", _handle_route)
+        await page.route("https://grok.com/**", _handle_route)
 
         # Case 1: never logs in -> should time out and return False quickly.
         current_html["body"] = LOGGED_OUT_HTML
-        await page.goto("https://chatgpt.com/")
+        await page.goto("https://grok.com/")
         ok = await wait_for_manual_login(scraper, timeout=1.0, poll_interval=0.2)
         assert ok is False, "Expected timeout (False) when never logged in"
         print("Case 1 (never logs in, short timeout) -> False   OK")
 
         # Case 2: logs in partway through the wait window.
         current_html["body"] = LOGGED_OUT_HTML
-        await page.goto("https://chatgpt.com/")
+        await page.goto("https://grok.com/")
 
         async def _simulate_manual_login():
             await asyncio.sleep(0.5)
@@ -81,14 +81,14 @@ async def scenario_single_tab():
 
 
 async def scenario_popup():
-    """Reproduces the exact reported bug: a popup opens, the ORIGINAL tab
-    keeps stale app-shell markup in the background (no "Log in" button,
-    but old chat UI still present) -- this must NOT be mistaken for a
-    successful login. Only once the POPUP itself becomes logged in should
+    """Reproduces the SSO-popup case: a popup opens, the ORIGINAL tab keeps
+    stale app-shell markup in the background (no "Sign in" button, but old
+    chat UI still present) -- this must NOT be mistaken for a successful
+    login. Only once the POPUP itself becomes logged in should
     wait_for_manual_login() report success, and it must point
     scraper._page at that popup afterwards.
     """
-    scraper = ChatGPTScraper(headless=True, account="stub-test")
+    scraper = GrokScraper(headless=True, account="stub-test")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context()
@@ -105,25 +105,25 @@ async def scenario_popup():
         async def _handle_popup(route):
             await route.fulfill(body=popup_html["body"], content_type="text/html")
 
-        await original_page.route("https://chatgpt.com/**", _handle_original)
-        await original_page.goto("https://chatgpt.com/")
+        await original_page.route("https://grok.com/**", _handle_original)
+        await original_page.goto("https://grok.com/")
 
-        # Simulate: user clicks "Log in" -> original tab's button
+        # Simulate: user clicks "Sign in" -> original tab's button
         # disappears but stale app markup remains (the false-positive
-        # trap) -- AND a popup opens showing the Cloudflare/auth flow,
-        # which only becomes chatgpt.com + logged in after some delay.
+        # trap) -- AND an SSO popup opens, which only becomes grok.com +
+        # logged in after some delay.
         original_html["body"] = STALE_BACKGROUND_HTML
 
         popup_page = await context.new_page()
-        await popup_page.route("https://chatgpt.com/**", _handle_popup)
-        await popup_page.goto("about:blank")  # starts off-domain (auth provider stand-in)
+        await popup_page.route("https://grok.com/**", _handle_popup)
+        await popup_page.goto("about:blank")  # starts off-domain (SSO provider stand-in)
 
         async def _simulate_popup_flow():
             await asyncio.sleep(0.4)
-            # still on the auth domain (off-domain stand-in), not logged in yet
+            # still on the SSO domain (off-domain stand-in), not logged in yet
             await asyncio.sleep(0.4)
             popup_html["body"] = LOGGED_IN_HTML
-            await popup_page.goto("https://chatgpt.com/")
+            await popup_page.goto("https://grok.com/")
 
         asyncio.create_task(_simulate_popup_flow())
 
@@ -142,8 +142,8 @@ async def scenario_popup():
 async def main():
     await scenario_single_tab()
     await scenario_popup()
-    print("\nAll checks for login_chatgpt.wait_for_manual_login() passed "
-          "(including the popup false-positive regression).")
+    print("\nAll checks for login_grok.wait_for_manual_login() passed "
+          "(including the SSO-popup false-positive regression).")
 
 
 if __name__ == "__main__":

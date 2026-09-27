@@ -6,7 +6,10 @@ keeps its own proven worker loop / browser pool / scraper unchanged:
 
     --backend deepseek  → public_deepseek.py  (account-name + email/password auth)
     --backend qwen      → public_qwen.py      (cookie-file auth)
-    --backend chatgpt   → public_chatgpt.py   (email/password auth via authchatgpt.json)
+    --backend grok      → public_grok.py      (cookie-import / manual-login auth via
+                                                authgrok.json — REPLACES the retired
+                                                ChatGPT backend entirely, see
+                                                GROK_BACKEND.md)
 
 The worker registers with the VPS including its "backend" field, so the unified
 VPS gateway routes tasks to the right pool (see PublicForward/ForVPS/vps_server.py).
@@ -15,7 +18,7 @@ Run one process per backend, exactly as before:
 
     python public.py --backend deepseek --vps ws://VPS_IP:PORT/ws/worker --workers 2
     python public.py --backend qwen     --vps ws://VPS_IP:PORT/ws/worker --workers 2
-    python public.py --backend chatgpt  --vps ws://VPS_IP:PORT/ws/worker --workers 2
+    python public.py --backend grok     --vps ws://VPS_IP:PORT/ws/worker --workers 2
 
 All flags after --backend are passed through unchanged to the selected worker.
 Run `python public.py --backend deepseek --help` to see backend-specific flags.
@@ -34,8 +37,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--backend",
-        choices=["deepseek", "qwen", "chatgpt"],
-        help="Which backend this worker serves: 'deepseek', 'qwen', or 'chatgpt'.",
+        choices=["deepseek", "qwen", "grok"],
+        help="Which backend this worker serves: 'deepseek', 'qwen', or 'grok'.",
     )
     parser.add_argument(
         "-h", "--help", action="store_true", dest="_show_help",
@@ -47,7 +50,7 @@ def main() -> None:
         if args._show_help:
             parser.print_help()
             raise SystemExit(0)
-        parser.error("--backend is required (choose 'deepseek', 'qwen', or 'chatgpt').")
+        parser.error("--backend is required (choose 'deepseek', 'qwen', or 'grok').")
 
     # Re-assemble argv for the delegated worker (drop --backend; keep --help).
     forwarded = list(rest)
@@ -60,7 +63,7 @@ def main() -> None:
     elif args.backend == "qwen":
         from public_qwen import main as worker_main
     else:
-        from public_chatgpt import main as worker_main
+        from public_grok import main as worker_main
 
     worker_main()
 
