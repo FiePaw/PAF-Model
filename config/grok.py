@@ -75,6 +75,30 @@ GROK_CONFIG: dict = {
         "message_items": ['[role="article"]', '[role="region"]', 'div[class*="message"]'],
         "main_area": ['[role="main"]', "main", '[class*="chat"]'],
 
+        # ── Assistant-response extraction (NEW — fix "output keluar tapi
+        #    scrape kosong") ── grok.com's current DOM exposes data-testid
+        #    markers for user/assistant turns. Tried in order by
+        #    BaseAIChatScraper._extract_current_text() BEFORE the legacy
+        #    message_items/main_area cascade. Keep sorted most→least
+        #    specific; add newly observed variants at the TOP.
+        "assistant_response": [
+            '[data-testid="assistant-message"]',
+            '[data-testid="message"][data-role="assistant"]',
+            '[data-testid="message"]',
+            '[data-message-id][data-role="assistant"]',
+            '[data-message-id]',
+        ],
+        # Scope for the "still generating" text scan (replaces the old
+        # whole-body scan that false-positived on responses containing
+        # words like "thinking"/"menganalisis").
+        "response_container": ['[data-testid="conversation-container"]', '[role="log"]'],
+        # Last-resort class-fragment scan when no testid/role matches
+        # (grok.com renames classes between deploys — this catches bubbles).
+        "message_class_fallback": [
+            "div[class*=\"bubble\"]",
+            "div[class*=\"message\"]",
+        ],
+
         # ── Login-state detection ───────────────────────────────────────
         # grok.js checks page TEXT for "Sign in"/"Log in"/"Create account"
         # (no stable selector). Here we use Playwright's text-matching

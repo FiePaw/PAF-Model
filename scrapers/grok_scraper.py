@@ -181,27 +181,38 @@ class GrokScraper(BaseAIChatScraper):
         if attachments:
             await self._upload_attachments(attachments)
 
-        try:
-            await textarea.click()
-            await textarea.fill(prompt)
-        except Exception:
-            # Fallback: type per-character (ported from grok.js's fallback path).
-            try:
-                await textarea.click()
-                await textarea.type(prompt, delay=10)
-            except Exception as exc:
-                await self.take_debug_screenshot("fill_prompt_failed")
-                raise RuntimeError(f"Failed to fill prompt: {exc}") from exc
+        # STALE-HANDLE FIX: never reuse the ElementHandle from _find_first()
+        # across actions — React re-renders (hydration, attachment upload,
+        # banner dismiss) detach it and Playwright raises
+        # "Element is not attached to the DOM". _fill_prompt() re-resolves a
+        # FRESH locator on every attempt (locators re-query the DOM on each
+        # action, so they cannot go stale).
+        await self._fill_prompt(prompt)
 
         await asyncio.sleep(GROK_CONFIG["timeouts"]["between_actions"] / 1000)
 
         sent = await self._click_send_button(self._page)
         if not sent:
-            try:
-                await textarea.press("Enter")
-            except Exception as exc:
+            # Fresh-locator Enter fallback (stale-handle fix — the old code
+            # pressed Enter on the SAME possibly-detached ElementHandle).
+            if not await self._press_enter_fresh():
                 await self.take_debug_screenshot("send_prompt_failed")
-                raise RuntimeError(f"Failed to send prompt: {exc}") from exc
+                raise RuntimeError(
+                    "Failed to send prompt: send button not clicked and Enter "
+                    "rejected by all composer selectors"
+                )
+
+        # PRE-RESPONSE BASELINE (Bug #5): capture the last assistant message
+        # RIGHT AFTER sending — at this instant the DOM still shows the
+        # PREVIOUS turn (mode='continue' goto lands on the old answer, and
+        # even mode='new' can restore the last conversation — both
+        # live-confirmed via debug_grok_div.py). wait_for_response() treats
+        # text equal to this baseline as "not updated yet", so the old
+        # answer can never be returned as the response to the new prompt.
+        try:
+            pre_send_text = await self._extract_current_text()
+        except Exception:
+            pre_send_text = ""
 
         await asyncio.sleep(0.5)
 
@@ -211,7 +222,7 @@ class GrokScraper(BaseAIChatScraper):
         # Grok-specific: "Which response do you prefer?" A/B dialog.
         await self._handle_response_choice()
 
-        response = await self.wait_for_response()
+        response = await self.wait_for_response(pre_send_text=pre_send_text)
         return response
 
     async def _click_send_button(self, page: Page) -> bool:
@@ -297,7 +308,12 @@ class GrokScraper(BaseAIChatScraper):
     # Ported 1:1 from grok.js's response-cleaning regex cascade.
     _UI_LINE_PATTERNS = [
         r"^(fast|slow|auto|standard|copy|share|send|stop|jelaskan|soal|pikir|buat|terjemahkan)(\s|$)",
-        r"^\d+[,\.]\d*\s*s$",
+        r"^\d+[,\.)]\d*\s*s$",
+        # Grok status/footer chrome (live-confirmed via debug_grok_div.py —
+        # the assistant bubble carries "Worked for 5s" above the answer and
+        # a "10 sources" web-search footer below it):
+        r"^worked\s+for\s+[\dhms.,\s]+$",   # "Worked for 5s" / "Worked for 2m 30s"
+        r"^\d+\s+sources?$",                # "10 sources" / "1 source"
         r"^[a-z0-9.-]+\.(com|org|net|io|co\.uk|gov)$",
     ]
     _UI_LINE_RE = re.compile("|".join(_UI_LINE_PATTERNS), re.IGNORECASE)

@@ -607,44 +607,129 @@ class BaseAIChatScraper(ABC):
         phrases = [p.replace("text=", "").lower() for p in GROK_CONFIG["selectors"]["rate_limited"]]
         return any(p in body_lower for p in phrases)
 
-    # ── Chat loop generic (poll for generation completion) ──────────── #
+    # ── Chat loop generic (poll for generation completion) ───────────── #
 
-    async def wait_for_response(self, *, deadline_s: float | None = None) -> str:
-        """Poll loop (ported from grok.js's monitor-response-generation
-        loop + base_chatgpt.py's stability pattern):
-          - generating = stop_button visible OR page text still shows one
-            of GROK_CONFIG's `generating_text_patterns` (Grok surfaces web-
-            search progress text inside the response area — a stop button
-            alone is not a reliable enough signal, unlike ChatGPT).
-          - selesai jika NOT generating DAN teks stabil 2x berturut-turut
-          - deadline = GROK_CONFIG['timeouts']['response_wait']
+    async def wait_for_response(
+        self, *, deadline_s: float | None = None, pre_send_text: str | None = None,
+    ) -> str:
+        """Poll loop — TEXT-CHANGE detection (ported from base_deepseek.py's
+        fixed wait_for_response, same fix as tests/test_stuck_signal_regression.py).
+
+        Old behavior (buggy): `_is_generating()` was a HARD GATE — if the page
+        text contained any `generating_text_patterns` word (e.g. the response
+        itself says "thinking"/"menganalisis"), the loop spun until the 240s
+        deadline and raised TimeoutError even though the answer had finished
+        long before.
+
+        New behavior:
+          1. Poll `_extract_current_text()` until the text is non-empty AND
+             stable for `stability_polls` consecutive polls.
+          2. `_is_generating()` is only an ADVISORY signal with a bounded
+             grace period: once the text has been unchanged for `stall_grace`
+             seconds, accept it as final even if the signal still reports
+             "generating" (stale/unreliable signal).
+          3. Stall watchdog: if NO text was ever captured and nothing changes
+             for `empty_stall_s`, fail fast with a diagnostic-rich error
+             instead of silently burning the full deadline.
+          4. Pre-send baseline (Bug #5 fix): pass `pre_send_text` (captured
+             by send_prompt right after sending) — extracted text identical
+             to it is treated as "not updated yet", so a restored/continued
+             conversation can never return the PREVIOUS turn's answer as
+             the response to the NEW prompt.
+
+        deadline = GROK_CONFIG['timeouts']['response_wait'] (unchanged).
         """
         assert self._page is not None
         timeouts = GROK_CONFIG["timeouts"]
         deadline = deadline_s if deadline_s is not None else timeouts["response_wait"] / 1000
-        stability_interval = timeouts["stability_check"] / 1000
+        poll_interval = timeouts["stability_check"] / 1000
+        stability_polls = 2
+
+        # PRE-SEND BASELINE (Bug #5 fix — ported from base_deepseek.py's
+        # pre_send_text mechanism): the page can still show the PREVIOUS
+        # turn's answer when polling starts (continue-mode goto, or a
+        # mode='new' navigation that restores the last conversation — both
+        # live-confirmed via debug_grok_div.py). Without this guard the
+        # stability check can accept the OLD answer as the response to the
+        # NEW prompt before the DOM even updates.
+        baseline = (pre_send_text or "").strip()
 
         loop = asyncio.get_event_loop()
         deadline_at = loop.time() + deadline
-        prev_text = None
+        stall_grace = max(stability_polls * poll_interval * 4, 5.0)
+        # Continue-mode (baseline set) gets a more patient empty-stall
+        # window: a reasoning turn can take >45s before the new bubble
+        # renders any text at all.
+        empty_stall_s = max(timeouts.get("empty_stall", 45.0), 90.0 if baseline else 0.0)
+
+        prev_text: str | None = None
         stable_count = 0
+        stable_since: float | None = None
         poll_n = 0
+        first_poll_at = loop.time()
+        ever_had_text = False
+        diag_every = 25  # polls between diagnostic dumps when text is still empty
 
         while loop.time() < deadline_at:
             poll_n += 1
-            generating = await self._is_generating()
 
             try:
                 text = await self._extract_current_text()
             except Exception:
                 text = ""
 
-            if not generating and text and text == prev_text:
+            # Baseline guard: the unchanged old answer is NOT the new
+            # response — treat as "nothing yet" until the DOM updates.
+            if baseline and text.strip() == baseline:
+                text = ""
+
+            if text and text == prev_text:
                 stable_count += 1
-                if stable_count >= 2:
-                    return text
             else:
                 stable_count = 0
+                stable_since = loop.time() if text else None
+
+            if text:
+                ever_had_text = True
+
+            if stable_count >= stability_polls and text:
+                elapsed_stable = loop.time() - (stable_since or loop.time())
+                still_streaming = await self._is_generating()
+                if not still_streaming:
+                    self.logger.info(
+                        "wait_for_response: STABLE after %d polls (len=%d)",
+                        stable_count, len(text),
+                    )
+                    return text
+                if elapsed_stable >= stall_grace:
+                    # Advisory-only: text frozen far longer than the grace
+                    # period → the "generating" signal is stale/unreliable
+                    # (e.g. the response text itself contains a pattern word).
+                    self.logger.warning(
+                        "wait_for_response: accepting stable text as final "
+                        "after %.1fs unchanged even though _is_generating() "
+                        "still reports True — grace period %.1fs exceeded, "
+                        "treating the signal as stale/unreliable (len=%d)",
+                        elapsed_stable, stall_grace, len(text),
+                    )
+                    return text
+                else:
+                    self.logger.info(
+                        "wait_for_response: text stable for %d polls (len=%d) "
+                        "but still 'generating' — grace %.1fs/%.1fs",
+                        stable_count, len(text), elapsed_stable, stall_grace,
+                    )
+
+            # Fail fast: DOM never yielded any text (selector mismatch —
+            # exactly the "output sudah keluar tapi scrape kosong" case).
+            if not ever_had_text and (loop.time() - first_poll_at) >= empty_stall_s:
+                await self._extract_current_text(_diagnostic=True)
+                raise TimeoutError(
+                    f"Grok response text EMPTY for {empty_stall_s:.0f}s — "
+                    f"({'new response never rendered (baseline kept filtering the old answer)' if baseline else 'extraction selectors match nothing — DOM changed?'}). "
+                    f"See [DIAG] log lines above for per-selector match "
+                    f"counts. Run debug_grok_div.py to inspect the live DOM."
+                )
 
             prev_text = text
 
@@ -657,7 +742,11 @@ class BaseAIChatScraper(ABC):
                 if await self.is_rate_limited():
                     raise RuntimeError("Rate limited by Grok (usage limit reached).")
 
-            await asyncio.sleep(stability_interval)
+            # Periodic diagnostics while nothing has been captured yet.
+            if text == "" and poll_n % diag_every == 0:
+                await self._extract_current_text(_diagnostic=True)
+
+            await asyncio.sleep(poll_interval)
 
         raise TimeoutError(
             f"Grok response not stable after {deadline:.0f}s — "
@@ -665,6 +754,9 @@ class BaseAIChatScraper(ABC):
         )
 
     async def _is_generating(self) -> bool:
+        """ADVISORY signal only (see wait_for_response). Stop button visible
+        is a hard signal; the text-pattern check is scoped to the RESPONSE
+        AREA (not the whole body) so unrelated page copy can never trip it."""
         assert self._page is not None
         for sel in GROK_CONFIG["selectors"]["stop_button"]:
             try:
@@ -674,34 +766,190 @@ class BaseAIChatScraper(ABC):
             except Exception:
                 continue
         # Ported from grok.js: web-search / thinking progress text inside
-        # the page counts as "still generating" even with no stop button.
+        # the RESPONSE AREA counts as "still generating" even with no stop
+        # button. Scoped to the response container — the old whole-body
+        # scan false-positived whenever the answer text itself contained a
+        # pattern word (e.g. "thinking", "menganalisis").
+        scope = await self._response_scope()
+        if scope is None:
+            return False
         try:
-            body_text = (await self._page.inner_text("body", timeout=2_000)).lower()
+            area_text = (await scope.inner_text(timeout=2_000)).lower()
         except Exception:
             return False
-        return any(p in body_text for p in GROK_CONFIG["selectors"]["generating_text_patterns"])
+        return any(p in area_text for p in GROK_CONFIG["selectors"]["generating_text_patterns"])
 
-    async def _extract_current_text(self) -> str:
-        """Grab the current text of the last assistant message (used while
-        polling for stability, before final extraction/cleaning)."""
+    async def _response_scope(self):
+        """Best-effort container that holds the conversation/response area —
+        used to scope the 'still generating' text scan."""
         assert self._page is not None
+        for sel in (
+            GROK_CONFIG["selectors"].get("response_container", [])
+            + GROK_CONFIG["selectors"]["main_area"]
+        ):
+            try:
+                el = await self._page.query_selector(sel)
+                if el:
+                    return el
+            except Exception:
+                continue
+        return None
+
+    async def _fill_prompt(self, prompt: str) -> None:
+        """Fill the composer, re-resolving a FRESH locator on every attempt.
+
+        STALE-HANDLE FIX (live bug: "ElementHandle.click: Element is not
+        attached to the DOM"): the old code held ONE ElementHandle from
+        wait_for_selector() across click/fill/type — any React re-render in
+        between (SPA hydration, attachment upload, banner dismiss) detaches
+        that node and every later action on the same handle fails. Playwright
+        Locators re-query the DOM on each action, so they cannot go stale;
+        on top of that the whole cascade is retried up to 3 times with a
+        short backoff to ride out an in-flight re-render.
+        """
+        assert self._page is not None
+        selectors = GROK_CONFIG["selectors"]["prompt_textarea"]
+        last_err: Exception | None = None
+
+        for attempt in range(1, 4):
+            # Primary path: click + fill (fill also clears existing content).
+            for sel in selectors:
+                try:
+                    loc = self._page.locator(sel).first
+                    await loc.wait_for(state="visible", timeout=4_000)
+                    await loc.click(timeout=3_000)
+                    await loc.fill(prompt, timeout=5_000)
+                    return
+                except Exception as exc:
+                    last_err = exc
+                    continue
+            # Fallback: type per-character (ported from grok.js's fallback
+            # path) — some builds accept typing where fill() no-ops.
+            for sel in selectors:
+                try:
+                    loc = self._page.locator(sel).first
+                    await loc.click(timeout=3_000)
+                    await loc.type(prompt, delay=10, timeout=10_000)
+                    return
+                except Exception as exc:
+                    last_err = exc
+                    continue
+            if attempt < 3:
+                await asyncio.sleep(0.8 * attempt)  # ride out an in-flight re-render
+
+        await self.take_debug_screenshot("fill_prompt_failed")
+        raise RuntimeError(
+            f"Failed to fill prompt after 3 attempts (fresh locator each time): {last_err}"
+        )
+
+    async def _press_enter_fresh(self) -> bool:
+        """Press Enter on the composer using a FRESH locator (never a held
+        ElementHandle — see _fill_prompt for the staleness rationale).
+        Returns True if some composer selector accepted the key press."""
+        assert self._page is not None
+        for sel in GROK_CONFIG["selectors"]["prompt_textarea"]:
+            try:
+                await self._page.locator(sel).first.press("Enter", timeout=3_000)
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _extract_current_text(self, _diagnostic: bool = False) -> str:
+        """Grab the current text of the LAST assistant message.
+
+        Selector cascade (new, resilient — grok.com DOM per 2025):
+          1. `[data-testid="assistant-message"]` — current grok.com DOM.
+          2. `[data-testid="message"]` / `[data-message-id]` variants.
+          3. Legacy cascade: last element matching message_items INSIDE
+             main_area (old behavior, kept as fallback).
+          4. Last-resort: unscoped message_items / class-fragment scan.
+
+        KEY FIX vs old version: the old code required `len(nodes) >= 2`
+        before returning anything, so a chat where only ONE element matched
+        (e.g. a brand-new chat where the user bubble doesn't match the same
+        selector) returned "" forever → stability check never satisfied →
+        240s timeout even though the answer was on screen.
+
+        When _diagnostic=True, logs every selector's match count + a text
+        preview so a mismatch is obvious in the worker log.
+        """
+        assert self._page is not None
+        sel_cfg = GROK_CONFIG["selectors"]
+        diag: list[str] = []
+
+        async def _last_text_of(nodes: list) -> str:
+            try:
+                return ((await nodes[-1].inner_text()) or "").strip()
+            except Exception:
+                return ""
+
+        # 1+2) data-testid cascade — page-scoped, most reliable first.
+        for sel in sel_cfg.get("assistant_response", []):
+            try:
+                nodes = await self._page.query_selector_all(sel)
+            except Exception:
+                continue
+            diag.append(f"{sel!r}={len(nodes)}")
+            if nodes:
+                text = await _last_text_of(nodes)
+                if text:
+                    if _diagnostic:
+                        self.logger.info(
+                            "[DIAG] matched %r (last of %d) len=%d preview=%r",
+                            sel, len(nodes), len(text), text[:120],
+                        )
+                    return text
+
+        # 3) Legacy cascade: message_items scoped inside main_area — but
+        #    WITHOUT the old `len(nodes) >= 2` requirement.
         main = None
-        for sel in GROK_CONFIG["selectors"]["main_area"]:
+        for sel in sel_cfg["main_area"]:
             try:
                 main = await self._page.query_selector(sel)
                 if main:
                     break
             except Exception:
                 continue
-        if not main:
-            return ""
-        for sel in GROK_CONFIG["selectors"]["message_items"]:
+        if main is not None:
+            for sel in sel_cfg["message_items"]:
+                try:
+                    nodes = await main.query_selector_all(sel)
+                except Exception:
+                    continue
+                diag.append(f"main>{sel!r}={len(nodes)}")
+                if nodes:
+                    text = await _last_text_of(nodes)
+                    if text:
+                        if _diagnostic:
+                            self.logger.info(
+                                "[DIAG] matched main>%r (last of %d) len=%d preview=%r",
+                                sel, len(nodes), len(text), text[:120],
+                            )
+                        return text
+
+        # 4) Last resort: unscoped message_items + class-fragment scan.
+        for sel in sel_cfg["message_items"] + sel_cfg.get("message_class_fallback", []):
             try:
-                nodes = await main.query_selector_all(sel)
-                if len(nodes) >= 2:
-                    return ((await nodes[-1].inner_text()) or "").strip()
+                nodes = await self._page.query_selector_all(sel)
             except Exception:
                 continue
+            diag.append(f"body>{sel!r}={len(nodes)}")
+            if nodes:
+                text = await _last_text_of(nodes)
+                if text:
+                    if _diagnostic:
+                        self.logger.info(
+                            "[DIAG] matched body>%r (last of %d) len=%d preview=%r",
+                            sel, len(nodes), len(text), text[:120],
+                        )
+                    return text
+
+        if _diagnostic:
+            self.logger.warning(
+                "[DIAG] _extract_current_text matched NOTHING. Counts: %s",
+                ", ".join(diag) if diag else "(no selector evaluated)",
+            )
         return ""
 
     # ── Output helpers (pola existing) ──────────────────────────────── #
