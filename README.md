@@ -55,7 +55,9 @@ PAF-Model/
 ├── start_grok_chrome.py         # Grok: start a real Chrome for CDP attach (#3, strongest)
 │
 ├── PublicForward/ForVPS/
-│   ├── vps_server.py            # UNIFIED gateway: model routing + X-Session-ID
+│   ├── vps_server.py            # UNIFIED gateway: model routing + X-Session-ID + API-token auth
+│   ├── paf_auth.py              # API-token helpers (storage, Bearer parsing, constant-time compare)
+│   ├── manage_token.py          # CLI: generate / set / show / revoke the API token
 │   └── start.sh
 │
 ├── cookies/  profiles/  dataSession/  logs/  debug/  output/
@@ -71,12 +73,14 @@ PAF-Model/
 
 ```
 CLIENT → VPS   POST /v1/chat/completions
+               Header: Authorization: Bearer <API_TOKEN>   (REQUIRED — else 401)
                Header: X-Session-ID: sess-abc123   (optional — CONTINUE only)
                Body:   { "model": "deepseek(account1)" | "qwen(account1)" | "grok(account1)",
                          "messages": [...], "think_mode": "...", "tools": [...],
                          "attachments": [...] }
 
 VPS (vps_server.py):
+  0. ApiTokenMiddleware: reject (401) unless `Authorization: Bearer <API_TOKEN>` matches
   1. resolve_backend_and_account(model) → ("deepseek"|"qwen"|"grok", account_id|None)
   2. session_id = X-Session-ID header (else generate)   → mode = continue|new
   3. dispatch(backend=…, preferred_account=…) → pick a worker whose backend
@@ -112,8 +116,28 @@ On the **VPS**:
 
 ```bash
 pip install -r requirements_api.txt
-export PAF_TOKEN=your-secret            # optional; "change-me" disables auth
+
+# 1) Start the gateway in a terminal. PAF_TOKEN is the separate WORKER secret.
+export PAF_TOKEN=your-worker-secret     # optional; "change-me" disables worker-token check
 python PublicForward/ForVPS/vps_server.py --port 9000
+
+# 2) Right in THAT console, create the client API token (live, no restart):
+token generate
+#    -> prints paf_xxxx; give it to everyone who may use the API.
+```
+
+Until a token exists every request gets `503` (never open access). Manage the
+token live from the server console: `token generate | rotate | set <value> |
+show | reveal | revoke | help` — changes apply immediately and are saved to
+`PublicForward/ForVPS/.api_token`. No terminal (`nohup`/`systemd`)? Create it
+offline with `python vps_server.py --generate-token` or `manage_token.py`
+(then the server refuses to start without one). Details in
+[`API_USAGE.md` §3](./API_USAGE.md#3-authentication--api-token-required).
+
+Calling the API:
+
+```bash
+curl http://VPS_IP:9000/v1/models -H "Authorization: Bearer $PAF_API_TOKEN"
 ```
 
 On each **worker host** (run two processes, one per backend):
@@ -181,15 +205,25 @@ See backend-specific flags with e.g. `python public.py --backend qwen --help`.
   the session is already valid; there is no automated fallback login to fall
   back to (see `GrokScraper.ensure_authenticated()`).
 
-The VPS accepts a worker's token from the register body (DeepSeek worker) or the
-`?token=` query param (Qwen worker); enforcement is skipped when `PAF_TOKEN` is
-the default `change-me`.
+### VPS tokens — two separate secrets
+
+| Token | Who uses it | How it is sent | Set with |
+|---|---|---|---|
+| **API token** (one shared token for all users) | Anyone calling the REST API | `Authorization: Bearer <token>` on **every** HTTP request (all endpoints, incl. `/health` and `/docs`) | `manage_token.py` → `.api_token`, or env `PAF_API_TOKEN`, or `--api-token` |
+| **Worker token** (`PAF_TOKEN`) | `public.py` workers attaching to `/ws/worker` | `register` body (DeepSeek/Grok worker) or `?token=` query param (Qwen worker) | env `PAF_TOKEN` / `--token`; enforcement skipped when it is the default `change-me` |
+
+Missing/invalid API token → `401`; no API token configured on the server →
+`503` on every request (never open). Create/rotate it live from the server
+console (`token generate` / `token rotate`).
+Use HTTPS (reverse proxy) when exposing the VPS publicly.
 
 ## Tests (offline, no browser / no accounts needed)
 
 ```bash
 python tests/test_vps_smoke.py     # WorkerManager: routing, envelopes, result shapes
 python tests/test_http_e2e.py      # real uvicorn + WS worker + httpx POST (all 3 backends)
+python tests/test_delete_session_e2e.py   # DELETE /v1/sessions/{id}
+python tests/test_api_auth.py      # API-token auth: 401/503, CORS, worker WS unaffected, manage_token CLI
 ```
 
 Grok-specific logic (login-state detection, SSO-popup handling, driver

@@ -4,7 +4,8 @@
 > agents/LLMs** integrating with PAF-Model. It documents the *actual* runtime
 > behavior of `PublicForward/ForVPS/vps_server.py` (the only public HTTP
 > surface of this project), verified directly against the source code and the
-> repo's own tests (`tests/test_http_e2e.py`, `tests/test_vps_smoke.py`) and
+> repo's own tests (`tests/test_http_e2e.py`, `tests/test_vps_smoke.py`,
+> `tests/test_api_auth.py`) and
 > example clients (`example/chat_deepseek.py`, `example/chat_qwen.py`,
 > `example/foto_qwen.py`).
 >
@@ -55,22 +56,121 @@ OpenAI-shaped so existing OpenAI SDK tooling mostly works if you point
 
 ---
 
-## 3. Authentication — read this carefully
+## 3. Authentication — API token required
 
-There are **two, completely separate** notions of "token" in this project and
-they are easy to confuse:
+There are **two, completely separate** tokens in this project:
 
 | Token | Protects | Where it's checked |
 |---|---|---|
-| `PAF_TOKEN` / `AUTH_TOKEN` (env `PAF_TOKEN`, default `"change-me"`) | The **WebSocket worker connection** (`/ws/worker`) — i.e. which `public.py` processes are allowed to register as a backend worker | Inside `worker_endpoint()`, comparing the `token` field in the worker's `register` message (DeepSeek and Grok worker) or the `?token=` query param (Qwen worker) |
-| — none — | The **public REST API** (`/v1/chat/completions`, `/v1/models`, `/health`, `/`) | **Not checked at all.** There is no `Authorization` header, no API key, no bearer-token check anywhere in the REST handlers. |
+| **API token** (env `PAF_API_TOKEN`, or the file `.api_token` managed by `manage_token.py`) | The **entire public REST API** — every HTTP endpoint (`/`, `/health`, `/v1/models`, `/v1/chat/completions`, `DELETE /v1/sessions/{id}`, even unknown paths and `/docs`). **One shared token for all users.** | `ApiTokenMiddleware` in `vps_server.py`, before routing/body parsing |
+| `PAF_TOKEN` (env `PAF_TOKEN`, default `"change-me"`) | The **WebSocket worker connection** (`/ws/worker`) — which `public.py` processes may register as a backend worker. Has nothing to do with API callers. | `worker_endpoint()` |
 
-**Practical implication:** as shipped, anyone who can reach the VPS's HTTP
-port can call `/v1/chat/completions` with no credentials. If you are exposing
-this publicly, put it behind your own auth layer (reverse proxy, API gateway,
-IP allowlist, etc.) — the app itself does not provide client-facing auth.
-`PAF_TOKEN` only gates whether a *worker* (the machine with logged-in browser
-sessions) may attach to the gateway, not whether a *caller* may use it.
+### 3.1 Calling the API (clients)
+
+Send the API token on **every** request as a bearer token:
+
+```
+Authorization: Bearer <API_TOKEN>
+```
+
+```bash
+curl http://VPS_HOST:9000/v1/models -H "Authorization: Bearer $PAF_API_TOKEN"
+```
+
+Ask the VPS operator for the token. Requests without a valid token are
+rejected **before** anything else happens (a malformed body or an unknown
+path does not bypass this):
+
+| Situation | Status | Body |
+|---|---|---|
+| No `Authorization` header | `401` + `WWW-Authenticate: Bearer` | `{"detail": "Missing API token. Send 'Authorization: Bearer <token>'."}` |
+| Wrong token / wrong scheme / empty token | `401` + `WWW-Authenticate: Bearer` | `{"detail": "Invalid API token."}` |
+| Server has no API token configured | `503` | `{"detail": "API token is not configured on the server."}` |
+
+Notes:
+- Only the `Authorization: Bearer` header is accepted (no `X-API-Key`, no
+  query-string token). The scheme word is case-insensitive.
+- `/docs`, `/redoc` and `/openapi.json` are protected too, so a plain browser
+  visit gets a `401` — use `curl`/an HTTP client with the header instead.
+- Browser (CORS) preflight `OPTIONS` requests are answered without a token;
+  the actual request still needs it, and `401` responses carry CORS headers
+  so browser clients can read the error.
+- The OpenAI SDK sends exactly this header when you pass the token as
+  `api_key`:
+  ```python
+  from openai import OpenAI
+  client = OpenAI(base_url="http://VPS_HOST:9000/v1", api_key="<API_TOKEN>")
+  ```
+- Treat the token like a password; use HTTPS (reverse proxy such as
+  nginx/Caddy) when exposing the VPS on the public internet, because a
+  bearer token sent over plain HTTP can be sniffed.
+
+### 3.2 Managing the token (VPS operator)
+
+There is a **single token shared by every user**. The easiest way is the
+**live console**: while `vps_server.py` is running in a terminal, just type
+commands into that same terminal. Changes apply **immediately, with no
+restart**, and are saved to the token file so they survive restarts.
+
+```
+$ python vps_server.py --port 9000
+[vps] No client API token yet -> every HTTP request is rejected (503) until you create one.
+[vps]   Type  token generate  in this console.
+[console] Ready. Type 'help' for commands, e.g. 'token generate'.
+token generate
+New API token created.
+
+  paf_Xk3v...
+
+Active NOW (saved to .../.api_token). Clients send: Authorization: Bearer <token>
+```
+
+| Console command | Effect |
+|---|---|
+| `token generate` | Create a random token (`paf_...`). Refuses if one already exists. |
+| `token rotate` | Replace it with a new random token. The old one stops working at once. |
+| `token set <value>` | Use your own token (min 16 chars, no spaces). |
+| `token show` / `token reveal` | Show the token masked / in full. |
+| `token revoke` | Delete the token. Every request gets `503` until you create a new one. |
+| `help` | List the commands. |
+
+Notes:
+- The console is enabled automatically when the server runs in an
+  **interactive terminal** (ssh session, `tmux`, `screen`, a foreground
+  process). It is **not** available under `nohup`, `systemd`, or
+  `docker run -d`, because there is no terminal to type in — use `tmux`/`screen`,
+  or the offline methods below. Disable it with `--no-console`.
+- Typed tokens stay in your terminal's scrollback; clear it if that matters.
+
+**Offline alternatives** (server not running, or no terminal):
+
+```bash
+cd PublicForward/ForVPS
+python vps_server.py --generate-token            # create + print + exit
+python vps_server.py --generate-token --force    # rotate
+python manage_token.py generate [--force] | set | show [--reveal] | revoke
+```
+These edit the same token file; a running server only picks it up after a restart
+(or just use the live console instead).
+
+- The token is stored in `PublicForward/ForVPS/.api_token` (permissions
+  `600`, git-ignored). Minimum length is 16 characters.
+- Rotating (`token rotate`) immediately cuts off everyone using the old token,
+  so tell your users the new one.
+- Resolution order at startup: `--api-token` flag > `PAF_API_TOKEN` env var >
+  token file. If the env var is set it overrides the file after a restart (the
+  console warns about this). Prefer the file/env over the flag, since CLI args
+  are visible in `ps`.
+- **Fail closed:** with no token configured, every request gets `503` — never
+  open access. In an interactive terminal the server still starts so you can
+  type `token generate`; without a terminal (`nohup`, `systemd`, ...) it refuses
+  to start (exit code 2) and `start.sh` stops instead of looping.
+- A failed attempt is logged as `[vps] auth rejected (...)` with method, path
+  and client IP (never the token).
+
+> **Upgrading from a version without client auth:** existing clients (including
+> the scripts in `example/`) will start getting `401` until they send the
+> token. There is intentionally no "auth off" mode.
 
 ---
 
@@ -281,7 +381,8 @@ broadcast to every connected worker (all three backends); whichever one (if
 any) actually holds that `session_id` removes it from its store.
 
 ```bash
-curl -X DELETE http://<VPS_HOST>:<PORT>/v1/sessions/sess-421a9c7e1b2c3d4f
+curl -X DELETE http://<VPS_HOST>:<PORT>/v1/sessions/sess-421a9c7e1b2c3d4f \
+  -H "Authorization: Bearer $PAF_API_TOKEN"
 ```
 
 Response:
@@ -297,9 +398,8 @@ Response:
   a brand-new conversation (`mode` silently falls back to `"new"`, surfaced
   via `x_meta.mode_fallback: true`), exactly like it already does today for
   any other unknown/never-seen `session_id`.
-- No auth is enforced on this endpoint, consistent with every other REST
-  endpoint on this gateway (see §2.4) — protect it at the network level if
-  that matters for your deployment.
+- Like every other REST endpoint, this requires the API token
+  (`Authorization: Bearer <token>`, see §3).
 
 ### 6.3 Response headers
 
@@ -551,8 +651,10 @@ Notes on fields you can rely on:
 | HTTP status | When | Body shape |
 |---|---|---|
 | `400` | `model` doesn't match `^(deepseek\|qwen\|grok)(?:\(...\))?$` | `{"detail": "Unknown model: '...'. Use 'deepseek', 'qwen', 'grok', or '<backend>(<account_id>)' ..."}` |
-| `401` | Grok worker has no valid session for the account (grok.com is SSO-only — there is no automated login fallback; run `login_grok.py` or `import_grok_cookies.py` on the worker host) | `{"detail": "<auth error message>"}` — see [`GROK_BACKEND.md`](./GROK_BACKEND.md#6-cloudflare--anti-bot--the-mitigation-ladder) if this coincides with a Cloudflare/anti-bot challenge |
+| `401` | **Missing/invalid API token** (§3) — carries a `WWW-Authenticate: Bearer` header. Sent before the request is processed | `{"detail": "Missing API token. ..."}` or `{"detail": "Invalid API token."}` |
+| `401` | *(different cause)* Grok worker has no valid session for the account (grok.com is SSO-only — there is no automated login fallback; run `login_grok.py` or `import_grok_cookies.py` on the worker host) | `{"detail": "<auth error message>"}` (no `WWW-Authenticate` header — that is how you tell it apart from the API-token 401 above) — see [`GROK_BACKEND.md`](./GROK_BACKEND.md#6-cloudflare--anti-bot--the-mitigation-ladder) if this coincides with a Cloudflare/anti-bot challenge |
 | `404` | Grok CONTINUE request whose `session_id` has no saved `conversation_url` (session was deleted, or never existed) | `{"detail": "Session tidak ditemukan atau conversation_url kosong — client harus membuat session baru"}` — start a new session (omit `X-Session-ID`) |
+| `503` | The gateway has no API token configured (operator error) — every request is refused | `{"detail": "API token is not configured on the server."}` |
 | `422` | Request body fails Pydantic validation (e.g. missing `messages`) | Standard FastAPI validation error body |
 | `429` | Backend reported a rate limit / usage cap (all backends) | `{"detail": "<rate limit message>"}` — back off and retry later, or target a different account |
 | `500` | Worker reported `ok: false` (DeepSeek / Grok) / generic exception in the handler | `{"detail": "<error message from worker>"}` |
@@ -574,9 +676,12 @@ success response being OpenAI-shaped).
 
 ## 13. Quick-start examples
 
+> Every example below assumes `export PAF_API_TOKEN=<your API token>` (§3).
+
 ### 13.1 curl — simple DeepSeek chat (new session)
 ```bash
 curl -X POST http://VPS_HOST:9000/v1/chat/completions \
+  -H "Authorization: Bearer $PAF_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
         "model": "deepseek",
@@ -588,6 +693,7 @@ Read `X-Session-ID` from the response headers to continue the chat.
 ### 13.2 curl — continue that session
 ```bash
 curl -X POST http://VPS_HOST:9000/v1/chat/completions \
+  -H "Authorization: Bearer $PAF_API_TOKEN" \
   -H "Content-Type: application/json" \
   -H "X-Session-ID: sess-7f3a9c1d0e2b4f6a" \
   -d '{
@@ -599,6 +705,7 @@ curl -X POST http://VPS_HOST:9000/v1/chat/completions \
 ### 13.3 curl — DeepSeek Expert + DeepThink + web search
 ```bash
 curl -X POST http://VPS_HOST:9000/v1/chat/completions \
+  -H "Authorization: Bearer $PAF_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
         "model": "deepseek",
@@ -611,6 +718,7 @@ curl -X POST http://VPS_HOST:9000/v1/chat/completions \
 ### 13.4 curl — Qwen chat targeting a specific account
 ```bash
 curl -X POST http://VPS_HOST:9000/v1/chat/completions \
+  -H "Authorization: Bearer $PAF_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
         "model": "qwen(account1.json)",
@@ -623,6 +731,7 @@ curl -X POST http://VPS_HOST:9000/v1/chat/completions \
 ```bash
 # New session — omit X-Session-ID
 curl -i -X POST http://VPS_HOST:9000/v1/chat/completions \
+  -H "Authorization: Bearer $PAF_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
         "model": "grok",
@@ -632,6 +741,7 @@ curl -i -X POST http://VPS_HOST:9000/v1/chat/completions \
 
 # Continue — reuse the X-Session-ID from above
 curl -X POST http://VPS_HOST:9000/v1/chat/completions \
+  -H "Authorization: Bearer $PAF_API_TOKEN" \
   -H "Content-Type: application/json" \
   -H "X-Session-ID: sess-7f3a9c1d0e2b4f6a" \
   -d '{
@@ -644,13 +754,15 @@ Grok — it's chat-only in v1 (see §7 and §14).
 
 ### 13.6 Python — minimal client
 ```python
+import os
 import requests
 
 BASE_URL = "http://VPS_HOST:9000"
+API_TOKEN = os.environ["PAF_API_TOKEN"]
 session = {"id": None}
 
 def ask(message: str) -> str:
-    headers = {}
+    headers = {"Authorization": f"Bearer {API_TOKEN}"}
     if session["id"]:
         headers["X-Session-ID"] = session["id"]
 
@@ -669,6 +781,9 @@ print(ask("What did I just ask you?"))   # continues the same session
 ```
 
 ### 13.7 Ready-made reference clients in this repo
+All of them read the API token from `--api-token` or the `PAF_API_TOKEN`
+environment variable and send it as a bearer token (§3).
+
 - `example/chat_deepseek.py` — full interactive CLI for the DeepSeek path
   (`/new`, `/status`, `/think <mode>` commands); this file's own docstring
   explicitly says it mirrors the flow documented here.
@@ -693,6 +808,8 @@ viable request is:
 ```
 
 Decision rules:
+- **Always** send `Authorization: Bearer <API_TOKEN>` — without it every call
+  fails with `401` (§3).
 - **New conversation** → omit `X-Session-ID` header entirely.
 - **Continue conversation** → send back the `X-Session-ID` you received last
   time; don't resend prior `messages`, only send the newest `user` turn (plus
@@ -724,6 +841,9 @@ Decision rules:
 
 For anyone auditing this document against the code:
 - Endpoint behavior, schema, headers, error codes → `PublicForward/ForVPS/vps_server.py`
+- API-token auth → `PublicForward/ForVPS/vps_server.py` (`ApiTokenMiddleware`),
+  `PublicForward/ForVPS/paf_auth.py`, `PublicForward/ForVPS/manage_token.py`;
+  verified by `tests/test_api_auth.py`
 - DeepSeek worker task execution / result shape → `public_deepseek.py`, `scrapers/deepseek_scraper.py`
 - Qwen worker task execution / result shape → `public_qwen.py`, `scrapers/qwen_scraper.py`
 - Grok worker task execution / result shape → `public_grok.py`,

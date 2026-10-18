@@ -20,9 +20,18 @@ NEW FEATURES:
   11. x_meta block in response (session, account, timing, conversation_url)
   12. Worker stats detail in /health and /
   13. reject_future() when worker sends error message
+  14. Client API token: EVERY HTTP endpoint requires
+      `Authorization: Bearer <token>` (see paf_auth.py / manage_token.py).
+      This is separate from --token / PAF_TOKEN, which only gates workers.
+
+  15. Live admin console: while the server runs in a terminal, type
+      `token generate | rotate | set <value> | show | revoke` right in that
+      console to manage the API token with NO restart (see CONSOLE_HELP).
 
 Run:
-  python vps_server.py --port 8000 --token MY_SHARED_SECRET
+  python vps_server.py --port 8000 --token MY_WORKER_SECRET
+  # then, in the same console:  token generate
+  # (offline alternatives: `--generate-token`, or manage_token.py)
 """
 from __future__ import annotations
 
@@ -31,6 +40,8 @@ import asyncio
 import json
 import os
 import re
+import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -40,13 +51,23 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPExcept
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 import uvicorn
+
+import paf_auth
 
 
 # =========================================================================== #
 # Config (env / CLI)
 # =========================================================================== #
+# AUTH_TOKEN (env PAF_TOKEN) only gates WORKER WebSocket connections.
 AUTH_TOKEN = os.environ.get("PAF_TOKEN", "change-me")
+# API_TOKEN is the single shared token every HTTP CLIENT must present as
+# `Authorization: Bearer <token>`. Resolved from env PAF_API_TOKEN or the
+# token file (manage_token.py); main() lets --api-token override it.
+# Empty means "not configured" -> every HTTP request is rejected (fail closed).
+API_TOKEN, _API_TOKEN_SOURCE = paf_auth.load_token()
 REQUEST_TIMEOUT = float(os.environ.get("PAF_REQUEST_TIMEOUT", "330"))
 WORKER_WAIT_TIMEOUT = float(os.environ.get("WORKER_WAIT_TIMEOUT", "60"))
 
@@ -523,6 +544,11 @@ worker_mgr = WorkerManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not API_TOKEN:
+        print(
+            "[vps] WARNING: no API token configured -- every HTTP request will "
+            "be rejected with 503. Run `python manage_token.py generate`."
+        )
     yield
 
 
@@ -532,6 +558,66 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+# --------------------------------------------------------------------------- #
+# Client API token (Feature 14)
+# --------------------------------------------------------------------------- #
+class ApiTokenMiddleware:
+    """Require `Authorization: Bearer <API_TOKEN>` on EVERY HTTP request.
+
+    Pure ASGI middleware, so it runs before routing/body parsing: unknown paths,
+    /docs and /openapi.json are protected too, and unauthenticated callers
+    learn nothing about the API. WebSocket scopes pass through untouched --
+    /ws/worker has its own separate PAF_TOKEN check in worker_endpoint().
+
+    Fail closed: if the server has no API token configured, every request is
+    rejected with 503 rather than silently allowed.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        rejection = self._check(scope)
+        if rejection is None:
+            await self.app(scope, receive, send)
+            return
+
+        status, detail = rejection
+        client = scope.get("client")
+        print(
+            f"[vps] auth rejected ({status}): {scope.get('method')} "
+            f"{scope.get('path')} from {client[0] if client else 'unknown'}"
+        )
+        headers = {"WWW-Authenticate": "Bearer"} if status == 401 else {}
+        response = JSONResponse(
+            status_code=status, content={"detail": detail}, headers=headers
+        )
+        await response(scope, receive, send)
+
+    @staticmethod
+    def _check(scope: Scope) -> Optional[tuple[int, str]]:
+        """Return None if authorised, else (status_code, detail)."""
+        if not API_TOKEN:
+            return 503, "API token is not configured on the server."
+        header = Headers(scope=scope).get("authorization")
+        if not header:
+            return 401, "Missing API token. Send 'Authorization: Bearer <token>'."
+        provided = paf_auth.extract_bearer(header)
+        if provided is None or not paf_auth.tokens_match(provided, API_TOKEN):
+            return 401, "Invalid API token."
+        return None
+
+
+# NOTE: middleware added LAST is OUTERMOST. The auth middleware is added
+# BEFORE CORS on purpose, so CORS stays outermost: browser preflight (OPTIONS)
+# requests are answered by CORS without credentials, and even 401 responses
+# carry CORS headers (so browser clients can read the error).
+app.add_middleware(ApiTokenMiddleware)
 
 # Feature 1: CORS middleware
 app.add_middleware(
@@ -922,22 +1008,201 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
 # =========================================================================== #
 # Main
 # =========================================================================== #
+# --------------------------------------------------------------------------- #
+# Live admin console (Feature 15) — manage the API token while the server runs
+# --------------------------------------------------------------------------- #
+CONSOLE_HELP = """\
+Console commands (type them in THIS terminal; effective immediately, no restart):
+  token generate        create a random API token (only if none exists)
+  token rotate          replace the token with a new random one
+  token set <value>     use your own token (min 16 chars)
+  token show            show token status (masked)
+  token reveal          print the full token
+  token revoke          delete the token (every request gets 503 until a new one is set)
+  help                  show this help
+Changes are saved to the token file, so they survive a restart."""
+
+
+def _set_api_token(token: str, source: str = "console") -> None:
+    """Apply a new API token to the RUNNING server (read per request)."""
+    global API_TOKEN, _API_TOKEN_SOURCE
+    API_TOKEN, _API_TOKEN_SOURCE = token, source
+
+
+def _env_override_note() -> str:
+    if os.environ.get(paf_auth.ENV_VAR, "").strip():
+        return (f"\nNOTE: env {paf_auth.ENV_VAR} is set and will override the saved "
+                "token after a restart.")
+    return ""
+
+
+def _console_install(token: str, headline: str) -> str:
+    err = paf_auth.validate_token_format(token)
+    if err:
+        return f"Invalid token: {err}"
+    try:
+        path = paf_auth.save_token(token)
+    except OSError as exc:
+        return f"Could not save the token file ({exc}); nothing was changed."
+    _set_api_token(token)
+    return (f"{headline}\n\n  {token}\n\n"
+            f"Active NOW (saved to {path}). Clients send: Authorization: Bearer <token>"
+            + _env_override_note())
+
+
+def handle_console_command(line: str) -> str:
+    """Run one console command and return the text to print ("" = nothing)."""
+    parts = line.strip().split()
+    if not parts:
+        return ""
+    cmd = parts[0].lower()
+    if cmd in ("help", "?"):
+        return CONSOLE_HELP
+    if cmd != "token":
+        return f"Unknown command '{parts[0]}'. Type 'help'."
+
+    sub = parts[1].lower() if len(parts) > 1 else "show"
+    args = parts[2:]
+
+    if sub in ("show", "reveal"):
+        if not API_TOKEN:
+            return ("No API token configured: every request gets 503.\n"
+                    "Type: token generate")
+        shown = API_TOKEN if sub == "reveal" else paf_auth.mask_token(API_TOKEN)
+        return f"API token ({_API_TOKEN_SOURCE}): {shown}"
+
+    if sub == "generate":
+        if API_TOKEN:
+            return ("A token already exists. Use 'token rotate' to replace it "
+                    "(everyone using the old token is cut off immediately).")
+        return _console_install(paf_auth.generate_token(), "New API token created.")
+
+    if sub == "rotate":
+        return _console_install(
+            paf_auth.generate_token(),
+            "API token rotated. The OLD token no longer works.",
+        )
+
+    if sub == "set":
+        if len(args) != 1:
+            return "Usage: token set <value>"
+        return _console_install(args[0], "API token set.")
+
+    if sub == "revoke":
+        paf_auth.delete_token_file()
+        _set_api_token("")
+        return ("API token revoked. Every request now gets 503 until you run "
+                "'token generate' or 'token set <value>'." + _env_override_note())
+
+    return f"Unknown token command '{sub}'. Type 'help'."
+
+
+def _console_loop() -> None:
+    print("[console] Ready. Type 'help' for commands, e.g. 'token generate'.", flush=True)
+    while True:
+        try:
+            line = sys.stdin.readline()
+        except Exception:
+            return
+        if line == "":  # EOF (terminal closed)
+            return
+        out = handle_console_command(line)
+        if out:
+            print(out, flush=True)
+
+
+def _start_console() -> None:
+    threading.Thread(target=_console_loop, name="admin-console", daemon=True).start()
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PAF-ModelDeepSeek Enhanced VPS Server")
     p.add_argument("--port", type=int, default=8000, help="Port to listen on")
     p.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    p.add_argument("--token", help="Auth token (overrides PAF_TOKEN env)")
+    p.add_argument("--token", help="WORKER auth token (overrides PAF_TOKEN env)")
+    p.add_argument(
+        "--api-token",
+        help=(
+            "Client API token (overrides PAF_API_TOKEN env and the token file "
+            "written by manage_token.py). Prefer the file/env: CLI args are "
+            "visible in `ps`."
+        ),
+    )
+    p.add_argument(
+        "--no-console",
+        action="store_true",
+        help=("Disable the live admin console (it is enabled automatically when "
+              "stdin is a terminal)."),
+    )
+    p.add_argument(
+        "--generate-token",
+        action="store_true",
+        help=(
+            "Generate a new client API token, save it to the token file, print it "
+            "and exit (does not start the server). Add --force to replace an "
+            "existing token."
+        ),
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="With --generate-token: replace an existing token.",
+    )
     return p.parse_args()
 
 
 def main():
     args = _parse_args()
+
+    if args.generate_token:
+        import manage_token  # lazy: only needed for this one-shot command
+        sys.exit(manage_token.main(["generate"] + (["--force"] if args.force else [])))
+
     if args.token:
         global AUTH_TOKEN
         AUTH_TOKEN = args.token
 
+    token, source = paf_auth.load_token(args.api_token)
+    _set_api_token(token, source)
+
+    # The live console needs an interactive terminal (not nohup/systemd/docker -d).
+    console_enabled = (
+        not args.no_console
+        and sys.stdin is not None
+        and sys.stdin.isatty()
+    )
+
+    if not API_TOKEN:
+        if console_enabled:
+            # Start anyway (fail closed: every request gets 503) so the operator
+            # can create the token right here, in this console.
+            print(
+                "[vps] No client API token yet -> every HTTP request is rejected "
+                "(503) until you create one.\n"
+                "[vps]   Type  token generate  in this console.",
+                flush=True,
+            )
+        else:
+            print(
+                "[vps] ERROR: no client API token configured and no interactive "
+                "console available; refusing to start.\n"
+                "[vps]   Create one with:  python vps_server.py --generate-token\n"
+                "[vps]   (or set PAF_API_TOKEN / pass --api-token)",
+                file=sys.stderr,
+            )
+            sys.exit(2)  # exit code 2 = config error (start.sh does not retry it)
+    else:
+        err = paf_auth.validate_token_format(API_TOKEN)
+        if err:
+            print(f"[vps] ERROR: invalid API token ({_API_TOKEN_SOURCE}): {err}", file=sys.stderr)
+            sys.exit(2)
+
     print(f"[vps] Starting Enhanced VPS Bridge on {args.host}:{args.port}")
-    print(f"[vps] Auth token: {AUTH_TOKEN[:8]}***")
+    print(f"[vps] Worker token: {AUTH_TOKEN[:8]}***")
+    print(f"[vps] API token: {paf_auth.mask_token(API_TOKEN)} (from {_API_TOKEN_SOURCE})")
+
+    if console_enabled:
+        _start_console()
 
     uvicorn.run(
         app,

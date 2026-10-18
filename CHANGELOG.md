@@ -5,6 +5,63 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — MAJOR: client API token (auth) for the VPS gateway
+
+> **Breaking change.** Every HTTP endpoint of `vps_server.py` now requires
+> `Authorization: Bearer <API_TOKEN>`. Existing clients without the token get
+> `401`. There is intentionally **no** "auth off" / transition mode.
+
+**Why:** until now the public REST API had no client authentication at all —
+anyone who could reach the VPS port could use it. `PAF_TOKEN` only protected
+the worker WebSocket (`/ws/worker`), not callers.
+
+**Design (single shared token, CLI-managed):**
+- **One token for all users**, sent as `Authorization: Bearer <token>`.
+  Separate from `PAF_TOKEN` (worker auth), which is unchanged.
+- Enforced by a pure-ASGI `ApiTokenMiddleware` on **all** HTTP routes
+  (`/`, `/health`, `/v1/models`, `/v1/chat/completions`,
+  `DELETE /v1/sessions/{id}`, unknown paths, `/docs`, `/openapi.json`), before
+  routing/body parsing. WebSocket scopes pass through (worker auth unchanged).
+- Responses: `401` + `WWW-Authenticate: Bearer` for missing/invalid token;
+  `503` if the server has no token configured (**fail closed**).
+- Constant-time comparison (`hmac.compare_digest`); non-ASCII credentials are
+  rejected cleanly. Rejections are logged (method, path, client IP — never the
+  token).
+- Middleware order keeps **CORS outermost**: browser preflight `OPTIONS` works
+  without credentials and `401` responses carry CORS headers.
+- No token configured → every request is `503`. Without an interactive
+  terminal `python vps_server.py` **refuses to start** (exit code 2) and
+  `start.sh` stops instead of looping on that config error.
+
+**Managing the token — live console:** while `vps_server.py` runs in a terminal,
+type `token generate | rotate | set <value> | show | reveal | revoke | help`
+right in that console. Changes apply to the running server **immediately (no
+restart)** and are saved to the token file. Enabled automatically when stdin is
+a TTY (disable with `--no-console`); not available under nohup/systemd. In an
+interactive terminal the server may start with no token (every request → 503)
+so you can create it from the console; without a terminal it refuses to start.
+Offline alternatives: `python vps_server.py --generate-token [--force]` and the
+new `PublicForward/ForVPS/manage_token.py`
+(`generate [--force]`, `set`, `show [--reveal]`, `revoke`). Stored in
+`PublicForward/ForVPS/.api_token` (chmod 600, git-ignored). Resolution order:
+`--api-token` flag > env `PAF_API_TOKEN` > token file. Console changes are
+live; the offline CLI/flag only take effect on a running server after a restart.
+
+**New files:** `PublicForward/ForVPS/paf_auth.py`,
+`PublicForward/ForVPS/manage_token.py`, `tests/test_api_auth.py`.
+
+**Changed files:** `PublicForward/ForVPS/vps_server.py`,
+`PublicForward/ForVPS/start.sh`, `PublicForward/start.txt`, `.env.example`,
+`.gitignore`, `API_USAGE.md` (§3 rewritten, error table, all examples),
+`README.md`, `tests/test_http_e2e.py`, `tests/test_delete_session_e2e.py`
+(now send the Bearer token), and the example clients in `example/`
+(`--api-token` / env `PAF_API_TOKEN`).
+
+**Upgrade steps:** start the gateway in a terminal → type `token generate` in
+its console (no restart needed) → give the token to your users.
+
+---
+
 ## [Unreleased] — Grok backend replaces ChatGPT backend entirely (migration)
 
 > **Full architecture + operational deep-dive:** see
