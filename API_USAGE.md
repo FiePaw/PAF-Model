@@ -85,6 +85,7 @@ path does not bypass this):
 |---|---|---|
 | No `Authorization` header | `401` + `WWW-Authenticate: Bearer` | `{"detail": "Missing API token. Send 'Authorization: Bearer <token>'."}` |
 | Wrong token / wrong scheme / empty token | `401` + `WWW-Authenticate: Bearer` | `{"detail": "Invalid API token."}` |
+| Correct token but **past its expiry** (§3.2) | `401` + `WWW-Authenticate: Bearer` | `{"detail": "API token has expired. Ask the operator for a new token."}` |
 | Server has no API token configured | `503` | `{"detail": "API token is not configured on the server."}` |
 
 Notes:
@@ -127,12 +128,33 @@ Active NOW (saved to .../.api_token). Clients send: Authorization: Bearer <token
 
 | Console command | Effect |
 |---|---|
-| `token generate` | Create a random token (`paf_...`). Refuses if one already exists. |
-| `token rotate` | Replace it with a new random token. The old one stops working at once. |
-| `token set <value>` | Use your own token (min 16 chars, no spaces). |
-| `token show` / `token reveal` | Show the token masked / in full. |
+| `token generate [expiry]` | Create a random token (`paf_...`). Refuses if an *active* token already exists. |
+| `token rotate [expiry]` | Replace it with a new random token. The old one stops working at once. |
+| `token set <value> [expiry]` | Use your own token (min 16 chars, no spaces). |
+| `token expire <expiry\|never>` | Change the expiry of the **current** token (same token string). |
+| `token show` / `token reveal` | Show the token masked / in full, with its expiry status. |
 | `token revoke` | Delete the token. Every request gets `503` until you create a new one. |
 | `help` | List the commands. |
+
+**Token expiry (optional).** Give a token a lifetime with `<expiry>` = a number
+plus a unit — `s`, `m`, `h`, `d`, `w` — e.g. `30m`, `12h`, `7d`, `2w` (max 10
+years). Omit it or use `never` for a token that never expires.
+
+```
+token generate 7d        # valid for 7 days
+token rotate 12h         # new token, valid for 12 hours
+token set my-secret-token-123456 2w
+token expire 1d          # change the expiry of the current token to 1 day from now
+token expire never       # remove the expiry
+token show               # Status: expires 2026-10-26 14:03:00 UTC (in 6d 23h)
+```
+
+Once the time passes, the gateway rejects the token **automatically** (`401`,
+body `API token has expired...`) — no restart, no action needed. Create a new
+one with `token rotate [expiry]` (or `token generate`, which is also allowed
+once the old token has expired). The expiry is stored in the token file and is
+still enforced after a restart. Tokens supplied via the `--api-token` flag or
+the `PAF_API_TOKEN` env var never expire (use the console/file for that).
 
 Notes:
 - The console is enabled automatically when the server runs in an
@@ -148,13 +170,20 @@ Notes:
 cd PublicForward/ForVPS
 python vps_server.py --generate-token            # create + print + exit
 python vps_server.py --generate-token --force    # rotate
-python manage_token.py generate [--force] | set | show [--reveal] | revoke
+python vps_server.py --generate-token --expires 7d       # token valid for 7 days
+python manage_token.py generate [--force] [--expires 7d]
+python manage_token.py set [TOKEN] [--expires 7d]
+python manage_token.py expire 12h|never          # change expiry of the saved token
+python manage_token.py show [--reveal] | revoke
 ```
 These edit the same token file; a running server only picks it up after a restart
 (or just use the live console instead).
 
 - The token is stored in `PublicForward/ForVPS/.api_token` (permissions
-  `600`, git-ignored). Minimum length is 16 characters.
+  `600`, git-ignored): line 1 is the token, an optional line 2
+  `expires_at=2026-10-26T14:03:00Z` (UTC) is the expiry. Minimum token length
+  is 16 characters. A file without an expiry line (e.g. from an older version)
+  simply never expires; an unreadable expiry line is treated as *expired*.
 - Rotating (`token rotate`) immediately cuts off everyone using the old token,
   so tell your users the new one.
 - Resolution order at startup: `--api-token` flag > `PAF_API_TOKEN` env var >
@@ -651,7 +680,7 @@ Notes on fields you can rely on:
 | HTTP status | When | Body shape |
 |---|---|---|
 | `400` | `model` doesn't match `^(deepseek\|qwen\|grok)(?:\(...\))?$` | `{"detail": "Unknown model: '...'. Use 'deepseek', 'qwen', 'grok', or '<backend>(<account_id>)' ..."}` |
-| `401` | **Missing/invalid API token** (§3) — carries a `WWW-Authenticate: Bearer` header. Sent before the request is processed | `{"detail": "Missing API token. ..."}` or `{"detail": "Invalid API token."}` |
+| `401` | **Missing/invalid/expired API token** (§3) — carries a `WWW-Authenticate: Bearer` header. Sent before the request is processed | `{"detail": "Missing API token. ..."}`, `{"detail": "Invalid API token."}` or `{"detail": "API token has expired. ..."}` |
 | `401` | *(different cause)* Grok worker has no valid session for the account (grok.com is SSO-only — there is no automated login fallback; run `login_grok.py` or `import_grok_cookies.py` on the worker host) | `{"detail": "<auth error message>"}` (no `WWW-Authenticate` header — that is how you tell it apart from the API-token 401 above) — see [`GROK_BACKEND.md`](./GROK_BACKEND.md#6-cloudflare--anti-bot--the-mitigation-ladder) if this coincides with a Cloudflare/anti-bot challenge |
 | `404` | Grok CONTINUE request whose `session_id` has no saved `conversation_url` (session was deleted, or never existed) | `{"detail": "Session tidak ditemukan atau conversation_url kosong — client harus membuat session baru"}` — start a new session (omit `X-Session-ID`) |
 | `503` | The gateway has no API token configured (operator error) — every request is refused | `{"detail": "API token is not configured on the server."}` |

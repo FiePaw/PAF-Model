@@ -33,8 +33,18 @@ the worker WebSocket (`/ws/worker`), not callers.
   terminal `python vps_server.py` **refuses to start** (exit code 2) and
   `start.sh` stops instead of looping on that config error.
 
+**Optional token expiry:** `token generate 7d`, `token rotate 12h`,
+`token set <value> 2w`, `token expire <expiry|never>` (units `s/m/h/d/w`, max
+10 years; default = never expires). An expired token is rejected automatically
+with `401` ("API token has expired...") — no restart, enforced on every request
+and again after a restart. Stored as an optional `expires_at=<UTC ISO>` second
+line of the token file (files without it keep working and never expire; an
+unparsable expiry line fails closed = expired). Tokens from `--api-token` /
+`PAF_API_TOKEN` never expire. Offline: `--generate-token --expires 7d`,
+`manage_token.py generate|set --expires ...`, `manage_token.py expire <expiry|never>`.
+
 **Managing the token — live console:** while `vps_server.py` runs in a terminal,
-type `token generate | rotate | set <value> | show | reveal | revoke | help`
+type `token generate | rotate | set <value> | expire | show | reveal | revoke | help`
 right in that console. Changes apply to the running server **immediately (no
 restart)** and are saved to the token file. Enabled automatically when stdin is
 a TTY (disable with `--no-console`); not available under nohup/systemd. In an

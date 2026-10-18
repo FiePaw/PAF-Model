@@ -25,8 +25,10 @@ NEW FEATURES:
       This is separate from --token / PAF_TOKEN, which only gates workers.
 
   15. Live admin console: while the server runs in a terminal, type
-      `token generate | rotate | set <value> | show | revoke` right in that
-      console to manage the API token with NO restart (see CONSOLE_HELP).
+      `token generate [expiry] | rotate | set <value> | expire | show | revoke`
+      right in that console to manage the API token with NO restart (see
+      CONSOLE_HELP). A token may carry an expiry (e.g. 7d) and is rejected
+      automatically once it has passed.
 
 Run:
   python vps_server.py --port 8000 --token MY_WORKER_SECRET
@@ -67,7 +69,9 @@ AUTH_TOKEN = os.environ.get("PAF_TOKEN", "change-me")
 # `Authorization: Bearer <token>`. Resolved from env PAF_API_TOKEN or the
 # token file (manage_token.py); main() lets --api-token override it.
 # Empty means "not configured" -> every HTTP request is rejected (fail closed).
-API_TOKEN, _API_TOKEN_SOURCE = paf_auth.load_token()
+API_TOKEN, _API_TOKEN_SOURCE, API_TOKEN_EXPIRES_AT = paf_auth.load_token_full()
+# API_TOKEN_EXPIRES_AT: epoch seconds, or None = never expires. Only a token
+# kept in the token file can expire (CLI flag / env tokens never do).
 REQUEST_TIMEOUT = float(os.environ.get("PAF_REQUEST_TIMEOUT", "330"))
 WORKER_WAIT_TIMEOUT = float(os.environ.get("WORKER_WAIT_TIMEOUT", "60"))
 
@@ -610,6 +614,9 @@ class ApiTokenMiddleware:
         provided = paf_auth.extract_bearer(header)
         if provided is None or not paf_auth.tokens_match(provided, API_TOKEN):
             return 401, "Invalid API token."
+        if paf_auth.is_expired(API_TOKEN_EXPIRES_AT):
+            # Only someone holding the (now expired) valid token sees this message.
+            return 401, "API token has expired. Ask the operator for a new token."
         return None
 
 
@@ -1013,40 +1020,53 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
 # --------------------------------------------------------------------------- #
 CONSOLE_HELP = """\
 Console commands (type them in THIS terminal; effective immediately, no restart):
-  token generate        create a random API token (only if none exists)
-  token rotate          replace the token with a new random one
-  token set <value>     use your own token (min 16 chars)
-  token show            show token status (masked)
-  token reveal          print the full token
-  token revoke          delete the token (every request gets 503 until a new one is set)
-  help                  show this help
-Changes are saved to the token file, so they survive a restart."""
+  token generate [expiry]       create a random API token (only if none is active)
+  token rotate [expiry]         replace the token with a new random one
+  token set <value> [expiry]    use your own token (min 16 chars)
+  token expire <expiry|never>   change the expiry of the CURRENT token
+  token show                    show token status and expiry (masked)
+  token reveal                  print the full token
+  token revoke                  delete the token (every request gets 503 until a new one is set)
+  help                          show this help
+<expiry> = number + unit s/m/h/d/w (e.g. 30m, 12h, 7d, 2w) or 'never' (the default).
+An expired token is rejected automatically (401). Changes are saved to the token
+file, so they survive a restart."""
 
 
-def _set_api_token(token: str, source: str = "console") -> None:
-    """Apply a new API token to the RUNNING server (read per request)."""
-    global API_TOKEN, _API_TOKEN_SOURCE
-    API_TOKEN, _API_TOKEN_SOURCE = token, source
+def _set_api_token(token: str, source: str = "console",
+                   expires_at: Optional[float] = None) -> None:
+    """Apply a new API token (+ expiry) to the RUNNING server (read per request)."""
+    global API_TOKEN, _API_TOKEN_SOURCE, API_TOKEN_EXPIRES_AT
+    API_TOKEN, _API_TOKEN_SOURCE, API_TOKEN_EXPIRES_AT = token, source, expires_at
+
+
+def _token_is_active() -> bool:
+    return bool(API_TOKEN) and not paf_auth.is_expired(API_TOKEN_EXPIRES_AT)
 
 
 def _env_override_note() -> str:
     if os.environ.get(paf_auth.ENV_VAR, "").strip():
         return (f"\nNOTE: env {paf_auth.ENV_VAR} is set and will override the saved "
-                "token after a restart.")
+                "token (and its expiry) after a restart.")
     return ""
 
 
-def _console_install(token: str, headline: str) -> str:
+def _console_install(token: str, headline: str, expiry_text: Optional[str] = None) -> str:
+    try:
+        expires_at = paf_auth.expiry_from_arg(expiry_text)
+    except ValueError as exc:
+        return str(exc)
     err = paf_auth.validate_token_format(token)
     if err:
         return f"Invalid token: {err}"
     try:
-        path = paf_auth.save_token(token)
+        path = paf_auth.save_token(token, expires_at)
     except OSError as exc:
         return f"Could not save the token file ({exc}); nothing was changed."
-    _set_api_token(token)
+    _set_api_token(token, "console", expires_at)
     return (f"{headline}\n\n  {token}\n\n"
-            f"Active NOW (saved to {path}). Clients send: Authorization: Bearer <token>"
+            f"Token {paf_auth.describe_expiry(expires_at)}. Active NOW "
+            f"(saved to {path}). Clients send: Authorization: Bearer <token>"
             + _env_override_note())
 
 
@@ -1067,26 +1087,46 @@ def handle_console_command(line: str) -> str:
     if sub in ("show", "reveal"):
         if not API_TOKEN:
             return ("No API token configured: every request gets 503.\n"
-                    "Type: token generate")
+                    "Type: token generate [expiry]")
         shown = API_TOKEN if sub == "reveal" else paf_auth.mask_token(API_TOKEN)
-        return f"API token ({_API_TOKEN_SOURCE}): {shown}"
+        return (f"API token ({_API_TOKEN_SOURCE}): {shown}\n"
+                f"Status: {paf_auth.describe_expiry(API_TOKEN_EXPIRES_AT)}")
 
-    if sub == "generate":
-        if API_TOKEN:
+    if sub in ("generate", "rotate"):
+        if len(args) > 1:
+            return f"Usage: token {sub} [expiry]   (expiry: {paf_auth.EXPIRY_HELP})"
+        if sub == "generate" and _token_is_active():
             return ("A token already exists. Use 'token rotate' to replace it "
                     "(everyone using the old token is cut off immediately).")
-        return _console_install(paf_auth.generate_token(), "New API token created.")
-
-    if sub == "rotate":
-        return _console_install(
-            paf_auth.generate_token(),
-            "API token rotated. The OLD token no longer works.",
-        )
+        headline = ("New API token created." if sub == "generate" else
+                    "API token rotated. The OLD token no longer works.")
+        return _console_install(paf_auth.generate_token(), headline,
+                                args[0] if args else None)
 
     if sub == "set":
+        if len(args) not in (1, 2):
+            return "Usage: token set <value> [expiry]"
+        return _console_install(args[0], "API token set.", args[1] if len(args) == 2 else None)
+
+    if sub == "expire":
         if len(args) != 1:
-            return "Usage: token set <value>"
-        return _console_install(args[0], "API token set.")
+            return f"Usage: token expire <expiry|never>   (expiry: {paf_auth.EXPIRY_HELP})"
+        if not API_TOKEN:
+            return "No API token to change. Type: token generate [expiry]"
+        if _API_TOKEN_SOURCE in ("env", "cli"):
+            return (f"The current token comes from the {_API_TOKEN_SOURCE} and cannot "
+                    "have an expiry. Use 'token rotate [expiry]' to replace it with a "
+                    "managed token.")
+        try:
+            expires_at = paf_auth.expiry_from_arg(args[0])
+        except ValueError as exc:
+            return str(exc)
+        try:
+            paf_auth.save_token(API_TOKEN, expires_at)
+        except OSError as exc:
+            return f"Could not save the token file ({exc}); nothing was changed."
+        _set_api_token(API_TOKEN, "console", expires_at)
+        return f"Expiry updated: token {paf_auth.describe_expiry(expires_at)}."
 
     if sub == "revoke":
         paf_auth.delete_token_file()
@@ -1148,6 +1188,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="With --generate-token: replace an existing token.",
     )
+    p.add_argument(
+        "--expires",
+        metavar="EXPIRY",
+        help="With --generate-token: token lifetime, e.g. 30m, 12h, 7d, 2w (default: never).",
+    )
     return p.parse_args()
 
 
@@ -1156,14 +1201,18 @@ def main():
 
     if args.generate_token:
         import manage_token  # lazy: only needed for this one-shot command
-        sys.exit(manage_token.main(["generate"] + (["--force"] if args.force else [])))
+        sys.exit(manage_token.main(
+            ["generate"]
+            + (["--force"] if args.force else [])
+            + (["--expires", args.expires] if args.expires else [])
+        ))
 
     if args.token:
         global AUTH_TOKEN
         AUTH_TOKEN = args.token
 
-    token, source = paf_auth.load_token(args.api_token)
-    _set_api_token(token, source)
+    token, source, expires_at = paf_auth.load_token_full(args.api_token)
+    _set_api_token(token, source, expires_at)
 
     # The live console needs an interactive terminal (not nohup/systemd/docker -d).
     console_enabled = (
@@ -1199,7 +1248,11 @@ def main():
 
     print(f"[vps] Starting Enhanced VPS Bridge on {args.host}:{args.port}")
     print(f"[vps] Worker token: {AUTH_TOKEN[:8]}***")
-    print(f"[vps] API token: {paf_auth.mask_token(API_TOKEN)} (from {_API_TOKEN_SOURCE})")
+    print(f"[vps] API token: {paf_auth.mask_token(API_TOKEN)} (from {_API_TOKEN_SOURCE}), "
+          f"{paf_auth.describe_expiry(API_TOKEN_EXPIRES_AT)}")
+    if API_TOKEN and paf_auth.is_expired(API_TOKEN_EXPIRES_AT):
+        print("[vps] WARNING: the API token has EXPIRED -> clients get 401 until you "
+              "create a new one (console: token rotate [expiry]).", flush=True)
 
     if console_enabled:
         _start_console()

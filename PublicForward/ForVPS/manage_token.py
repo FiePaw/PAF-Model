@@ -6,10 +6,14 @@ Every client of the PAF-Model gateway must send this token as
 `Authorization: Bearer <token>`. It is separate from PAF_TOKEN (worker auth).
 
 Usage:
-  python manage_token.py generate [--force]   # create a random token and save it
-  python manage_token.py set [TOKEN]          # save your own token (prompts if omitted)
-  python manage_token.py show [--reveal]      # show status (masked unless --reveal)
-  python manage_token.py revoke                # delete the saved token file
+  python manage_token.py generate [--force] [--expires 7d]  # create a random token
+  python manage_token.py set [TOKEN] [--expires 7d]         # save your own token (prompts if omitted)
+  python manage_token.py expire 7d|never                    # change expiry of the saved token
+  python manage_token.py show [--reveal]                    # status + expiry (masked unless --reveal)
+  python manage_token.py revoke                             # delete the saved token file
+
+Expiry = number + unit s/m/h/d/w (30m, 12h, 7d, 2w) or 'never' (default). An
+expired token is rejected automatically by the gateway (401).
 
 The token is stored in `.api_token` next to vps_server.py (chmod 600, git-ignored).
 This script edits the token FILE; a running gateway reads it only at startup.
@@ -39,10 +43,16 @@ def cmd_generate(args: argparse.Namespace) -> int:
               "Use --force to replace it (all clients using the old token will "
               "stop working).", file=sys.stderr)
         return 1
+    try:
+        expires_at = paf_auth.expiry_from_arg(args.expires)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     token = paf_auth.generate_token()
-    path = paf_auth.save_token(token)
+    path = paf_auth.save_token(token, expires_at)
     print(f"New API token saved to {path}\n")
     print(f"  {token}\n")
+    print(f"Token {paf_auth.describe_expiry(expires_at)}.\n")
     print("Share it only with people allowed to use the API. Clients send it as:")
     print("  Authorization: Bearer <token>")
     _warn_if_overridden()
@@ -62,15 +72,21 @@ def cmd_set(args: argparse.Namespace) -> int:
     if err:
         print(f"Invalid token: {err}", file=sys.stderr)
         return 1
-    path = paf_auth.save_token(token)
-    print(f"API token saved to {path} ({paf_auth.mask_token(token)})")
+    try:
+        expires_at = paf_auth.expiry_from_arg(args.expires)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    path = paf_auth.save_token(token, expires_at)
+    print(f"API token saved to {path} ({paf_auth.mask_token(token)}), "
+          f"{paf_auth.describe_expiry(expires_at)}")
     _warn_if_overridden()
     _restart_hint()
     return 0
 
 
 def cmd_show(args: argparse.Namespace) -> int:
-    token, source = paf_auth.load_token()
+    token, source, expires_at = paf_auth.load_token_full()
     if not token:
         print("No API token configured (every request gets 503; without an "
               "interactive terminal the gateway refuses to start).\n"
@@ -83,8 +99,27 @@ def cmd_show(args: argparse.Namespace) -> int:
     }
     print(f"Source : {labels.get(source, source)}")
     print(f"Token  : {token if args.reveal else paf_auth.mask_token(token)}")
+    print(f"Status : {paf_auth.describe_expiry(expires_at)}")
     if not args.reveal:
         print("(use --reveal to print the full token)")
+    return 0
+
+
+def cmd_expire(args: argparse.Namespace) -> int:
+    token, _ = paf_auth.read_token_file()
+    if not token:
+        print(f"No saved token in {paf_auth.TOKEN_FILE}. Run: python manage_token.py generate",
+              file=sys.stderr)
+        return 1
+    try:
+        expires_at = paf_auth.expiry_from_arg(args.expiry)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    paf_auth.save_token(token, expires_at)
+    print(f"Expiry updated: token {paf_auth.describe_expiry(expires_at)}.")
+    _warn_if_overridden()
+    _restart_hint()
     return 0
 
 
@@ -110,11 +145,19 @@ def main(argv: list[str] | None = None) -> int:
 
     g = sub.add_parser("generate", help="generate a new random token and save it")
     g.add_argument("--force", action="store_true", help="replace an existing token")
+    g.add_argument("--expires", metavar="EXPIRY",
+                   help="token lifetime, e.g. 30m, 12h, 7d, 2w (default: never)")
     g.set_defaults(func=cmd_generate)
 
     s = sub.add_parser("set", help="save a token of your choice")
     s.add_argument("token", nargs="?", help="token value (prompted if omitted)")
+    s.add_argument("--expires", metavar="EXPIRY",
+                   help="token lifetime, e.g. 30m, 12h, 7d, 2w (default: never)")
     s.set_defaults(func=cmd_set)
+
+    e = sub.add_parser("expire", help="change the expiry of the saved token")
+    e.add_argument("expiry", help="e.g. 30m, 12h, 7d, 2w, or 'never'")
+    e.set_defaults(func=cmd_expire)
 
     sh = sub.add_parser("show", help="show the active token source (masked)")
     sh.add_argument("--reveal", action="store_true", help="print the full token")

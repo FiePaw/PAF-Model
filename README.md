@@ -127,9 +127,11 @@ token generate
 ```
 
 Until a token exists every request gets `503` (never open access). Manage the
-token live from the server console: `token generate | rotate | set <value> |
-show | reveal | revoke | help` — changes apply immediately and are saved to
-`PublicForward/ForVPS/.api_token`. No terminal (`nohup`/`systemd`)? Create it
+token live from the server console: `token generate [expiry] | rotate [expiry] |
+set <value> [expiry] | expire <expiry|never> | show | reveal | revoke | help` —
+changes apply immediately and are saved to `PublicForward/ForVPS/.api_token`.
+Optional expiry = number + unit `s/m/h/d/w` (e.g. `token generate 7d`); an
+expired token is rejected automatically (`401`), no restart needed. No terminal (`nohup`/`systemd`)? Create it
 offline with `python vps_server.py --generate-token` or `manage_token.py`
 (then the server refuses to start without one). Details in
 [`API_USAGE.md` §3](./API_USAGE.md#3-authentication--api-token-required).
