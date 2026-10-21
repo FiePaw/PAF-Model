@@ -552,7 +552,8 @@ class LocalWorker:
         try:
             print(f"➕ Adding account: {account_name}")
             self.pool.add_account(account_name)
-            print(f"✅ Account {account_name} added (initializing in background)")
+            self.num_workers = len(self.pool.slots)
+            print(f"✅ Account {account_name} added (initializing in background, total slots: {self.num_workers})")
             await self._update_accounts_to_vps()
         except Exception as exc:
             print(f"❌ Failed to add account: {exc}")
@@ -565,8 +566,9 @@ class LocalWorker:
                 "type": "update_accounts",
                 "worker_id": self.worker_id,
                 "accounts": [a["account"] for a in self.pool.list_accounts()],
+                "max_concurrent": len(self.pool.slots),
             }))
-            log.info("Sent account update to VPS")
+            log.info("Sent account update to VPS (max_concurrent=%d)", len(self.pool.slots))
         except Exception as exc:
             log.warning("Failed to send account update: %s", exc)
 
@@ -587,7 +589,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PAF-Model Grok local worker")
     p.add_argument("--vps", required=True, help="VPS WebSocket URL (e.g., ws://VPS_IP:8000/ws/worker)")
     p.add_argument("--token", required=True, help="Shared secret token for authentication")
-    p.add_argument("--workers", type=int, default=1, help="Number of concurrent browser slots (default 1)")
+    p.add_argument("--workers", type=int, default=None, help="Number of concurrent browser slots (default: all accounts in authgrok.json)")
     p.add_argument("--headless", action="store_true", default=True, help="Run browsers headless (default True)")
     p.add_argument("--no-headless", action="store_true", help="Run browsers with visible UI (overrides --headless)")
     return p.parse_args(argv)
@@ -597,8 +599,17 @@ async def _amain(argv: list[str]) -> int:
     args = _parse_args(argv)
     headless = not args.no_headless if args.no_headless else args.headless
 
+    num_workers = args.workers
+    if not num_workers:
+        try:
+            from config import GROK_AUTH_CONFIG
+            from scrapers.utils import AuthStore
+            num_workers = len(AuthStore(GROK_AUTH_CONFIG["auth_file"]).account_names()) or 1
+        except Exception:
+            num_workers = 1
+
     worker = LocalWorker(
-        vps_url=args.vps, token=args.token, num_workers=args.workers, headless=headless,
+        vps_url=args.vps, token=args.token, num_workers=num_workers, headless=headless,
     )
     try:
         await worker.start()

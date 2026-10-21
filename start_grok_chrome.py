@@ -123,6 +123,14 @@ def start_chrome(account: str, port: int, headless: bool, channel: str, url: str
     profile_dir = PROFILES_DIR / "grok" / account
     profile_dir.mkdir(parents=True, exist_ok=True)
 
+    if _wait_for_cdp(port, timeout=0.5):
+        log.warning(
+            "⚠️ PERINGATAN: Port CDP %s sudah aktif dan merespons! "
+            "Jika ada Chrome lain yang memakai port ini, Chrome untuk %r akan gagal bind port. "
+            "Gunakan port berbeda (misal --port %s).",
+            port, account, port + 1,
+        )
+
     binary = _find_chrome_binary(channel)
     if not binary:
         log.error(
@@ -158,8 +166,8 @@ def start_chrome(account: str, port: int, headless: bool, channel: str, url: str
     print("  1. Log into grok.com di jendela Chrome ini (sekali saja).")
     print("  2. Jalankan worker dengan GROK_CDP_ATTACH=1, mis.:")
     print("       set GROK_CDP_ATTACH=1   (Windows)")
-    print("       python public.py --backend grok --vps ws://VPS_IP:PORT/ws/worker --token YOUR_TOKEN")
-    print(f"  3. Untuk menghentikan Chrome ini: python start_grok_chrome.py --account {account} --stop\n")
+    print("       python public.py --backend grok --vps ws://VPS_IP:PORT/ws/worker --workers 2 --token YOUR_TOKEN")
+    print(f"  3. Untuk menghentikan Chrome ini: python start_grok_chrome.py --account {account} --port {port} --stop\n")
 
     try:
         proc.wait()
@@ -171,8 +179,12 @@ def start_chrome(account: str, port: int, headless: bool, channel: str, url: str
 def stop_chrome(account: str, port: int) -> int:
     pid_file = _pid_file(account, port)
     if not pid_file.exists():
-        log.error("Tidak ada PID file %s — Chrome mungkin tidak di-start lewat script ini.", pid_file)
-        return 1
+        matches = list((PROFILES_DIR / "grok").glob(f"{account}.chrome-*.pid"))
+        if matches:
+            pid_file = matches[0]
+        else:
+            log.error("Tidak ada PID file %s — Chrome mungkin tidak di-start lewat script ini.", pid_file)
+            return 1
     pid = int(pid_file.read_text().strip())
     try:
         if sys.platform == "win32":
@@ -190,12 +202,22 @@ def stop_chrome(account: str, port: int) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Start a real Chrome for CDP attach (Grok backend).")
     parser.add_argument("--account", default="account1", help="Account/profile name (default: account1)")
-    parser.add_argument("--port", type=int, default=9222, help="CDP debugging port (default: 9222)")
+    parser.add_argument("--port", type=int, default=None, help="CDP debugging port (default: 9222 for account1, 9223 for account2, ...)")
     parser.add_argument("--headless", action="store_true", help="Start Chrome headless (not recommended for first login)")
     parser.add_argument("--channel", default="chrome", help='Browser binary: "chrome" (default), "msedge", "brave", "chromium"')
     parser.add_argument("--url", default=GROK_CONFIG["base_url"], help="Page to open after start")
     parser.add_argument("--stop", action="store_true", help="Stop the Chrome started earlier for this account")
     args = parser.parse_args()
+
+    if args.port is None:
+        try:
+            from config import GROK_AUTH_CONFIG
+            from scrapers.utils import AuthStore
+            auth_accounts = AuthStore(GROK_AUTH_CONFIG["auth_file"]).account_names()
+            idx = auth_accounts.index(args.account) if args.account in auth_accounts else 0
+            args.port = 9222 + idx
+        except Exception:
+            args.port = 9222
 
     if args.stop:
         raise SystemExit(stop_chrome(args.account, args.port))

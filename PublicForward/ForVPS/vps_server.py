@@ -275,12 +275,16 @@ class WorkerManager:
         print(f"[vps] worker unregistered: {worker_id}")
 
     # ----- Feature 4: update_accounts runtime ------------------------ #
-    async def update_accounts(self, worker_id: str, accounts: list[str]) -> None:
+    async def update_accounts(
+        self, worker_id: str, accounts: list[str], max_concurrent: Optional[int] = None,
+    ) -> None:
         """Update account list for a worker at runtime."""
         async with self._lock:
             if worker_id in self.workers:
                 self.workers[worker_id].accounts = accounts
-                print(f"[vps] updated accounts for {worker_id}: {accounts}")
+                if max_concurrent is not None:
+                    self.workers[worker_id].max_concurrent = max_concurrent
+                print(f"[vps] updated accounts for {worker_id}: {accounts} (max_concurrent={self.workers[worker_id].max_concurrent})")
 
     @staticmethod
     def _account_matches(account: Any, name: str) -> bool:
@@ -680,7 +684,9 @@ async def worker_endpoint(ws: WebSocket):
             elif mtype == "session_deleted":
                 await worker_mgr.handle_session_deleted(raw)
             elif mtype == "update_accounts":
-                await worker_mgr.update_accounts(worker_id, raw.get("accounts", []))
+                await worker_mgr.update_accounts(
+                    worker_id, raw.get("accounts", []), raw.get("max_concurrent"),
+                )
             elif mtype == "ping":
                 # Update last_ping timestamp
                 if worker_id in worker_mgr.workers:

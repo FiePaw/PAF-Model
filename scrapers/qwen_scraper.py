@@ -1962,7 +1962,7 @@ class QwenScraper(BaseAIChatScraper):
             {"prompt": "...", "model": "account1", "max_tokens": 2000}
         """
         account_name = (
-            self._current_cookie_file.stem if self._current_cookie_file else "qwen"
+            self.account or (self._current_cookie_file.stem if self._current_cookie_file else "qwen")
         )
         user_request: dict = {"prompt": prompt, "model": account_name}
         if self._max_tokens is not None:
@@ -2037,7 +2037,7 @@ class QwenScraper(BaseAIChatScraper):
             {"prompt":"sekarang jalankan","model":"account1"}
         """
         account_name = (
-            self._current_cookie_file.stem if self._current_cookie_file else "qwen"
+            self.account or (self._current_cookie_file.stem if self._current_cookie_file else "qwen")
         )
         parts = ["[TOOL RESULT]"]
 

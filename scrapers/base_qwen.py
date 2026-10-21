@@ -155,8 +155,9 @@ class BaseAIChatScraper(ABC):
         both workers ran simultaneously.
         """
         base = PROFILES_DIR / "qwen"
-        if account:
-            return base / account
+        target_account = account or self.account
+        if target_account:
+            return base / target_account
         if cookie_file:
             return base / cookie_file.stem
         return base / PERSISTENT_CONTEXT_CONFIG["default_profile"]
@@ -181,20 +182,22 @@ class BaseAIChatScraper(ABC):
     ) -> None:
         """
         Start Playwright and either:
-          • Open a persistent context bound to *account*'s profile (email+password mode), or
+          • Open a persistent context bound to *account*'s profile (email+password mode: profiles/qwen/<account>/), or
           • Open a persistent context for *cookie_file*'s profile (legacy cookie mode), or
           • Launch an ephemeral browser + context (non-persistent mode).
 
         When *account* is given it takes priority over *cookie_file*.
         """
+        target_account = account or self.account
+        self.account = target_account
         self.logger.info(
-            "Launching browser (headless=%s, persistent=%s, account=%s)",
-            self.headless, self._persistent_mode, account or "legacy-cookie",
+            "Launching browser (headless=%s, persistent=%s, account=%s, profile=profiles/qwen/%s)",
+            self.headless, self._persistent_mode, target_account or "legacy-cookie", target_account or "default",
         )
         self._playwright = await async_playwright().start()
 
         if self._persistent_mode:
-            await self._launch_persistent(cookie_file=cookie_file, account=account)
+            await self._launch_persistent(cookie_file=cookie_file, account=target_account)
         else:
             await self._launch_ephemeral()
 
@@ -321,9 +324,13 @@ class BaseAIChatScraper(ABC):
             self.logger.warning("Error during crash detection: %s", e)
             return True
 
-    async def restart_browser(self, cookie_file: Path | None = None) -> bool:
+    async def restart_browser(
+        self,
+        account: str | None = None,
+        cookie_file: Path | None = None,
+    ) -> bool:
         """
-        Restart browser sepenuhnya (close + relaunch) dengan cookie yang sama.
+        Restart browser sepenuhnya (close + relaunch) dengan profile akun yang sama.
 
         Dipakai saat halaman crash / error fatal yang tidak bisa di-recover
         hanya dengan navigate ulang.
@@ -331,10 +338,12 @@ class BaseAIChatScraper(ABC):
         Returns True jika restart berhasil.
         """
         import time as _time
+        target_account = account or self.account
         target_cookie = cookie_file or self._current_cookie_file or self.cookies_path
         self.logger.warning(
-            "🔄 Restarting browser (account: %s) …",
-            target_cookie.name if target_cookie else "default",
+            "🔄 Restarting browser (account: %s, profile: profiles/qwen/%s) …",
+            target_account or (target_cookie.name if target_cookie else "default"),
+            target_account or (target_cookie.stem if target_cookie else "default"),
         )
 
         _time.sleep(ROTATION_CONFIG.get("browser_restart_delay", 5))
@@ -361,8 +370,8 @@ class BaseAIChatScraper(ABC):
             self._page = None
             self._playwright = None
 
-            await self.launch_browser(cookie_file=target_cookie)
-            self.logger.info("✅ Browser restart selesai")
+            await self.launch_browser(cookie_file=target_cookie, account=target_account)
+            self.logger.info("✅ Browser restart selesai (profile: profiles/qwen/%s)", target_account or "default")
             return True
 
         except Exception as e:
@@ -485,12 +494,41 @@ class BaseAIChatScraper(ABC):
     async def _rotate_account(self) -> bool:
         """
         Switch to the next available account.
-        In persistent mode: close the current context and open the next
-        account's profile directory.
-        In ephemeral mode: close the current context and inject the next
-        account's cookies into a fresh context.
+        In email+password mode: rotate across self._qwen_accounts (profiles/qwen/<account>/).
+        In legacy cookie mode: rotate across self._cookie_files (profiles/qwen/<cookie_stem>/).
         Returns False if all accounts are exhausted.
         """
+        # ── Mode Email+Password (profiles/qwen/<account>/) ─────────────────
+        if self._qwen_accounts and len(self._qwen_accounts) > 1:
+            total = len(self._qwen_accounts)
+            next_index = (self._account_index + 1) % total
+            if next_index == 0:
+                self.logger.error("All Qwen accounts exhausted – no more rotation possible")
+                await self.take_debug_screenshot("all_accounts_exhausted")
+                return False
+
+            prev_acc = self.account
+            next_acc = self._qwen_accounts[next_index]
+            self.logger.warning(
+                "Rotating Qwen account: %s → %s (profile: profiles/qwen/%s)",
+                prev_acc, next_acc, next_acc,
+            )
+            self._account_index = next_index
+            self.account = next_acc
+            self.email = None
+            self.password = None
+            self._authenticated = False
+            retry_sleep(ROTATION_CONFIG.get("rotation_delay", 5))
+
+            if self._context:
+                try:
+                    await self._context.close()
+                except Exception:
+                    pass
+            await self._launch_persistent(account=self.account)
+            return True
+
+        # ── Legacy Cookie-File Mode ───────────────────────────────────────
         total = len(self._cookie_files)
         if total <= 1:
             self.logger.error("No additional accounts available for rotation")
@@ -517,7 +555,7 @@ class BaseAIChatScraper(ABC):
             # Close current persistent context and open the next profile
             if self._context:
                 await self._context.close()
-            await self._launch_persistent(next_cookie_file)
+            await self._launch_persistent(cookie_file=next_cookie_file)
         else:
             # Ephemeral: recreate context and inject cookies after navigating to domain
             if self._context:

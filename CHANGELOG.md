@@ -5,6 +5,50 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — Qwen Backend: Diagnostik Login Otomatis, Pemetaan Selector Baru, dan Isolasi Profil Akun
+
+> **Pembaruan Backend Qwen.** Penambahan tool diagnostik auth mandiri (`debug_login_qwen.py`) dengan auto-summary generator, identifikasi perubahan alur login Qwen Web (v0.3.20), pemetaan selector baru, serta pengetatan isolasi persistent browser profile akun ke `profiles/qwen/<account>/`.
+
+### 1. Tool Diagnostik Mandiri & Auto-Summary (`debug_login_qwen.py`)
+- **Script Diagnostik Komprehensif:** File baru [`debug_login_qwen.py`](./debug_login_qwen.py) untuk menguji, membedah, dan mendiagnosis seluruh tahapan login Qwen (`chat.qwen.ai`) secara live.
+  - Mendukung mode **No-Headless** (default, browser GUI tampil) dan mode **Headless** (`--headless`).
+  - Mode interaktif (`--interactive`): menahan jendela browser terbuka untuk inspeksi elemen langsung via Chrome DevTools (F12).
+  - Mode profil bersih (`--clean-profile`): pengujian first-time login cold-start tanpa terpengaruh cache/sesi lama.
+  - Opsi `--skip-fill` dan `--skip-submit` untuk inspeksi selektif tanpa mengubah status form.
+- **Generator Summary Otomatis:** Script secara otomatis menganalisis hasil pengujian dan menyimpannya ke direktori `debug/summary/`:
+  - [`debug/summary/summary.md`](./debug/summary/summary.md): Ringkasan lengkap format Markdown (tabel evaluasi selector, temuan alur baru, dan rekomendasi kode).
+  - [`debug/summary/summary.json`](./debug/summary/summary.json): Data ringkasan terstruktur JSON untuk kemudahan parsing terotomasi.
+  - Arsip riwayat pengujian ber-timestamp (`summary_YYYYMMDD_HHMMSS.md` & `.json`).
+- **Perekaman Artefak Lengkap:** Tangkapan layar otomatis (`.png`) dan dump DOM HTML penuh (`.html`) tersimpan pada folder `debug/` di setiap tahap (landing page, auth page, form terisi, dan respon pasca-submit).
+
+### 2. Temuan Alur UI Baru Qwen Web (`qwen-chat-fe/0.3.20`)
+- **Alur Login Dua Tahap (Two-Step Flow):**
+  - Halaman `/auth` kini secara default menampilkan alur kode verifikasi / SSO. Field password **disembunyikan** hingga tombol `Log in with a password` diklik.
+  - Ditambahkan dukungan deteksi dan interaksi tombol switch: `button:has-text("Log in with a password")`.
+- **Perubahan Tipe Input Email:**
+  - Input email diubah oleh Qwen menjadi `type="text"` dengan `name="email"` (sebelumnya `type="email"`).
+  - Pembaruan selector email rekomendasi: `input[name="email"]` dan `input[placeholder*="Email" i]`.
+- **Input Password & Submit Button:**
+  - Input password menggunakan `name="password"` dan `type="password"`.
+  - Tombol submit formulir login menggunakan class khusus `.qwenchat-auth-pc-submit-button` dengan teks "Log in".
+- **Koreksi Deteksi Sesi Guest:**
+  - Halaman landing `chat.qwen.ai` merender textarea input chat untuk pengguna tamu (guest), sehingga keberadaan `#chat-input` tidak lagi dijadikan acuan tunggal status login. Scraper memverifikasi ketiadaan tombol "Log in" / "Sign up" untuk memastikan sesi terautentikasi.
+
+### 3. Pengetatan Isolasi Persistent Profile (`profiles/qwen/<account>/`)
+- **Isolasi Profil Konsisten:**
+  - Scraper Qwen kini secara ketat memetakan seluruh sesi akun ke subfolder namespace khusus: `profiles/qwen/<account>/` (misal `profiles/qwen/account1/`, `profiles/qwen/account2/`), mencegah konflik SingletonLock dengan backend DeepSeek (`profiles/deepseek/`) dan Grok (`profiles/grok/`).
+- **Perbaikan Browser Restart:**
+  - Memperbaiki method `restart_browser()` pada `scrapers/base_qwen.py`: sebelumnya restart browser tanpa argumen menyebabkan profil terlempar ke `profiles/qwen/default`. Sekarang `restart_browser()` mempertahankan `self.account` dan membuka kembali direktori profil akun yang sama.
+- **Dukungan Rotasi Multi-Akun Email+Password:**
+  - Memperbarui `_rotate_account()` pada `scrapers/base_qwen.py` agar mendukung rotasi akun dari `cookies/authqwen.json` (`account1` → `account2` → `account3` → `account4`).
+  - Setiap rotasi menutup browser context aktif dan meluncurkan persistent context baru ke profil akun berikutnya.
+- **Koreksi Identitas Akun pada Prompt Wrapper:**
+  - Memperbaiki `_build_wrapped_prompt` dan `_build_tool_result_prompt` pada `scrapers/qwen_scraper.py` agar field `"model"` menggunakan `self.account` (misal `"model": "account1"`), bukan fallback statis `"qwen"`.
+- **Pembersihan Dokumentasi Browser Pool:**
+  - Menyelaraskan seluruh docstring dan komentar di `browser_pool_qwen.py` agar secara eksplisit merujuk ke `profiles/qwen/<account>/`.
+
+---
+
 ## [Unreleased] — MAJOR: client API token (auth) for the VPS gateway
 
 > **Breaking change.** Every HTTP endpoint of `vps_server.py` now requires

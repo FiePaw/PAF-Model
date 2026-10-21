@@ -5,7 +5,7 @@ browser_pool_qwen.py – Pre-warmed Browser Pool untuk QwenScraper
 AUTH MODEL (identik dengan DeepSeek):
   • Semua account didefinisikan di cookies/authqwen.json
     Format: [{"name": "account1", "email": "...", "password": "..."}]
-  • Setiap account → persistent browser profile di profiles/<account>/
+  • Setiap account → persistent browser profile di profiles/qwen/<account>/
   • Saat warmup (start()), setiap slot:
       1. launch_browser(account) → buka persistent context
       2. ensure_authenticated():
@@ -95,7 +95,7 @@ class BrowserPool:
     ─────────────────────────────────
     • Semua account didefinisikan di satu file: cookies/authqwen.json
       Format: [{"name": "account1", "email": "...", "password": "..."}]
-    • Setiap account → persistent browser profile di profiles/<account>/
+    • Setiap account → persistent browser profile di profiles/qwen/<account>/
     • Saat warmup (start()), setiap slot:
         1. launch_browser(account) → buka persistent context
         2. ensure_authenticated() → cek apakah session valid
@@ -218,7 +218,7 @@ class BrowserPool:
 
         Flow identik dengan DeepSeek browser_pool_deepseek._init_slot:
           1. Buat QwenScraper dengan account name dari authqwen.json
-          2. launch_browser(account) → buka persistent context di profiles/<account>/
+          2. launch_browser(account) → buka persistent context di profiles/qwen/<account>/
           3. ensure_authenticated():
                - Profile baru     → navigasi ke /auth, isi form, login otomatis
                - Profile lama     → cek session masih valid, skip login jika OK

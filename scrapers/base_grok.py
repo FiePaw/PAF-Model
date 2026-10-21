@@ -382,7 +382,31 @@ class BaseAIChatScraper(ABC):
         real Chrome was started with — start_grok_chrome.py starts it
         visible by default).
         """
-        cdp_url = os.environ.get("GROK_CDP_URL", "").strip() or "http://127.0.0.1:9222"
+        # Resolve CDP port/URL for this specific account:
+        cdp_url = os.environ.get(f"GROK_CDP_URL_{account.upper()}", "").strip()
+        if not cdp_url:
+            port_env = os.environ.get(f"GROK_CDP_PORT_{account.upper()}", "").strip()
+            if port_env.isdigit():
+                cdp_url = f"http://127.0.0.1:{port_env}"
+
+        if not cdp_url:
+            pid_files = list((PROFILES_DIR / "grok").glob(f"{account}.chrome-*.pid"))
+            if pid_files:
+                try:
+                    port_str = pid_files[0].stem.split("-")[-1]
+                    if port_str.isdigit():
+                        cdp_url = f"http://127.0.0.1:{port_str}"
+                except Exception:
+                    pass
+
+        if not cdp_url:
+            global_cdp = os.environ.get("GROK_CDP_URL", "").strip()
+            if global_cdp and len(self._grok_accounts) <= 1:
+                cdp_url = global_cdp
+            else:
+                port = 9222 + self._account_index
+                cdp_url = f"http://127.0.0.1:{port}"
+
         self.logger.info(
             "Attaching to running Chrome via CDP (%s) for account '%s' — "
             "start it with: python start_grok_chrome.py --account %s",
@@ -397,7 +421,7 @@ class BaseAIChatScraper(ABC):
             raise RuntimeError(
                 f"Could not attach to Chrome at {cdp_url}: {exc}\n"
                 f"Start it first with:  python start_grok_chrome.py --account {account}\n"
-                f"(or set GROK_CDP_URL to the right host:port)"
+                f"(or set GROK_CDP_URL_{account.upper()} / GROK_CDP_PORT_{account.upper()})"
             ) from exc
 
         self._context = self._browser.contexts[0] if self._browser.contexts else await self._browser.new_context()
