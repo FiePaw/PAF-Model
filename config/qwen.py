@@ -17,17 +17,17 @@ QWEN_CONFIG = {
     "base_url": "https://chat.qwen.ai",
     "new_chat_url": "https://chat.qwen.ai",
     "selectors": {
-        "prompt_textarea": 'textarea[placeholder], div[contenteditable="true"], #chat-input',
-        "send_button": 'button[type="submit"], button[aria-label*="Send"], button[aria-label*="send"]',
-        "response_container": '.message-content, .chat-message, [class*="response"], [class*="message"]',
-        "loading_indicator": '[class*="loading"], [class*="spinner"], [class*="typing"]',
-        "stop_button": 'button[aria-label*="Stop"], button[title*="Stop"]',
-        "new_chat_button": 'button[aria-label*="New chat"], a[href*="new"], [class*="new-chat"]',
+        "prompt_textarea": 'textarea.message-input-textarea, textarea[placeholder], div[contenteditable="true"], #chat-input',
+        "send_button": 'button.send-button:not(.disabled), button[aria-label="Send"]:not([disabled]), button[type="submit"], button[aria-label*="Send"]',
+        "response_container": '.qwen-markdown, .qwen-markdown-loose, .chat-response-message, [class*="response-message"], [class*="response"], [class*="message"]',
+        "loading_indicator": '[class*="loading"], [class*="spinner"], [class*="typing"], [class*="thinking"]',
+        "stop_button": 'button.stop-btn, button[aria-label*="Stop"], button[title*="Stop"], button[aria-label*="stop" i]',
+        "new_chat_button": '[aria-label="New Chat"], div.sidebar-entry-fixed-list-content, button[aria-label*="New chat"], a[href*="new"], [class*="new-chat"]',
 
-        # Think mode dropdown
-        "think_mode_trigger": ".qwen-select-thinking-label",
-        "think_mode_selected": ".qwen-select-option-selected-label-container",
-        "think_mode_options": ".rc-virtual-list-holder-inner",
+        # Think mode dropdown (Qwen v2 UI + legacy fallbacks)
+        "think_mode_trigger": ".qwen-thinking-selector, .qwen-chat-v2-dropdown-menu-trigger, .qwen-select-thinking-label",
+        "think_mode_selected": ".qwen-chat-v2-dropdown-menu-select-label, .qwen-thinking-selector, .qwen-select-option-selected-label-container",
+        "think_mode_options": ".qwen-chat-v2-dropdown-menu li, .qwen-chat-v2-dropdown-menu-item, .rc-virtual-list-holder-inner",
 
         # ── Login / auth selectors (for email+password login) ─────────────
         # Selectors untuk mendeteksi tombol Login / Sign Up di halaman utama

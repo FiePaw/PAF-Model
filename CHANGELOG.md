@@ -5,6 +5,49 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — Qwen Backend: Diagnostik Prompt Page (I/O), Pembaruan Selector UI qwen-chat-v2, dan Optimasi Latency CONTINUE
+
+> **Pembaruan Backend Qwen.** NEW! Penambahan tool diagnostik mandiri untuk halaman percakapan prompt (`debug_prompt_qwen.py`) yang menguji alur I/O secara end-to-end pada **NEW mode** dan **CONTINUE mode**, identifikasi migrasi antarmuka Qwen Web ke sistem komponen `qwen-chat-v2`, pembaruan selector I/O, serta optimasi latensi respon mode CONTINUE yang memulihkan kecepatan respon dari ~8 detik kembali ke ~5 detik.
+
+### 1. Tool Diagnostik Mandiri Prompt Page (`debug_prompt_qwen.py`)
+- **Script Diagnostik Menyeluruh:** File baru [`debug_prompt_qwen.py`](./debug_prompt_qwen.py) untuk menguji, membedah, dan memvalidasi seluruh elemen DOM dan selector I/O pada halaman percakapan Qwen (`chat.qwen.ai`).
+  - Mendukung pengujian **NEW mode** (buka chat baru, fill prompt, send, tangkap turn 1) dan **CONTINUE mode** (kirim prompt ke-2 di thread yang sama, verifikasi stabilitas respon turn 2).
+  - Mode **No-Headless** (default) dan **Headless** (`--headless`).
+  - Opsi `--auto-login`: otomatis login jika sesi akun belum aktif sebelum memulai pengetesan prompt.
+  - Mode interaktif (`--interactive`) untuk inspeksi manual via DevTools (F12).
+  - Perekaman artefak: screenshot `.png` dan HTML dump `.html` di setiap tahap ke `debug/`.
+  - Generator summary otomatis ke `debug/summary_prompt/` ([`summary.md`](./debug/summary_prompt/summary.md) & [`summary.json`](./debug/summary_prompt/summary.json)).
+
+### 2. Pembaruan Selector DOM UI Qwen Web (`qwen-chat-v2`)
+- **Think Mode Dropdown (`qwen-chat-v2`):**
+  - Menggantikan selector usang `.qwen-select-thinking-label` dengan komponen generasi baru Qwen:
+    - Container/Trigger: `.qwen-thinking-selector`, `.qwen-chat-v2-dropdown-menu-trigger`
+    - Selected Label: `.qwen-chat-v2-dropdown-menu-select-label`
+    - Options: `.qwen-chat-v2-dropdown-menu li`, `.qwen-chat-v2-dropdown-menu-item`, `[role="option"]`
+  - Diperbarui pada [`config/qwen.py`](./config/qwen.py) dan [`scrapers/qwen_scraper.py`](./scrapers/qwen_scraper.py).
+- **Send Button & Status Disabled:**
+  - Menambahkan selector spesifik tombol kirim Qwen: `button.send-button:not(.disabled)` dan `button[aria-label="Send"]:not([disabled])`.
+- **Input Textarea:**
+  - Menambahkan class spesifik `textarea.message-input-textarea` sebagai prioritas pertama sebelum fallback `textarea[placeholder]`.
+- **Response Container & Markdown:**
+  - Memprioritaskan `.qwen-markdown` dan `.chat-response-message` pada strategi ekstraksi teks respon.
+- **Tombol New Chat:**
+  - Menyesuaikan selector tombol chat baru dengan elemen DOM terkini: `[aria-label="New Chat"]`, `div.sidebar-entry-fixed-list-content`.
+
+### 3. Optimasi Latency Respon Mode CONTINUE (Pemulihan dari ~8s ke ~5s)
+- **Eliminasi Pencarian Think-Mode di Mode CONTINUE:**
+  - UI Qwen Web menyembunyikan trigger think-mode pada halaman percakapan yang sedang berjalan (`/c/<id>`).
+  - Memperbaiki kondisi guard di `send_prompt()` ([`scrapers/qwen_scraper.py`](./scrapers/qwen_scraper.py)) agar hanya mengeksekusi `_set_think_mode()` pada mode `new` (`mode != "continue"` dan `not self._think_mode_applied`).
+- **Penghapusan Pemanggilan Diagnostik Otomatis di Jalur Produksi:**
+  - Menghapus pemanggilan otomatis `self.debug_think_mode_selectors()` saat trigger think-mode tidak ditemukan di `send_prompt()`. Ini mencegah eksekusi 2x full document `createTreeWalker` via Playwright CDP yang sebelumnya membuang 2.5–3.5 detik per pesan.
+  - Method `debug_think_mode_selectors()` tetap dipertahankan di class scraper dan dapat dipanggil secara manual saat dibutuhkan.
+- **Pencegahan Reset Flag `_think_mode_applied` pada Mode CONTINUE di Worker:**
+  - Pada [`public_qwen.py`](./public_qwen.py), flag `_think_mode_applied` kini hanya di-reset ke `False` jika `mode != "continue"`.
+- **Prioritaskan Selector Input Cepat di Worker Readiness Check:**
+  - Menambahkan `textarea.message-input-textarea` pada posisi teratas `_INPUT_SELECTORS` di [`public_qwen.py`](./public_qwen.py).
+
+---
+
 ## [Unreleased] — Qwen Backend: Diagnostik Login Otomatis, Pemetaan Selector Baru, dan Isolasi Profil Akun
 
 > **Pembaruan Backend Qwen.** Penambahan tool diagnostik auth mandiri (`debug_login_qwen.py`) dengan auto-summary generator, identifikasi perubahan alur login Qwen Web (v0.3.20), pemetaan selector baru, serta pengetatan isolasi persistent browser profile akun ke `profiles/qwen/<account>/`.

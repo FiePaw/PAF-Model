@@ -138,8 +138,10 @@ class QwenScraper(BaseAIChatScraper):
 
     BASE_URL: str = QWEN_CONFIG["base_url"]
 
-    _SEL_TEXTAREA = "textarea[placeholder], div[contenteditable='true']"
+    _SEL_TEXTAREA = "textarea.message-input-textarea, textarea[placeholder], div[contenteditable='true'], #chat-input"
     _SEL_SEND_BTN = (
+        "button.send-button:not(.disabled), "
+        "button[aria-label='Send']:not([disabled]), "
         "button[aria-label*='send' i], "
         "button[class*='send' i], "
         "button[data-testid*='send' i], "
@@ -147,8 +149,15 @@ class QwenScraper(BaseAIChatScraper):
         "button[class*='submit' i], "
         "button[type='submit']"
     )
-    _SEL_STOP_BTN = "button[aria-label*='stop' i], button[class*='stop' i]"
-    _SEL_THINKING = ".thinking-indicator, .loading-dots, [class*='thinking']"
+    _SEL_STOP_BTN = (
+        "button.stop-btn, "
+        "button[class*='stop' i], "
+        "button[aria-label*='stop' i], "
+        "button[title*='stop' i], "
+        "[class*='stop-btn'], "
+        "[class*='abort']"
+    )
+    _SEL_THINKING = ".thinking-indicator, .loading-dots, [class*='thinking'], [class*='typing'], [class*='streaming']"
 
     def __init__(
         self,
@@ -503,8 +512,11 @@ class QwenScraper(BaseAIChatScraper):
     async def _get_current_think_mode(self) -> str:
         """Read the currently active think mode label from the UI."""
         _CURRENT_MODE_CANDIDATES = [
-            _SELECTORS["think_mode_selected"],       # .qwen-select-option-selected-label-container
-            _SELECTORS["think_mode_trigger"],        # .qwen-select-thinking-label
+            ".qwen-chat-v2-dropdown-menu-select-label",
+            ".qwen-thinking-selector .qwen-chat-v2-dropdown-menu-select-label",
+            ".qwen-thinking-selector",
+            _SELECTORS["think_mode_selected"],
+            _SELECTORS["think_mode_trigger"],
             "[class*='thinking-label']",
             "[class*='think-mode-label']",
             "[class*='selected-label']",
@@ -584,15 +596,15 @@ class QwenScraper(BaseAIChatScraper):
 
         # ── Step 2: open the dropdown via multiple trigger candidates ─────────
         _TRIGGER_CANDIDATES = [
-            # Confirmed class names seen on chat.qwen.ai
+            # Qwen chat v2 thinking selector
+            ".qwen-thinking-selector",
+            ".qwen-chat-v2-dropdown-menu-trigger",
+            ".qwen-thinking-selector .qwen-chat-v2-dropdown-menu-trigger",
+            # Legacy class names
             ".qwen-select-thinking-label",
-            #"[class*='thinking-label']",
-            #"[class*='think-mode']",
-            #"[class*='qwen-select']",
-            # Generic fallbacks: buttons / divs near the textarea
-            #"button[class*='think']",
-            #"div[class*='think']",
-            # Any element whose visible text matches known mode labels
+            "[class*='thinking-label']",
+            "[class*='think-mode']",
+            "[class*='qwen-select']",
         ]
 
         trigger_clicked = False
@@ -636,24 +648,22 @@ class QwenScraper(BaseAIChatScraper):
 
         if not trigger_clicked:
             self.logger.warning("Could not locate think-mode trigger – skipping mode set")
+            self._think_mode_applied = True
             return False
 
         await asyncio.sleep(0.5)  # allow dropdown animation to complete
 
         # ── Step 3 & 4: find and click the target option ──────────────────────
         _OPTION_SELECTORS = [
+            # Qwen chat v2 dropdown menu options
+            ".qwen-chat-v2-dropdown-menu li",
+            ".qwen-chat-v2-dropdown-menu-item",
+            ".qwen-chat-v2-dropdown-menu [role='option']",
             # rc-select virtual list (Ant Design)
             ".rc-virtual-list-holder-inner > *",
             ".rc-virtual-list-holder-inner li",
-            # Ant Design Select options
-            #".ant-select-item",
-            #".ant-select-item-option",
-            # Generic dropdown patterns
-            #"[class*='option-item']",
-            #"[class*='select-option']",
-            #"[class*='dropdown-item']",
-            #"[role='option']",
-            #"[role='menuitem']",
+            "[role='option']",
+            "[role='menuitem']",
         ]
 
         clicked = False
@@ -738,6 +748,7 @@ class QwenScraper(BaseAIChatScraper):
 
     async def _find_input(self):
         candidates = [
+            "textarea.message-input-textarea",
             "textarea[placeholder]",
             "textarea#chat-input",
             "textarea[data-testid='chat-input']",
@@ -956,16 +967,6 @@ class QwenScraper(BaseAIChatScraper):
         () => {
             const strategies = [
                 () => {
-                    const containers = document.querySelectorAll(
-                        '.chat-message-container .chat-response-message'
-                    );
-                    if (!containers.length) return null;
-                    const last = containers[containers.length - 1];
-                    const md = last.querySelector('.qwen-markdown-loose, .qwen-markdown');
-                    const t = ((md || last).innerText || '').trim();
-                    return t.length ? t : null;
-                },
-                () => {
                     const els = document.querySelectorAll('.qwen-markdown-loose, .qwen-markdown');
                     if (!els.length) return null;
                     const t = (els[els.length - 1].innerText || '').trim();
@@ -974,7 +975,18 @@ class QwenScraper(BaseAIChatScraper):
                 () => {
                     const els = document.querySelectorAll('.chat-response-message');
                     if (!els.length) return null;
-                    const t = (els[els.length - 1].innerText || '').trim();
+                    const md = els[els.length - 1].querySelector('.qwen-markdown-loose, .qwen-markdown');
+                    const t = ((md || els[els.length - 1]).innerText || '').trim();
+                    return t.length ? t : null;
+                },
+                () => {
+                    const containers = document.querySelectorAll(
+                        '.chat-message-container .chat-response-message'
+                    );
+                    if (!containers.length) return null;
+                    const last = containers[containers.length - 1];
+                    const md = last.querySelector('.qwen-markdown-loose, .qwen-markdown');
+                    const t = ((md || last).innerText || '').trim();
                     return t.length ? t : null;
                 },
                 () => {
@@ -2119,13 +2131,11 @@ class QwenScraper(BaseAIChatScraper):
 
         effective_think = think_mode or self._think_mode
 
-        # Apply think mode whenever: new page loaded, explicit per-call override,
-        # or not yet applied in this session.
-        if not self._think_mode_applied or think_mode is not None:
-            success = await self._set_think_mode(effective_think)
-            if not success:
-                # Run diagnostic scan so the user can identify correct selectors
-                await self.debug_think_mode_selectors()
+        # Apply think mode only in new chats (landing page) before first send.
+        # In continue mode, the conversation page does not expose the think mode trigger,
+        # so attempting to search for it wastes ~2.5-3.5 seconds per request.
+        if mode != "continue" and not self._think_mode_applied:
+            await self._set_think_mode(effective_think)
 
         # ── Upload attachments SEBELUM mengisi prompt ─────────────────────────
         # Urutan ini penting: Qwen membutuhkan file terupload lebih dulu

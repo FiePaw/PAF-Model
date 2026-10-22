@@ -274,6 +274,7 @@ _STOP_BTN_SELECTORS = [
 
 # Selector input field — sama dengan kandidat di QwenScraper._find_input()
 _INPUT_SELECTORS = [
+    "textarea.message-input-textarea",
     "textarea[placeholder]",
     "textarea#chat-input",
     "textarea[data-testid='chat-input']",
@@ -539,7 +540,8 @@ class TaskProcessor:
                     # Override think_mode per-request jika dikirim dari VPS
                     if think_mode:
                         scraper._think_mode = think_mode
-                        scraper._think_mode_applied = False
+                        if mode != "continue":
+                            scraper._think_mode_applied = False
 
                     # Teruskan max_tokens per-request
                     scraper._max_tokens = max_tokens
