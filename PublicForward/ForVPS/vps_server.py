@@ -65,13 +65,18 @@ import paf_auth
 # =========================================================================== #
 # AUTH_TOKEN (env PAF_TOKEN) only gates WORKER WebSocket connections.
 AUTH_TOKEN = os.environ.get("PAF_TOKEN", "change-me")
-# API_TOKEN is the single shared token every HTTP CLIENT must present as
-# `Authorization: Bearer <token>`. Resolved from env PAF_API_TOKEN or the
-# token file (manage_token.py); main() lets --api-token override it.
-# Empty means "not configured" -> every HTTP request is rejected (fail closed).
-API_TOKEN, _API_TOKEN_SOURCE, API_TOKEN_EXPIRES_AT = paf_auth.load_token_full()
-# API_TOKEN_EXPIRES_AT: epoch seconds, or None = never expires. Only a token
-# kept in the token file can expire (CLI flag / env tokens never do).
+# Multi-token registry: EVERY HTTP endpoint requires Authorization: Bearer <token>.
+# Stored in memory as dict[token_str, TokenInfo].
+API_TOKENS: dict[str, paf_auth.TokenInfo] = {}
+
+
+def _reload_api_tokens(cli_arg: Optional[str] = None) -> None:
+    """Reload all tokens from file, env (PAF_API_TOKEN), and CLI flag."""
+    global API_TOKENS
+    API_TOKENS = paf_auth.load_all_tokens(cli_arg)
+
+
+_reload_api_tokens()
 REQUEST_TIMEOUT = float(os.environ.get("PAF_REQUEST_TIMEOUT", "330"))
 WORKER_WAIT_TIMEOUT = float(os.environ.get("WORKER_WAIT_TIMEOUT", "60"))
 
@@ -552,10 +557,10 @@ worker_mgr = WorkerManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not API_TOKEN:
+    if not API_TOKENS:
         print(
             "[vps] WARNING: no API token configured -- every HTTP request will "
-            "be rejected with 503. Run `python manage_token.py generate`."
+            "be rejected with 503. Use console: 'token create <name>'."
         )
     yield
 
@@ -568,10 +573,10 @@ app = FastAPI(
 )
 
 # --------------------------------------------------------------------------- #
-# Client API token (Feature 14)
+# Client API token (Feature 14 — Multi-token support)
 # --------------------------------------------------------------------------- #
 class ApiTokenMiddleware:
-    """Require `Authorization: Bearer <API_TOKEN>` on EVERY HTTP request.
+    """Require `Authorization: Bearer <token>` on EVERY HTTP request.
 
     Pure ASGI middleware, so it runs before routing/body parsing: unknown paths,
     /docs and /openapi.json are protected too, and unauthenticated callers
@@ -599,7 +604,7 @@ class ApiTokenMiddleware:
         client = scope.get("client")
         print(
             f"[vps] auth rejected ({status}): {scope.get('method')} "
-            f"{scope.get('path')} from {client[0] if client else 'unknown'}"
+            f"{scope.get('path')} from {client[0] if client else 'unknown'}: {detail}"
         )
         headers = {"WWW-Authenticate": "Bearer"} if status == 401 else {}
         response = JSONResponse(
@@ -610,17 +615,22 @@ class ApiTokenMiddleware:
     @staticmethod
     def _check(scope: Scope) -> Optional[tuple[int, str]]:
         """Return None if authorised, else (status_code, detail)."""
-        if not API_TOKEN:
+        if not API_TOKENS:
             return 503, "API token is not configured on the server."
         header = Headers(scope=scope).get("authorization")
         if not header:
             return 401, "Missing API token. Send 'Authorization: Bearer <token>'."
         provided = paf_auth.extract_bearer(header)
-        if provided is None or not paf_auth.tokens_match(provided, API_TOKEN):
+        if provided is None:
+            return 401, "Invalid Authorization header format. Expected 'Bearer <token>'."
+
+        matched = paf_auth.find_matching_token(provided, API_TOKENS)
+        if matched is None:
             return 401, "Invalid API token."
-        if paf_auth.is_expired(API_TOKEN_EXPIRES_AT):
-            # Only someone holding the (now expired) valid token sees this message.
-            return 401, "API token has expired. Ask the operator for a new token."
+        if matched.is_expired():
+            return 401, f"API token '{matched.name}' has expired. Ask the operator for a new token."
+
+        scope.setdefault("state", {})["client_name"] = matched.name
         return None
 
 
@@ -966,8 +976,10 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
         if tool_calls:
             choice["message"]["tool_calls"] = tool_calls
 
+        client_name = request.scope.get("state", {}).get("client_name")
         x_meta = {
             "session_id": session_id,
+            "client_name": client_name,
             "backend": backend,               # ← model routing surfaced to client
             "mode": actual_mode,
             "mode_fallback": mode_fallback,
@@ -1022,58 +1034,36 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
 # Main
 # =========================================================================== #
 # --------------------------------------------------------------------------- #
-# Live admin console (Feature 15) — manage the API token while the server runs
+# Live admin console (Feature 15) — manage API tokens while the server runs
 # --------------------------------------------------------------------------- #
 CONSOLE_HELP = """\
 Console commands (type them in THIS terminal; effective immediately, no restart):
-  token generate [expiry]       create a random API token (only if none is active)
-  token rotate [expiry]         replace the token with a new random one
-  token set <value> [expiry]    use your own token (min 16 chars)
-  token expire <expiry|never>   change the expiry of the CURRENT token
-  token show                    show token status and expiry (masked)
-  token reveal                  print the full token
-  token revoke                  delete the token (every request gets 503 until a new one is set)
-  help                          show this help
+  token create <name> [expiry]         generate a new API token with label <name>
+  token list                           list all API tokens, labels, and expiry
+  token reveal <name>                  print the full token for <name>
+  token revoke <name>                  delete/revoke token <name>
+  token expire <name> <expiry|never>   change the expiry of token <name>
+  token set <name> <value> [expiry]    add a custom token with label <name>
+  token rotate <name> [expiry]         rotate/replace token for <name> with a new one
+  help                                 show this help
 <expiry> = number + unit s/m/h/d/w (e.g. 30m, 12h, 7d, 2w) or 'never' (the default).
-An expired token is rejected automatically (401). Changes are saved to the token
-file, so they survive a restart."""
+An expired token is rejected automatically (401). Changes take effect immediately."""
 
 
-def _set_api_token(token: str, source: str = "console",
-                   expires_at: Optional[float] = None) -> None:
-    """Apply a new API token (+ expiry) to the RUNNING server (read per request)."""
-    global API_TOKEN, _API_TOKEN_SOURCE, API_TOKEN_EXPIRES_AT
-    API_TOKEN, _API_TOKEN_SOURCE, API_TOKEN_EXPIRES_AT = token, source, expires_at
-
-
-def _token_is_active() -> bool:
-    return bool(API_TOKEN) and not paf_auth.is_expired(API_TOKEN_EXPIRES_AT)
-
-
-def _env_override_note() -> str:
-    if os.environ.get(paf_auth.ENV_VAR, "").strip():
-        return (f"\nNOTE: env {paf_auth.ENV_VAR} is set and will override the saved "
-                "token (and its expiry) after a restart.")
-    return ""
-
-
-def _console_install(token: str, headline: str, expiry_text: Optional[str] = None) -> str:
-    try:
-        expires_at = paf_auth.expiry_from_arg(expiry_text)
-    except ValueError as exc:
-        return str(exc)
-    err = paf_auth.validate_token_format(token)
-    if err:
-        return f"Invalid token: {err}"
-    try:
-        path = paf_auth.save_token(token, expires_at)
-    except OSError as exc:
-        return f"Could not save the token file ({exc}); nothing was changed."
-    _set_api_token(token, "console", expires_at)
-    return (f"{headline}\n\n  {token}\n\n"
-            f"Token {paf_auth.describe_expiry(expires_at)}. Active NOW "
-            f"(saved to {path}). Clients send: Authorization: Bearer <token>"
-            + _env_override_note())
+def _format_tokens_table() -> str:
+    if not API_TOKENS:
+        return ("No API tokens configured: every request gets 503.\n"
+                "Type: token create <name> [expiry]")
+    lines = [
+        f"{'NAME':<16} {'SOURCE':<8} {'STATUS':<10} {'EXPIRES AT':<28} {'TOKEN (MASKED)'}",
+        "-" * 80,
+    ]
+    for tok, info in API_TOKENS.items():
+        status = "EXPIRED" if info.is_expired() else "active"
+        exp = info.describe()
+        masked = paf_auth.mask_token(tok)
+        lines.append(f"{info.name:<16} {info.source:<8} {status:<10} {exp:<28} {masked}")
+    return "\n".join(lines)
 
 
 def handle_console_command(line: str) -> str:
@@ -1087,64 +1077,137 @@ def handle_console_command(line: str) -> str:
     if cmd != "token":
         return f"Unknown command '{parts[0]}'. Type 'help'."
 
-    sub = parts[1].lower() if len(parts) > 1 else "show"
+    sub = parts[1].lower() if len(parts) > 1 else "list"
     args = parts[2:]
 
-    if sub in ("show", "reveal"):
-        if not API_TOKEN:
-            return ("No API token configured: every request gets 503.\n"
-                    "Type: token generate [expiry]")
-        shown = API_TOKEN if sub == "reveal" else paf_auth.mask_token(API_TOKEN)
-        return (f"API token ({_API_TOKEN_SOURCE}): {shown}\n"
-                f"Status: {paf_auth.describe_expiry(API_TOKEN_EXPIRES_AT)}")
+    if sub in ("list", "show"):
+        if not args or sub == "list":
+            return _format_tokens_table()
+        target_name = args[0]
+        info = paf_auth.find_token_by_name(target_name, API_TOKENS)
+        if not info:
+            return f"Token '{target_name}' not found. Type 'token list'."
+        return (f"Name   : {info.name}\n"
+                f"Source : {info.source}\n"
+                f"Token  : {paf_auth.mask_token(info.token)}\n"
+                f"Status : {info.describe()}")
 
-    if sub in ("generate", "rotate"):
-        if len(args) > 1:
-            return f"Usage: token {sub} [expiry]   (expiry: {paf_auth.EXPIRY_HELP})"
-        if sub == "generate" and _token_is_active():
-            return ("A token already exists. Use 'token rotate' to replace it "
-                    "(everyone using the old token is cut off immediately).")
-        headline = ("New API token created." if sub == "generate" else
-                    "API token rotated. The OLD token no longer works.")
-        return _console_install(paf_auth.generate_token(), headline,
-                                args[0] if args else None)
+    if sub == "reveal":
+        if not args:
+            if len(API_TOKENS) == 1:
+                target_name = next(iter(API_TOKENS.values())).name
+            else:
+                return "Usage: token reveal <name>"
+        else:
+            target_name = args[0]
+        info = paf_auth.find_token_by_name(target_name, API_TOKENS)
+        if not info:
+            return f"Token '{target_name}' not found. Type 'token list'."
+        return (f"Token for '{info.name}':\n\n  {info.token}\n\n"
+                f"Status: {info.describe()}\n"
+                f"Clients send: Authorization: Bearer {info.token}")
+
+    if sub in ("create", "generate"):
+        if not args:
+            if sub == "generate" and "default" not in [t.name for t in API_TOKENS.values()]:
+                name = "default"
+                expiry_text = None
+            else:
+                return f"Usage: token {sub} <name> [expiry]   (expiry: {paf_auth.EXPIRY_HELP})"
+        else:
+            name = args[0]
+            expiry_text = args[1] if len(args) > 1 else None
+
+        try:
+            info, path = paf_auth.create_token(name, expiry_text)
+            _reload_api_tokens()
+            return (f"New API token created for '{info.name}':\n\n  {info.token}\n\n"
+                    f"Token {info.describe()}. Active NOW (saved to {path}).\n"
+                    f"Clients send: Authorization: Bearer {info.token}")
+        except Exception as exc:
+            return f"Error creating token: {exc}"
+
+    if sub == "rotate":
+        if not args:
+            if len(API_TOKENS) == 1:
+                name = next(iter(API_TOKENS.values())).name
+                expiry_text = None
+            else:
+                return "Usage: token rotate <name> [expiry]"
+        else:
+            name = args[0]
+            expiry_text = args[1] if len(args) > 1 else None
+
+        existing = paf_auth.find_token_by_name(name, API_TOKENS)
+        if not existing:
+            return f"Token '{name}' not found. Type 'token list'."
+        if existing.source != "file":
+            return f"Cannot rotate token '{name}' because its source is '{existing.source}'."
+
+        try:
+            paf_auth.revoke_token(name)
+            info, path = paf_auth.create_token(name, expiry_text)
+            _reload_api_tokens()
+            return (f"Token for '{name}' rotated. The OLD token no longer works.\n\n"
+                    f"  {info.token}\n\n"
+                    f"Token {info.describe()}. Active NOW.")
+        except Exception as exc:
+            return f"Error rotating token: {exc}"
 
     if sub == "set":
-        if len(args) not in (1, 2):
-            return "Usage: token set <value> [expiry]"
-        return _console_install(args[0], "API token set.", args[1] if len(args) == 2 else None)
+        if len(args) not in (2, 3):
+            return "Usage: token set <name> <value> [expiry]"
+        name, val = args[0], args[1]
+        expiry_text = args[2] if len(args) == 3 else None
+        try:
+            info, path = paf_auth.create_token(name, expiry_text, token_value=val)
+            _reload_api_tokens()
+            return (f"API token set for '{info.name}'.\n"
+                    f"Token {info.describe()}. Active NOW.")
+        except Exception as exc:
+            return f"Error setting token: {exc}"
 
     if sub == "expire":
-        if len(args) != 1:
-            return f"Usage: token expire <expiry|never>   (expiry: {paf_auth.EXPIRY_HELP})"
-        if not API_TOKEN:
-            return "No API token to change. Type: token generate [expiry]"
-        if _API_TOKEN_SOURCE in ("env", "cli"):
-            return (f"The current token comes from the {_API_TOKEN_SOURCE} and cannot "
-                    "have an expiry. Use 'token rotate [expiry]' to replace it with a "
-                    "managed token.")
+        if len(args) != 2:
+            return f"Usage: token expire <name> <expiry|never>   (expiry: {paf_auth.EXPIRY_HELP})"
+        name, exp = args[0], args[1]
+        existing = paf_auth.find_token_by_name(name, API_TOKENS)
+        if not existing:
+            return f"Token '{name}' not found. Type 'token list'."
+        if existing.source != "file":
+            return f"Cannot modify expiry for '{name}' because its source is '{existing.source}'."
         try:
-            expires_at = paf_auth.expiry_from_arg(args[0])
-        except ValueError as exc:
-            return str(exc)
-        try:
-            paf_auth.save_token(API_TOKEN, expires_at)
-        except OSError as exc:
-            return f"Could not save the token file ({exc}); nothing was changed."
-        _set_api_token(API_TOKEN, "console", expires_at)
-        return f"Expiry updated: token {paf_auth.describe_expiry(expires_at)}."
+            updated = paf_auth.update_token_expiry(name, exp)
+            _reload_api_tokens()
+            return f"Expiry updated: token '{name}' {updated.describe()}."
+        except Exception as exc:
+            return f"Error updating expiry: {exc}"
 
     if sub == "revoke":
-        paf_auth.delete_token_file()
-        _set_api_token("")
-        return ("API token revoked. Every request now gets 503 until you run "
-                "'token generate' or 'token set <value>'." + _env_override_note())
+        if not args:
+            if len(API_TOKENS) == 1:
+                name = next(iter(API_TOKENS.values())).name
+            else:
+                return "Usage: token revoke <name>"
+        else:
+            name = args[0]
+
+        existing = paf_auth.find_token_by_name(name, API_TOKENS)
+        if not existing:
+            return f"Token '{name}' not found. Type 'token list'."
+        if existing.source != "file":
+            return f"Cannot revoke token '{name}' because its source is '{existing.source}'."
+
+        removed = paf_auth.revoke_token(name)
+        _reload_api_tokens()
+        return (f"Token '{name}' revoked. Clients using this token are now rejected (401).\n"
+                f"Remaining tokens: {len(API_TOKENS)}")
 
     return f"Unknown token command '{sub}'. Type 'help'."
 
 
 def _console_loop() -> None:
-    print("[console] Ready. Type 'help' for commands, e.g. 'token generate'.", flush=True)
+    print("[console] Ready. Type 'help' for commands, e.g. 'token list' or 'token create <name>'.", flush=True)
     while True:
         try:
             line = sys.stdin.readline()
@@ -1217,8 +1280,7 @@ def main():
         global AUTH_TOKEN
         AUTH_TOKEN = args.token
 
-    token, source, expires_at = paf_auth.load_token_full(args.api_token)
-    _set_api_token(token, source, expires_at)
+    _reload_api_tokens(args.api_token)
 
     # The live console needs an interactive terminal (not nohup/systemd/docker -d).
     console_enabled = (
@@ -1227,38 +1289,33 @@ def main():
         and sys.stdin.isatty()
     )
 
-    if not API_TOKEN:
+    if not API_TOKENS:
         if console_enabled:
             # Start anyway (fail closed: every request gets 503) so the operator
             # can create the token right here, in this console.
             print(
-                "[vps] No client API token yet -> every HTTP request is rejected "
+                "[vps] No client API token configured yet -> every HTTP request is rejected "
                 "(503) until you create one.\n"
-                "[vps]   Type  token generate  in this console.",
+                "[vps]   Type  token create <name> [expiry]  in this console.",
                 flush=True,
             )
         else:
             print(
                 "[vps] ERROR: no client API token configured and no interactive "
                 "console available; refusing to start.\n"
-                "[vps]   Create one with:  python vps_server.py --generate-token\n"
+                "[vps]   Create one with:  python manage_token.py create <name>\n"
                 "[vps]   (or set PAF_API_TOKEN / pass --api-token)",
                 file=sys.stderr,
             )
             sys.exit(2)  # exit code 2 = config error (start.sh does not retry it)
     else:
-        err = paf_auth.validate_token_format(API_TOKEN)
-        if err:
-            print(f"[vps] ERROR: invalid API token ({_API_TOKEN_SOURCE}): {err}", file=sys.stderr)
-            sys.exit(2)
+        active_count = sum(1 for t in API_TOKENS.values() if not t.is_expired())
+        print(f"[vps] Loaded {len(API_TOKENS)} API token(s) ({active_count} active):")
+        for t in API_TOKENS.values():
+            print(f"  - [{t.name}] ({t.source}): {paf_auth.mask_token(t.token)}, {t.describe()}")
 
     print(f"[vps] Starting Enhanced VPS Bridge on {args.host}:{args.port}")
     print(f"[vps] Worker token: {AUTH_TOKEN[:8]}***")
-    print(f"[vps] API token: {paf_auth.mask_token(API_TOKEN)} (from {_API_TOKEN_SOURCE}), "
-          f"{paf_auth.describe_expiry(API_TOKEN_EXPIRES_AT)}")
-    if API_TOKEN and paf_auth.is_expired(API_TOKEN_EXPIRES_AT):
-        print("[vps] WARNING: the API token has EXPIRED -> clients get 401 until you "
-              "create a new one (console: token rotate [expiry]).", flush=True)
 
     if console_enabled:
         _start_console()

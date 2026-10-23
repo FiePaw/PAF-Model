@@ -4,6 +4,8 @@ cookies/*
 cookies/*.localstorage.json
 !cookies/*.example
 .env
+.api_token*
+PublicForward/ForVPS/.api_token*
 
 # Persistent browser profiles hold live sessions — never commit
 profiles/
