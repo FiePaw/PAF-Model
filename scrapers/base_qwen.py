@@ -986,6 +986,28 @@ class BaseAIChatScraper(ABC):
                     self.logger.error("Tidak bisa restart browser – menghentikan scrape")
                     break
 
+                # ── Cek status login / autentikasi sebelum mengirim prompt ─────────
+                if await self.is_session_expired():
+                    self.logger.warning(
+                        "⚠️  Sesi akun '%s' terdeteksi belum login / expired sebelum attempt %d – "
+                        "mencoba re-autentikasi …",
+                        account_name, attempt,
+                    )
+                    reauthed = False
+                    if hasattr(self, "ensure_authenticated"):
+                        reauthed = await self.ensure_authenticated()
+                    if not reauthed:
+                        self.logger.warning(
+                            "Autentikasi gagal untuk '%s' – merotasi ke akun berikutnya", account_name
+                        )
+                        previous_account_err = f"auth_failed on {account_name}"
+                        if not await self._rotate_account():
+                            break
+                        browser_restart_count = 0
+                        retries_on_this_acc = 0
+                        await asyncio.sleep(ROTATE_DELAY_S)
+                        continue
+
                 # Gabungkan kwargs dari subclass (misal think_mode) + attachments
                 extra = self._extra_send_kwargs()
                 if attachments:
@@ -1260,6 +1282,25 @@ class BaseAIChatScraper(ABC):
                         if restarted:
                             attempt -= 1
                             continue
+                elif await self.is_session_expired():
+                    self.logger.warning(
+                        "⚠️  Timeout attempt %d disebabkan oleh sesi expired / unauthenticated – "
+                        "mencoba re-autentikasi / rotasi …",
+                        attempt,
+                    )
+                    reauthed = False
+                    if hasattr(self, "ensure_authenticated"):
+                        reauthed = await self.ensure_authenticated()
+                    if reauthed:
+                        self.logger.info("Re-autentikasi berhasil – mengulang attempt %d", attempt)
+                        attempt -= 1
+                        continue
+                    self.logger.warning("Re-autentikasi gagal – rotasi ke akun berikutnya")
+                    previous_account_err = f"session_expired_timeout on {account_name}"
+                    if not await self._rotate_account():
+                        break
+                    browser_restart_count = 0
+                    retries_on_this_acc = 0
                 else:
                     retry_sleep(ROTATION_CONFIG["retry_delay"])
 

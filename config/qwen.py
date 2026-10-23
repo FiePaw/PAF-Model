@@ -46,22 +46,30 @@ QWEN_CONFIG = {
         ],
         # Form login di https://chat.qwen.ai/auth
         "login": {
-            "email_input":    [
-                'input[type="email"]',
+            "switch_password_button": [
+                'button:has-text("Log in with a password")',
+                'button:has-text("password")',
+                ':has-text("Log in with a password")',
+            ],
+            "email_input": [
+                'input[name="email"]',
                 'input[placeholder*="Email" i]',
-                'input[placeholder*="email" i]',
+                'input[type="email"]',
+                'input[type="text"]',
             ],
             "password_input": [
                 'input[type="password"]',
+                'input[name="password"]',
                 'input[placeholder*="Password" i]',
                 'input[placeholder*="password" i]',
             ],
-            "signin_button":  [
+            "signin_button": [
+                'button.qwenchat-auth-pc-submit-button',
+                'button:has-text("Log in")',
                 'button:has-text("Sign in")',
                 'button[type="submit"]',
-                'button:has-text("Log in")',
             ],
-            "error_message":  [
+            "error_message": [
                 '[class*="error"]:visible',
                 '[class*="alert"]:visible',
                 'p[class*="error"]',
@@ -111,14 +119,24 @@ QWEN_AUTH_CONFIG: dict = {
     # Deteksi "sudah di halaman login" — URL path mengandung salah satu string ini.
     "login_url_patterns": ["/auth", "/login", "/signin", "/sign_in"],
 
-    # Deteksi tombol Login/Sign Up di halaman utama (session expired / belum login).
-    # Jika salah satu selector ini ada di DOM → user belum login.
+    # Deteksi tombol Login/Sign Up di header utama (session expired / belum login).
+    # Terkunci ke header kanan (#qwen-chat-header-right) agar tidak memicu false-positive
+    # jika ada teks "Log in" di dalam pesan chat atau contoh kode.
     "unauthenticated_selectors": [
-        'button:has-text("Log in")',
-        'button:has-text("Login")',
-        'a:has-text("Log in")',
-        'button:has-text("Sign up")',
-        'button:has-text("Sign Up")',
+        "#qwen-chat-header-right .auth-buttons",
+        "#qwen-chat-header-right .header-right-auth-button",
+        ".auth-buttons",
+        ".header-right-auth-button",
+        '#qwen-chat-header-right button:has-text("Log in")',
+        '#qwen-chat-header-right button:has-text("Sign up")',
+    ],
+
+    # Sinyal positif bahwa akun SUDAH LOGIN (hanya ada pada akun terautentikasi)
+    "authenticated_selectors": [
+        ".temporary-chat-entry",
+        ".sidebar-wrapper",
+        ".sidebar-entry-fixed-list-content",
+        '[data-identity="sidebar"]',
     ],
 
     # Seconds to wait for post-login redirect to the chat UI.

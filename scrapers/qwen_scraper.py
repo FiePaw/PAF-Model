@@ -236,6 +236,15 @@ class QwenScraper(BaseAIChatScraper):
     async def _ensure_page_ready(self, mode: str) -> None:
         if mode == "new" or not self._conversation_started:
             await self._goto_new_chat()
+            # Cek apakah setelah landing page dimuat, sesi terdeteksi unauthenticated (Guest)
+            if await self._is_unauthenticated():
+                # Beri jeda singkat (400ms) untuk mengeliminasi race-condition hidrasi React SPA
+                await asyncio.sleep(0.4)
+                if await self._is_unauthenticated():
+                    self.logger.warning(
+                        "Landing page terkonfirmasi unauthenticated (Guest) – memastikan autentikasi …"
+                    )
+                    await self.ensure_authenticated()
         else:
             self.logger.debug("Continuing existing conversation")
             # Pada mode continue, think-mode trigger tidak selalu tersedia
@@ -251,32 +260,113 @@ class QwenScraper(BaseAIChatScraper):
     # ── Authentication (email + password, mirip DeepSeek) ────────────────────
 
     async def _is_unauthenticated(self) -> bool:
-        """Return True jika halaman menampilkan tombol Login atau Sign Up.
+        """Return True jika dan HANYA jika halaman terbukti dalam mode Guest / belum login.
 
-        Ini menandakan session belum ada atau sudah expired. Dua cara deteksi:
-          1. URL mengandung pola login (e.g. /auth, /login)
-          2. Tombol "Log in" / "Sign up" ada di DOM
+        Menggunakan evaluasi ganda (Positive & Negative Guard):
+          1. URL check: jika mengarah ke /auth, /login, /signin -> True
+          2. Modal check: jika dialog modal [role="dialog"] / .ant-modal verifikasi umur muncul -> True
+          3. Positive indicators:
+             Jika elemen khas akun terautentikasi ada (seperti .temporary-chat-entry,
+             .sidebar-wrapper, atau .sidebar-entry-fixed-list-content) DAN
+             header auth button TIDAK ada -> False (pasti sudah login!)
+          4. Negative indicators terkunci ke header:
+             Hanya periksa tombol login di #qwen-chat-header-right .auth-buttons
+             (tidak mencari teks di seluruh body/chat content agar tidak memicu false positive).
         """
         if self._page is None:
             return True
         try:
             url = self._page.url or ""
-            # Cek URL patterns
+            # 1. URL pattern check
             for pat in QWEN_AUTH_CONFIG["login_url_patterns"]:
                 if pat in url.lower():
                     return True
-            # Cek keberadaan tombol Login/Sign Up di DOM (screenshot menunjukkan
-            # tombol "Log in" di kanan atas dan "Sign up" di samping kanannya)
-            for sel in QWEN_AUTH_CONFIG["unauthenticated_selectors"]:
-                try:
-                    el = await self._page.query_selector(sel)
-                    if el and await el.is_visible():
-                        return True
-                except Exception:
-                    continue
-            return False
+
+            # 2. Evaluasi DOM terarah (Positive vs Negative Guard)
+            res = await self._page.evaluate("""
+            () => {
+                // (a) Cek modal verifikasi umur HANYA di dalam container dialog/modal
+                const modal = document.querySelector('[role="dialog"], .ant-modal, .qwen-chat-v2-modal, [class*="modal"]');
+                if (modal && modal.offsetParent !== null) {
+                    const modalText = (modal.innerText || '').trim();
+                    if (modalText.includes('Confirm your age to continue') || modalText.includes('What year were you born?')) {
+                        return { unauth: true, reason: 'age_modal' };
+                    }
+                }
+
+                // (b) Sinyal Positif (hanya ada saat akun SUDAH LOGIN):
+                // - Tombol temporary chat di header kanan (.temporary-chat-entry)
+                // - Sidebar riwayat percakapan (.sidebar-wrapper, .sidebar-entry-fixed-list-content, [data-identity="sidebar"])
+                const hasTempChat = !!document.querySelector('.temporary-chat-entry');
+                const sidebarEl = document.querySelector('.sidebar-wrapper, [data-identity="sidebar"], .sidebar-entry-fixed-list-content');
+                const hasSidebar = sidebarEl && (sidebarEl.offsetParent !== null || sidebarEl.clientWidth > 0 || sidebarEl.children.length > 0);
+                const isPositiveLoggedIn = Boolean(hasTempChat || hasSidebar);
+
+                // (c) Sinyal Negatif Terkunci ke Header Kanan:
+                // Tombol login/signup resmi Qwen selalu berada di dalam header kanan (#qwen-chat-header-right .auth-buttons)
+                const authHeader = document.querySelector('#qwen-chat-header-right .auth-buttons, #qwen-chat-header-right .header-right-auth-button, .auth-buttons');
+                const hasVisibleHeaderAuth = Boolean(authHeader && authHeader.offsetParent !== null);
+
+                // Jika sinyal positif terdeteksi dan tidak ada tombol auth di header -> PASTI LOGIN (False)
+                if (isPositiveLoggedIn && !hasVisibleHeaderAuth) {
+                    return { unauth: false, reason: 'positive_authenticated' };
+                }
+
+                // Jika tombol auth di header visible dan tidak ada sinyal positif -> PASTI GUEST (True)
+                if (hasVisibleHeaderAuth && !isPositiveLoggedIn) {
+                    return { unauth: true, reason: 'header_auth_visible' };
+                }
+
+                // Jika ada tombol auth di header visible meskipun sidebar ada (transisi logout)
+                if (hasVisibleHeaderAuth) {
+                    return { unauth: true, reason: 'header_auth_priority' };
+                }
+
+                // Default jika tidak ada tombol auth di header -> diasumsikan aman / sudah login
+                return { unauth: false, reason: 'default_safe' };
+            }
+            """)
+            return bool(res.get("unauth", False))
         except Exception:
             return False
+
+    async def _dismiss_age_confirmation_modal(self) -> bool:
+        """
+        Jika modal 'Confirm your age to continue' muncul, klik 'Continue'
+        atau tutup modal agar tidak memblokir antarmuka chat.
+        """
+        if self._page is None:
+            return False
+        try:
+            dismissed = await self._page.evaluate("""
+            () => {
+                const bodyText = (document.body ? document.body.innerText : '') || '';
+                if (!bodyText.includes('Confirm your age to continue') && !bodyText.includes('What year were you born?')) {
+                    return false;
+                }
+                const buttons = document.querySelectorAll('button, div[role="button"]');
+                for (const b of buttons) {
+                    const t = (b.innerText || '').trim();
+                    if (t === 'Continue' && b.offsetParent !== null) {
+                        b.click();
+                        return true;
+                    }
+                }
+                const closeBtn = document.querySelector('.ant-modal-close, button[aria-label="Close"], [class*="modal-close"]');
+                if (closeBtn && closeBtn.offsetParent !== null) {
+                    closeBtn.click();
+                    return true;
+                }
+                return false;
+            }
+            """)
+            if dismissed:
+                self.logger.info("Modal 'Confirm your age' terdeteksi dan di-dismiss otomatis.")
+                await asyncio.sleep(0.4)
+                return True
+        except Exception:
+            pass
+        return False
 
     async def ensure_authenticated(self) -> bool:
         """Idempotent auth check untuk Qwen.
@@ -382,6 +472,18 @@ class QwenScraper(BaseAIChatScraper):
         await asyncio.sleep(1.5)
 
         login_sel = QWEN_CONFIG["selectors"]["login"]
+
+        # Cek apakah form login password perlu dibuka dulu via tombol "Log in with a password"
+        for sel in login_sel.get("switch_password_button", []):
+            try:
+                btn_pw = await self._page.query_selector(sel)
+                if btn_pw and await btn_pw.is_visible():
+                    self.logger.info("Mengklik '%s' untuk beralih ke form password", sel)
+                    await btn_pw.click()
+                    await asyncio.sleep(1.0)
+                    break
+            except Exception:
+                continue
 
         # Cari field email
         email_loc = None
@@ -2167,6 +2269,9 @@ class QwenScraper(BaseAIChatScraper):
         await input_el.fill(outgoing_prompt, timeout=self._fill_timeout(outgoing_prompt))
         await asyncio.sleep(0.3)
 
+        # Cek jika ada modal umur sebelum tombol diklik
+        await self._dismiss_age_confirmation_modal()
+
         # Klik send button dengan retry+re-query untuk handle DOM detach
         await self._click_send_button(input_el)
         self.logger.debug("Send submitted (send_prompt main)")
@@ -2209,6 +2314,8 @@ class QwenScraper(BaseAIChatScraper):
                     generating, pre_count, cur_count,
                 )
                 break
+            # Jika modal verifikasi usia muncul setelah prompt dikirim, auto-dismiss
+            await self._dismiss_age_confirmation_modal()
             await asyncio.sleep(0.4)
 
         if not appeared:
@@ -2260,11 +2367,9 @@ class QwenScraper(BaseAIChatScraper):
             for pat in QWEN_AUTH_CONFIG["login_url_patterns"]:
                 if pat in url.lower():
                     return True
-            # Cek tombol Login/Sign Up di DOM
-            if await self._is_unauthenticated():
-                return True
-            body = await self._page.inner_text("body")
-            return contains_any(body, ROTATION_CONFIG["session_expired_phrases"])
+            # Cek status autentikasi terarah via _is_unauthenticated()
+            # (TIDAK membaca inner_text('body') bebas agar teks chat 'log in' / 'sign in' tidak memicu false positive)
+            return await self._is_unauthenticated()
         except Exception:
             return False
 

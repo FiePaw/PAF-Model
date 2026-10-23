@@ -46,6 +46,30 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Prioritaskan Selector Input Cepat di Worker Readiness Check:**
   - Menambahkan `textarea.message-input-textarea` pada posisi teratas `_INPUT_SELECTORS` di [`public_qwen.py`](./public_qwen.py).
 
+### 4. Deteksi Login Otomatis, Pre-Flight Auth Guard & Penanganan Modal Umur
+- **Pre-Flight Authentication Check Sebelum Pengiriman Prompt:**
+  - Menambahkan pengecekan `if await self.is_session_expired():` pada `scrape()` di [`scrapers/base_qwen.py`](./scrapers/base_qwen.py) sebelum prompt dikirim. Jika akun belum login / sesi habis, scraper otomatis menjalankan `ensure_authenticated()` atau merotasi ke akun lain.
+- **Deteksi Unauthenticated Komprehensif (< 10ms):**
+  - Memperbarui `_is_unauthenticated()` pada [`scrapers/qwen_scraper.py`](./scrapers/qwen_scraper.py) dengan evaluasi JS cepat memeriksa container auth header (`.auth-buttons`, `.header-right-auth-button`), keberadaan tombol "Log in" / "Sign up", dan URL `/auth`.
+- **Dukungan Form Login 2-Tahap (Password Switch):**
+  - Pada `login()` di [`scrapers/qwen_scraper.py`](./scrapers/qwen_scraper.py), ditambahkan klik otomatis pada tombol switch `button:has-text("Log in with a password")` agar field password dimunculkan sebelum pengisian form.
+- **Auto-Dismiss Modal Verifikasi Umur ("Confirm your age to continue"):**
+  - Menambahkan helper `_dismiss_age_confirmation_modal()` di [`scrapers/qwen_scraper.py`](./scrapers/qwen_scraper.py) yang otomatis mengklik `Continue` jika pop-up verifikasi usia muncul, mencegah browser membeku / macet saat sesi guest aktif.
+- **Recovery Cerdas pada `TimeoutError`:**
+  - Memperbarui blok `except TimeoutError` di [`scrapers/base_qwen.py`](./scrapers/base_qwen.py) untuk mengecek apakah timeout disebabkan oleh sesi yang logout/expired. Jika ya, scraper segera me-reautentikasi atau merotasi akun tanpa membuang waktu mengulang percobaan pada sesi yang rusak.
+
+### 5. Eliminasi False (Guest): Evaluasi Ganda Positif-Negatif & Penghapusan Pemindaian Frasa Body
+- **Penghapusan Pemindaian Teks Body `session_expired_phrases`:**
+  - Menghapus pemindaian string bebas `contains_any(body, ...)` pada `is_session_expired()` di [`scrapers/qwen_scraper.py`](./scrapers/qwen_scraper.py). Sebelumnya, kata "log in", "sign in", atau "unauthorized" di dalam pesan chat atau contoh kode memicu deteksi sesi expired secara keliru.
+- **Logika Evaluasi Ganda (Positive & Negative Guard):**
+  - Pada `_is_unauthenticated()` di [`scrapers/qwen_scraper.py`](./scrapers/qwen_scraper.py), ditambahkan deteksi sinyal positif akun login (`.temporary-chat-entry`, `.sidebar-wrapper`, `.sidebar-entry-fixed-list-content`). Jika sinyal positif ada dan header auth tidak ada, halaman dipastikan berstatus LOGIN (`False`).
+- **Pengecekan Header Terisolasi (#qwen-chat-header-right):**
+  - Selector tombol login pada [`config/qwen.py`](./config/qwen.py) dikunci hanya pada header kanan (`#qwen-chat-header-right .auth-buttons`), mencegah false positive dari tombol demo atau teks di area konten utama.
+- **Pengecekan Modal Usia Khusus Kontainer Dialog:**
+  - Evaluasi teks verifikasi umur kini dibatasi hanya pada elemen `[role="dialog"]` / `.ant-modal`, bukan seluruh teks dokumen.
+- **Jeda Hidrasi Anti-Race-Condition:**
+  - Menambahkan verifikasi ulang singkat (400ms) pada `_ensure_page_ready()` jika status unauthenticated dicurigai saat cold-load, memberi waktu React SPA memvalidasi sesi akun sebelum memicu login otomatis.
+
 ---
 
 ## [Unreleased] — Qwen Backend: Diagnostik Login Otomatis, Pemetaan Selector Baru, dan Isolasi Profil Akun
