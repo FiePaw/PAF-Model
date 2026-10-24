@@ -607,6 +607,9 @@ class BrowserPool:
         conversation_url: Optional[str] = None,
         preferred_account: Optional[str] = None,
         acquire_timeout: float = 120.0,
+        tools: Optional[list[dict]] = None,
+        max_tokens: Optional[int] = None,
+        system_prompt: Optional[str] = None,
     ) -> dict:
         """
         Turn 2: inject tool results into an existing CONTINUE conversation.
@@ -679,6 +682,9 @@ class BrowserPool:
             result = await slot.scraper.scrape_with_tool_result(
                 tool_messages=tool_messages,
                 next_user_msg=next_user_msg,
+                tools=tools,
+                max_tokens=max_tokens,
+                system_prompt=system_prompt,
             )
 
             t_scrape_elapsed = time.monotonic() - t_scrape_start

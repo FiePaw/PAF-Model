@@ -299,13 +299,25 @@ class BrowserPool:
         continue_url: str | None = None,
         preferred_account: str | None = None,
         acquire_timeout: float = 120.0,
+        tools: list | None = None,
+        max_tokens: int | None = None,
+        tool_messages: list | None = None,
+        next_user_msg: str | None = None,
     ) -> dict:
         """Acquire a slot (pinned to preferred_account when given), scrape,
         release. On rate-limit in mode='new', rotate account and retry once.
+
+        tools / max_tokens / tool_messages / next_user_msg carry the shared
+        function-calling protocol context (see scrapers/tool_protocol.py).
         """
+        proto = dict(
+            tools=tools, max_tokens=max_tokens,
+            tool_messages=tool_messages, next_user_msg=next_user_msg,
+        )
         async with self.acquire(preferred_account, timeout=acquire_timeout) as slot:
             result = await slot.scraper.scrape(
                 prompt, mode=mode, attachments=attachments, continue_url=continue_url,
+                **proto,
             )
 
             if not result.get("ok") and mode == "new":
@@ -318,6 +330,7 @@ class BrowserPool:
                     if rotated:
                         result = await slot.scraper.scrape(
                             prompt, mode=mode, attachments=attachments, continue_url=continue_url,
+                            **proto,
                         )
             elif not result.get("ok") and mode == "continue":
                 # Session terikat akun — rotasi akan kehilangan konteks percakapan.

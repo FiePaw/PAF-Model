@@ -509,12 +509,12 @@ sent with `model: "grok"` is silently ignored (no error).
 
 ---
 
-## 9. Tool / function calling (deepseek, qwen)
+## 9. Tool / function calling (deepseek, qwen, grok)
 
-Grok (v1) accepts `tools` in the request body without erroring, but does
-**not** execute tool calls against the Grok UI — this is recorded as a
-v1.1 follow-up in `CHANGELOG.md`. Only DeepSeek and Qwen actually resolve
-tool calls end-to-end today.
+All three backends resolve tool calls end-to-end with the **same protocol**
+(`scrapers/tool_protocol.py`). From a client's point of view nothing
+backend-specific is needed: you send OpenAI `tools`, you get OpenAI
+`tool_calls` back.
 
 Send `tools` in the OpenAI function-calling shape:
 
@@ -539,12 +539,47 @@ Send `tools` in the OpenAI function-calling shape:
 }
 ```
 
-Because both backends are **browser automation**, not native function-calling
-APIs, tool calling is emulated via a strict JSON-only system prompt injected
-by the scraper (see `scrapers/deepseek_scraper.py`): the model is told it is
-"a pure JSON API endpoint" and must answer with exactly one of two JSON
-shapes — a `tool_calls` request or a final `success` answer — which the
-scraper parses back into OpenAI's schema for you.
+Because the backends are **browser automation**, not native function-calling
+APIs, tool calling is emulated through the prompt. Every request is wrapped in a
+`[SYSTEM CONTEXT]` / `[USER REQUEST]` envelope, and:
+
+- **Plain chat (no `tools`)** — the model answers in **plain text**. There is no
+  JSON envelope to validate, so long answers, code, quotes and backslashes can
+  no longer produce "invalid JSON" failures, retries or account rotations.
+- **With `tools`** — the model answers in plain text *unless* it needs a
+  function, in which case it writes a marker block with **raw, unescaped**
+  argument values:
+
+  ````
+  @@PAF-CALL:write_file@@
+  @@PAF-ARG:path@@
+  main.py
+  @@PAF-ARG:content@@
+  print("raw", 'text')
+  @@PAF-END@@
+  ````
+
+  The worker parses the block and builds the OpenAI `tool_calls` JSON in code
+  (`json.dumps`), so escaping is always correct. Argument values are converted
+  to the type your `parameters` schema declares (`integer`, `number`,
+  `boolean`, `object`, `array`); `function.arguments` is always a JSON
+  **string** (OpenAI spec) on every backend.
+- **Self-healing** — if the model emits a function-call block that cannot be
+  parsed (unterminated, unknown function name, …) or an empty reply, the worker
+  sends one short correction in the **same** conversation (up to 2×) before
+  failing the request. Ordinary plain-text answers are never retried for format.
+- **Backward compatible** — conversations that started under the old JSON
+  protocol (`{"status":"success"|"tool_calls", ...}`) are still understood.
+
+Notes:
+- The `[SYSTEM CONTEXT]` is sent on **every** turn (it is short for plain chat),
+  because clients may change `tools` between requests.
+- A client-supplied `system` message is appended to `[SYSTEM CONTEXT]` on
+  **DeepSeek only** (see §5.2); Qwen and Grok do not receive it.
+- `max_tokens` is passed to the model as an advisory length hint, not enforced.
+- Resend `tools` on every request, as in the OpenAI API. On the Turn-B request
+  the worker can still parse a function call without them, but it can then
+  neither validate function names nor coerce argument types.
 
 ### Turn A — model requests a tool call
 Response:
@@ -587,9 +622,10 @@ to prompt the model to continue:
 ```
 (Header `X-Session-ID: sess-...` from Turn A.) The gateway detects `mode ==
 "continue"` (because a session id is present) and forwards `tool` messages
-as `tool_messages` (DeepSeek) or leaves them in `messages` for the Qwen
-worker's own tool-result branch (`scrape_with_tool_result`). The final answer
-comes back as a normal `finish_reason: "stop"` message.
+as `tool_messages` (DeepSeek and Grok) or leaves them in `messages` for the Qwen
+worker's own tool-result branch (`scrape_with_tool_result`). The model may
+answer (`finish_reason: "stop"`) or chain another function call
+(`finish_reason: "tool_calls"` again).
 
 ---
 
@@ -779,7 +815,8 @@ curl -X POST http://VPS_HOST:9000/v1/chat/completions \
       }'
 ```
 No `think_mode`/`model_tab`/`deep_think`/`web_search`/`task_type` fields for
-Grok — it's chat-only in v1 (see §7 and §14).
+Grok — it has no model picker or think-mode toggle (see §7 and §14). Function
+calling with `tools` works the same as on the other backends (§9).
 
 ### 13.6 Python — minimal client
 ```python
@@ -854,10 +891,10 @@ Decision rules:
   extra field for image attachments).
 - **Calling a tool** → declare `tools`, read `finish_reason == "tool_calls"`
   and `message.tool_calls`, execute locally, then POST back a `tool` message
-  with the same `X-Session-ID`. **Not supported for `grok`** — `tools` is
-  accepted without erroring but never resolved against the Grok UI (§9).
+  with the same `X-Session-ID`. Works the same on `deepseek`, `qwen` and
+  `grok` (§9); resend `tools` on every request.
 - **Do not** send `model_tab`/`deep_think`/`web_search`/`task_type`/
-  `think_mode` to `grok` — it's chat-only in v1 and ignores all of these
+  `think_mode` to `grok` — Grok has no such controls and ignores all of these
   (no error, just no effect). Same rule as before for not sending a
   backend's fields to a *different* backend that doesn't own them.
 - **Always** treat `usage.*` as approximate, `detail` (not `error.message`)
@@ -875,6 +912,9 @@ For anyone auditing this document against the code:
   verified by `tests/test_api_auth.py`
 - DeepSeek worker task execution / result shape → `public_deepseek.py`, `scrapers/deepseek_scraper.py`
 - Qwen worker task execution / result shape → `public_qwen.py`, `scrapers/qwen_scraper.py`
+- Prompt wrapping, function-call protocol and reply parsing (all three backends) →
+  `scrapers/tool_protocol.py`; verified by `tests/test_tool_protocol.py`,
+  `tests/test_protocol_scrapers.py` and `tests/test_grok_tools_e2e.py`
 - Grok worker task execution / result shape → `public_grok.py`,
   `scrapers/grok_scraper.py`, `scrapers/base_grok.py`,
   `browser_pool_grok.py`

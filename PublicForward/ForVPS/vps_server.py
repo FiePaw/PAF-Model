@@ -882,10 +882,23 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
                 "messages": messages_payload,
             }
         elif backend == "grok":
-            # v1: chat-only, no think_mode/model_tab/deep_think/web_search.
+            # No think_mode/model_tab/deep_think/web_search (Grok UI has none).
             # Uses the deepseek-style envelope/result shape (ok/text/account/
             # conversation_url) — same shape the retired ChatGPT worker used,
             # REUSED unchanged for Grok (see GROK_BACKEND.md).
+            # Function calling follows the shared protocol (same as DeepSeek):
+            # `tools` on every request, `tool_messages` on the Turn-2 request
+            # that returns function results.
+            tool_messages = [
+                {
+                    "role":         m.role,
+                    "tool_call_id": m.tool_call_id,
+                    "name":         m.name,
+                    "content":      m.content if isinstance(m.content, str)
+                                    else json.dumps(m.content, ensure_ascii=False),
+                }
+                for m in req.messages if m.role == "tool"
+            ] or None
             task_fields = {
                 "prompt": req.last_user_message(),
                 "mode": mode,
@@ -894,6 +907,8 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
                 "attachments": attachments,
                 "messages": messages_payload,
                 "max_tokens": req.max_tokens,
+                "tools": tools_payload,
+                "tool_messages": tool_messages,
             }
         else:  # backend == "qwen"
             # think_mode passed through as-is; the Qwen worker derives its own

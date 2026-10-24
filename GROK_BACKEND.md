@@ -324,9 +324,15 @@ method doesn't exist in `GrokScraper`.
 
 ## 8. Known limitations / v1.1 roadmap
 
-- No `think_mode` / model picker — chat-only, default UI model.
-- Tool/function calling is accepted in the request but not executed
-  against the Grok UI.
+- No `think_mode` / model picker — default UI model.
+- Function calling uses the shared protocol in `scrapers/tool_protocol.py`
+  (same as DeepSeek/Qwen): the prompt is wrapped in `[SYSTEM CONTEXT]` /
+  `[USER REQUEST]`, normal replies are plain text, and a function call is an
+  `@@PAF-CALL:<name>@@ … @@PAF-END@@` block parsed from the **raw** page text.
+  The UI-cleaning regexes in `_clean_response_text()` are deliberately NOT
+  applied to tool calls (they drop blank lines and trim indentation, which
+  would corrupt argument values). Not yet verified against a live account:
+  how grok.com renders a fenced block in `innerText`.
 - Attachments support is generic/best-effort and unverified against a
   live account (the reference scraper doesn't cover attachments).
 - `rate_limited` text patterns in `config/grok.py` are best-effort

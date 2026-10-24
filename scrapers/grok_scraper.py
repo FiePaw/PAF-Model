@@ -50,6 +50,7 @@ from typing import Any
 from playwright.async_api import Page
 
 from config import GROK_AUTH_CONFIG, GROK_CONFIG
+from scrapers import tool_protocol as tp
 from scrapers.base_grok import BaseAIChatScraper, _count_tokens
 
 SEL = GROK_CONFIG["selectors"]
@@ -61,6 +62,10 @@ class GrokScraper(BaseAIChatScraper):
         # Set once a NEW chat has actually been opened / a CONTINUE goto has
         # landed on a conversation — mirrors DeepSeek/ChatGPT's pattern.
         self._conversation_started: bool = False
+        # Per-request protocol context (set by scrape()): the function list the
+        # client declared and the advisory max_tokens hint.
+        self._tools: list | None = None
+        self._max_tokens: int | None = None
 
     # ── Small selector-list helpers (pola existing) ─────────────────── #
 
@@ -466,9 +471,28 @@ class GrokScraper(BaseAIChatScraper):
         mode: str = "new",
         attachments: list | None = None,
         continue_url: str | None = None,
+        tools: list | None = None,
+        max_tokens: int | None = None,
+        tool_messages: list | None = None,
+        next_user_msg: str | None = None,
         **kwargs,
     ) -> dict:
+        """Run one chat turn.
+
+        Shared protocol (scrapers/tool_protocol.py), same as DeepSeek/Qwen:
+          * the prompt is wrapped in [SYSTEM CONTEXT]/[USER REQUEST];
+          * a normal reply is plain text (cleaned of Grok UI chrome);
+          * a function call is an @@PAF-CALL:<name>@@ … @@PAF-END@@ block,
+            parsed from the RAW text (the UI-cleaning regexes would corrupt
+            argument values: they drop blank lines and trim indentation) and
+            returned as OpenAI ``tool_calls``;
+          * tool_messages (+ optional next_user_msg) = Turn 2: hand function
+            results back to the model in the same conversation (mode must be
+            "continue").
+        """
         t0 = time.monotonic()
+        self._tools = tools
+        self._max_tokens = max_tokens
         try:
             ok = await self.ensure_authenticated()
             if not ok:
@@ -482,12 +506,63 @@ class GrokScraper(BaseAIChatScraper):
                     "status": 401,
                 }
 
+            if tool_messages:
+                outgoing = tp.build_tool_result_prompt(
+                    tool_messages, next_user_msg, tools=tools, max_tokens=max_tokens,
+                )
+            else:
+                outgoing = tp.build_wrapped_prompt(
+                    prompt, tools=tools, max_tokens=max_tokens,
+                )
+
+            def _parse(txt: str) -> "tp.ParsedOutput":
+                return tp.parse_model_output(
+                    txt, tools=tools, expect_calls=bool(tool_messages),
+                )
+
             response = await self.send_prompt(
-                prompt, mode=mode, attachments=attachments, continue_url=continue_url,
+                outgoing, mode=mode, attachments=attachments, continue_url=continue_url,
             )
-            final_text = await self._extract_response(prompt) or response
-            canvas_blocks = await self._extract_canvas_blocks()
-            code_blocks = self.extract_code_blocks(final_text) or None
+            out = _parse(response)
+
+            # Broken function-call block / empty reply → short correction in the
+            # SAME conversation. Needs a real /c/<id> URL to re-enter the thread.
+            corrections = 0
+            while out.kind == tp.KIND_INVALID and corrections < tp.MAX_CORRECTIVE_RETRIES:
+                conv_url = self._page.url if self._page else None
+                if not conv_url or "/c/" not in conv_url:
+                    break
+                corrections += 1
+                self.logger.warning(
+                    "Reply invalid (corrective %d/%d): %s | raw[:200]=%r",
+                    corrections, tp.MAX_CORRECTIVE_RETRIES, out.error, (response or "")[:200],
+                )
+                response = await self.send_prompt(
+                    tp.corrective_prompt_for(out), mode="continue", continue_url=conv_url,
+                )
+                out = _parse(response)
+
+            if out.kind == tp.KIND_INVALID:
+                return {
+                    "ok": False,
+                    "error": f"invalid_response: {out.error}",
+                    "account": self.account,
+                    "raw": (response or "")[:2000],
+                }
+
+            tool_calls = None
+            if out.kind == tp.KIND_TOOL_CALLS:
+                tool_calls = out.tool_calls
+                final_text = ""
+                canvas_blocks: list = []
+                code_blocks = None
+            else:
+                if out.legacy:
+                    final_text = out.text
+                else:
+                    final_text = await self._extract_response(outgoing) or out.text
+                canvas_blocks = await self._extract_canvas_blocks()
+                code_blocks = self.extract_code_blocks(final_text) or None
 
             current_url = self._page.url if self._page else None
             conversation_id = None
@@ -496,21 +571,26 @@ class GrokScraper(BaseAIChatScraper):
                 if m:
                     conversation_id = m.group(1)
 
+            prompt_tokens = _count_tokens(outgoing)
+            completion_tokens = _count_tokens(final_text or response or "")
             result = {
                 "ok": True,
+                "finish_reason": "tool_calls" if tool_calls else "stop",
                 "text": final_text,
                 "code_blocks": code_blocks,
                 "canvas": canvas_blocks or None,
                 "conversation_id": conversation_id,
                 "usage": {
-                    "prompt_tokens": _count_tokens(prompt),
-                    "completion_tokens": _count_tokens(final_text),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
                 },
                 "account": self.account,
                 "conversation_url": current_url,
                 "mode": mode,
                 "elapsed": time.monotonic() - t0,
             }
+            if tool_calls:
+                result["tool_calls"] = tool_calls
             if canvas_blocks:
                 try:
                     self.save_code_files(

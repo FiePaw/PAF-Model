@@ -42,6 +42,7 @@ from config import (
     PROFILES_DIR,
     ROTATION_CONFIG,
 )
+from scrapers import tool_protocol as tp
 from scrapers.utils import (
     AuthStore,
     cookie_editor_json_to_playwright,
@@ -1491,50 +1492,45 @@ class BaseAIChatScraper(ABC):
                     continue
 
                 # ── Response handling ───────────────────────────────────────
-                # JSON API mode (parity w/ PAF-ModelQwen): DeepSeek was asked
-                # (via the [SYSTEM CONTEXT] wrapper built in send_prompt) to
-                # reply with a JSON envelope. Validate it; if invalid, send a
-                # corrective-feedback prompt in the SAME conversation up to
-                # max_corrective_retries before letting the outer retry/rotate
-                # loop take over. When disabled, fall back to lenient plain-text
-                # validation (original DeepSeek behaviour).
+                # Shared protocol (scrapers/tool_protocol.py), same for every
+                # backend: a normal reply is PLAIN TEXT (nothing to validate);
+                # a function call is an @@PAF-CALL:<name>@@ … @@PAF-END@@ block
+                # with raw argument values, converted to OpenAI ``tool_calls``
+                # in code. Only a broken call block / empty reply triggers an
+                # in-session corrective prompt (up to max_corrective_retries)
+                # before the outer retry/rotate loop takes over. Legacy JSON
+                # envelopes (older sessions) are still understood.
+                # When JSON_API_CONFIG["enabled"] is False the prompt is not
+                # wrapped and the original lenient plain-text path is used.
                 from config import JSON_API_CONFIG
-                _json_mode = (
-                    JSON_API_CONFIG.get("enabled", False)
-                    and hasattr(self, "_validate_deepseek_json_response")
-                )
+                _protocol_mode = JSON_API_CONFIG.get("enabled", False)
 
                 finish_reason = "stop"
                 tool_calls_list = None
+                _req_tools = merged_kwargs.get("tools")
 
-                if _json_mode:
-                    is_valid, parsed, verr = self._validate_deepseek_json_response(text)
-                    max_corr = JSON_API_CONFIG.get("max_corrective_retries", 2)
+                if _protocol_mode:
+                    def _parse(txt: str) -> "tp.ParsedOutput":
+                        return tp.parse_model_output(
+                            txt,
+                            tools=_req_tools,
+                            legacy_validator=getattr(
+                                self, "_validate_deepseek_json_response", None
+                            ),
+                        )
+
+                    out = _parse(text)
+                    max_corr = JSON_API_CONFIG.get(
+                        "max_corrective_retries", tp.MAX_CORRECTIVE_RETRIES
+                    )
                     corr = 0
-                    while not is_valid and corr < max_corr:
+                    while out.kind == tp.KIND_INVALID and corr < max_corr:
                         corr += 1
                         log.warning(
-                            "JSON response invalid (corrective %d/%d): %s | raw[:200]=%s",
-                            corr, max_corr, verr, (text or "")[:200],
+                            "Response invalid (corrective %d/%d): %s | raw[:200]=%s",
+                            corr, max_corr, out.error, (text or "")[:200],
                         )
-                        if '"tool_calls"' in (text or ""):
-                            corrective_prompt = (
-                                "Your previous reply was not valid JSON. Reply with "
-                                "ONE single line of JSON only, no other text, using "
-                                "EXACTLY this schema:\n"
-                                '{"status":"tool_calls","tool_calls":[{"id":'
-                                '"call_<unique_id>","type":"function","function":'
-                                '{"name":"<function_name>","arguments":{<args_as_object>}}}]}'
-                            )
-                        else:
-                            corrective_prompt = (
-                                "Your previous reply was not valid JSON. Reply with "
-                                "ONE single line of JSON only, no other text, using "
-                                "EXACTLY this schema:\n"
-                                '{"status":"success","choices":[{"index":0,"message":'
-                                '{"role":"assistant","content":"<your full answer>"},'
-                                '"finish_reason":"stop"}]}'
-                            )
+                        corrective_prompt = tp.corrective_prompt_for(out)
                         await asyncio.sleep(ROTATION_CONFIG["retry_delay"])
                         try:
                             # Capture pre-send text for virtual-list change detection.
@@ -1559,35 +1555,26 @@ class BaseAIChatScraper(ABC):
                         except Exception as corr_exc:  # noqa: BLE001
                             log.warning("Corrective send failed: %s", corr_exc)
                             break
-                        is_valid, parsed, verr = self._validate_deepseek_json_response(text)
+                        out = _parse(text)
 
-                    if not is_valid:
-                        last_error = f"invalid_json_response: {verr}"
+                    if out.kind == tp.KIND_INVALID:
+                        last_error = f"invalid_response: {out.error}"
                         log.error(
-                            "JSON response still invalid after %d corrective tries", corr
+                            "Response still invalid after %d corrective tries", corr
                         )
                         retries += 1
                         await asyncio.sleep(ROTATION_CONFIG["retry_delay"])
                         continue
 
-                    if parsed.get("status") == "error":
-                        err_obj = parsed.get("error", {}) or {}
-                        last_error = err_obj.get("message") or "model returned error envelope"
-                        log.warning("Model returned error envelope: %s", last_error)
-                        retries += 1
-                        await asyncio.sleep(ROTATION_CONFIG["retry_delay"])
-                        continue
-
-                    if parsed.get("status") == "tool_calls":
-                        tool_calls_list = parsed.get("tool_calls", [])
+                    if out.kind == tp.KIND_TOOL_CALLS:
+                        tool_calls_list = out.tool_calls
                         finish_reason = "tool_calls"
                         cleaned = ""
                         log.info(
-                            "JSON response: tool_calls (%d call(s))", len(tool_calls_list)
+                            "Response: tool_calls (%d call(s))", len(tool_calls_list)
                         )
                     else:
-                        cleaned = parsed["choices"][0]["message"]["content"]
-                        finish_reason = parsed["choices"][0].get("finish_reason", "stop")
+                        cleaned = out.text
                 else:
                     ok, cleaned = self._validate_response(text)
                     if not ok:

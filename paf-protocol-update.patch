@@ -1,0 +1,2759 @@
+diff --git a/API_USAGE.md b/API_USAGE.md
+index 5a7a8ef..7fec2e5 100644
+--- a/API_USAGE.md
++++ b/API_USAGE.md
+@@ -509,12 +509,12 @@ sent with `model: "grok"` is silently ignored (no error).
+ 
+ ---
+ 
+-## 9. Tool / function calling (deepseek, qwen)
++## 9. Tool / function calling (deepseek, qwen, grok)
+ 
+-Grok (v1) accepts `tools` in the request body without erroring, but does
+-**not** execute tool calls against the Grok UI — this is recorded as a
+-v1.1 follow-up in `CHANGELOG.md`. Only DeepSeek and Qwen actually resolve
+-tool calls end-to-end today.
++All three backends resolve tool calls end-to-end with the **same protocol**
++(`scrapers/tool_protocol.py`). From a client's point of view nothing
++backend-specific is needed: you send OpenAI `tools`, you get OpenAI
++`tool_calls` back.
+ 
+ Send `tools` in the OpenAI function-calling shape:
+ 
+@@ -539,12 +539,47 @@ Send `tools` in the OpenAI function-calling shape:
+ }
+ ```
+ 
+-Because both backends are **browser automation**, not native function-calling
+-APIs, tool calling is emulated via a strict JSON-only system prompt injected
+-by the scraper (see `scrapers/deepseek_scraper.py`): the model is told it is
+-"a pure JSON API endpoint" and must answer with exactly one of two JSON
+-shapes — a `tool_calls` request or a final `success` answer — which the
+-scraper parses back into OpenAI's schema for you.
++Because the backends are **browser automation**, not native function-calling
++APIs, tool calling is emulated through the prompt. Every request is wrapped in a
++`[SYSTEM CONTEXT]` / `[USER REQUEST]` envelope, and:
++
++- **Plain chat (no `tools`)** — the model answers in **plain text**. There is no
++  JSON envelope to validate, so long answers, code, quotes and backslashes can
++  no longer produce "invalid JSON" failures, retries or account rotations.
++- **With `tools`** — the model answers in plain text *unless* it needs a
++  function, in which case it writes a marker block with **raw, unescaped**
++  argument values:
++
++  ````
++  @@PAF-CALL:write_file@@
++  @@PAF-ARG:path@@
++  main.py
++  @@PAF-ARG:content@@
++  print("raw", 'text')
++  @@PAF-END@@
++  ````
++
++  The worker parses the block and builds the OpenAI `tool_calls` JSON in code
++  (`json.dumps`), so escaping is always correct. Argument values are converted
++  to the type your `parameters` schema declares (`integer`, `number`,
++  `boolean`, `object`, `array`); `function.arguments` is always a JSON
++  **string** (OpenAI spec) on every backend.
++- **Self-healing** — if the model emits a function-call block that cannot be
++  parsed (unterminated, unknown function name, …) or an empty reply, the worker
++  sends one short correction in the **same** conversation (up to 2×) before
++  failing the request. Ordinary plain-text answers are never retried for format.
++- **Backward compatible** — conversations that started under the old JSON
++  protocol (`{"status":"success"|"tool_calls", ...}`) are still understood.
++
++Notes:
++- The `[SYSTEM CONTEXT]` is sent on **every** turn (it is short for plain chat),
++  because clients may change `tools` between requests.
++- A client-supplied `system` message is appended to `[SYSTEM CONTEXT]` on
++  **DeepSeek only** (see §5.2); Qwen and Grok do not receive it.
++- `max_tokens` is passed to the model as an advisory length hint, not enforced.
++- Resend `tools` on every request, as in the OpenAI API. On the Turn-B request
++  the worker can still parse a function call without them, but it can then
++  neither validate function names nor coerce argument types.
+ 
+ ### Turn A — model requests a tool call
+ Response:
+@@ -587,9 +622,10 @@ to prompt the model to continue:
+ ```
+ (Header `X-Session-ID: sess-...` from Turn A.) The gateway detects `mode ==
+ "continue"` (because a session id is present) and forwards `tool` messages
+-as `tool_messages` (DeepSeek) or leaves them in `messages` for the Qwen
+-worker's own tool-result branch (`scrape_with_tool_result`). The final answer
+-comes back as a normal `finish_reason: "stop"` message.
++as `tool_messages` (DeepSeek and Grok) or leaves them in `messages` for the Qwen
++worker's own tool-result branch (`scrape_with_tool_result`). The model may
++answer (`finish_reason: "stop"`) or chain another function call
++(`finish_reason: "tool_calls"` again).
+ 
+ ---
+ 
+@@ -779,7 +815,8 @@ curl -X POST http://VPS_HOST:9000/v1/chat/completions \
+       }'
+ ```
+ No `think_mode`/`model_tab`/`deep_think`/`web_search`/`task_type` fields for
+-Grok — it's chat-only in v1 (see §7 and §14).
++Grok — it has no model picker or think-mode toggle (see §7 and §14). Function
++calling with `tools` works the same as on the other backends (§9).
+ 
+ ### 13.6 Python — minimal client
+ ```python
+@@ -854,10 +891,10 @@ Decision rules:
+   extra field for image attachments).
+ - **Calling a tool** → declare `tools`, read `finish_reason == "tool_calls"`
+   and `message.tool_calls`, execute locally, then POST back a `tool` message
+-  with the same `X-Session-ID`. **Not supported for `grok`** — `tools` is
+-  accepted without erroring but never resolved against the Grok UI (§9).
++  with the same `X-Session-ID`. Works the same on `deepseek`, `qwen` and
++  `grok` (§9); resend `tools` on every request.
+ - **Do not** send `model_tab`/`deep_think`/`web_search`/`task_type`/
+-  `think_mode` to `grok` — it's chat-only in v1 and ignores all of these
++  `think_mode` to `grok` — Grok has no such controls and ignores all of these
+   (no error, just no effect). Same rule as before for not sending a
+   backend's fields to a *different* backend that doesn't own them.
+ - **Always** treat `usage.*` as approximate, `detail` (not `error.message`)
+@@ -875,6 +912,9 @@ For anyone auditing this document against the code:
+   verified by `tests/test_api_auth.py`
+ - DeepSeek worker task execution / result shape → `public_deepseek.py`, `scrapers/deepseek_scraper.py`
+ - Qwen worker task execution / result shape → `public_qwen.py`, `scrapers/qwen_scraper.py`
++- Prompt wrapping, function-call protocol and reply parsing (all three backends) →
++  `scrapers/tool_protocol.py`; verified by `tests/test_tool_protocol.py`,
++  `tests/test_protocol_scrapers.py` and `tests/test_grok_tools_e2e.py`
+ - Grok worker task execution / result shape → `public_grok.py`,
+   `scrapers/grok_scraper.py`, `scrapers/base_grok.py`,
+   `browser_pool_grok.py`
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7182a42..f3735e3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,43 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+ 
+ ---
+ 
++## [Unreleased] — Semua Backend: Protokol API Mode Bersama (Teks Biasa + Tool Calling Berbasis Penanda) dan Tool Calling untuk Grok
++
++> **Perubahan lintas backend (DeepSeek, Qwen, Grok).** Sebelumnya setiap balasan dipaksa berbentuk envelope JSON sehingga model harus meng-escape sendiri tanda kutip, backslash, newline, dan kode di dalam string JSON — sumber utama error "invalid JSON", retry, dan rotasi akun. Kini jawaban biasa berupa **teks polos**, dan hanya pemanggilan fungsi yang memakai blok bertanda berisi nilai argumen **mentah**; JSON `tool_calls` disusun oleh kode (`json.dumps`), bukan oleh model. System prompt `[SYSTEM CONTEXT]` / `[USER REQUEST]` tetap dipertahankan.
++
++### 1. Modul Protokol Bersama (`scrapers/tool_protocol.py`)
++- **File baru** tanpa dependensi browser/jaringan, dipakai ketiga backend: pembangun prompt (`build_wrapped_prompt`, `build_tool_result_prompt`, `build_corrective_prompt`) dan parser balasan (`parse_model_output`).
++- **Chat biasa (tanpa `tools`):** jawaban = teks polos, tidak ada yang divalidasi.
++- **Dengan `tools`:** jawaban teks polos, kecuali model perlu memanggil fungsi → blok:
++  `@@PAF-CALL:<fungsi>@@` / `@@PAF-ARG:<argumen>@@ <nilai mentah>` / `@@PAF-END@@`. Penanda sengaja tanpa `<`/`>` dan tanpa karakter khusus markdown agar selamat dari renderer; model diminta membungkus blok dalam fenced code block 4-backtick agar baris baru dan indentasi tetap utuh pada `innerText`. Parser tetap bekerja dengan/tanpa fence dan mengabaikan teks UI sebelum blok.
++- **Konversi tipe** nilai argumen mengikuti skema `parameters` (`integer`, `number`, `boolean`, `object`, `array`). `function.arguments` kini **selalu string JSON** (sesuai spesifikasi OpenAI dan `API_USAGE.md`); sebelumnya Qwen mengembalikan objek.
++- **Self-healing:** blok pemanggilan yang rusak (tidak ditutup, nama fungsi tidak dikenal, dst.) atau balasan kosong memicu satu pesan koreksi singkat di session yang sama (maks. 2×). Jawaban teks biasa tidak pernah di-retry karena format.
++- **Kompatibel mundur:** envelope JSON lama (`{"status":"success"|"tool_calls",...}`) tetap dipahami, sehingga session yang dimulai sebelum update ini tetap berjalan. Envelope sukses yang rusak tidak pernah menggagalkan chat biasa; hanya `tool_calls` lama yang rusak yang di-retry.
++- `[SYSTEM CONTEXT]` dikirim pada **setiap** turn (singkat untuk chat biasa) karena klien boleh mengganti `tools` antar request dan session lama masih berisi instruksi JSON.
++
++### 2. Qwen
++- `_build_wrapped_prompt()` / `_build_tool_result_prompt()` memakai modul bersama (kata "tool" tetap dihindari dalam instruksi; dipakai "function").
++- `base_qwen.scrape()`: validasi JSON diganti `parse_model_output()`; logika retry/rotasi akun/hard-cap tetap, namun pemicunya kini hanya blok pemanggilan rusak atau balasan kosong.
++- `scrape_with_tool_result()` kini punya putaran koreksi (sebelumnya langsung gagal).
++
++### 3. DeepSeek
++- Wrapper dan hasil-tool memakai modul bersama; client `system` message tetap ditambahkan ke `[SYSTEM CONTEXT]`.
++- **Perbaikan state:** `send_prompt()` tidak lagi menimpa `_tools`/`_max_tokens`/`_system_prompt` pada pengiriman verbatim (koreksi / hasil tool), sehingga validasi nama fungsi dan konversi tipe tetap berlaku.
++- `tools`/`max_tokens`/`system_prompt` kini diteruskan sampai Turn 2 (worker → pool → `scrape_with_tool_result`).
++- `JSON_API_CONFIG`: kunci `chat_system_instruction` dihapus (sumber instruksi tunggal kini `tool_protocol.py`); `enabled` dan `max_corrective_retries` dipertahankan.
++
++### 4. Grok — Tool Calling Kini Didukung
++- `GrokScraper.scrape()` menerima `tools`, `max_tokens`, `tool_messages`, `next_user_msg`; prompt dibungkus dan balasan di-parse dengan modul bersama.
++- Pemanggilan fungsi di-parse dari **teks mentah**; pembersih UI (`_clean_response_text`) sengaja tidak dijalankan pada tool call karena regex-nya membuang baris kosong dan memangkas indentasi sehingga merusak nilai argumen. Jawaban biasa tetap melalui pembersih seperti sebelumnya.
++- Gateway (`vps_server.py`) kini meneruskan `tools` dan `tool_messages` ke worker Grok; `browser_pool_grok.run_task()` dan `public_grok.py` meneruskannya ke scraper.
++
++### 5. Dokumentasi & Test
++- `API_USAGE.md` §9 ditulis ulang (protokol baru, Grok didukung), plus perbaikan §13.5, §14, §15; `README.md` dan `GROK_BACKEND.md` diperbarui.
++- Test offline baru: `tests/test_tool_protocol.py` (parser/builder), `tests/test_protocol_scrapers.py` (loop `scrape()` asli ketiga backend dengan browser stub), `tests/test_grok_tools_e2e.py` (gateway + worker palsu, dua giliran).
++- **Catatan:** test ini membuktikan plumbing di sekitar balasan model, bukan bagaimana situs live (chat.qwen.ai, chat.deepseek.com, grok.com) merender blok bertanda pada `innerText`. Perlu verifikasi manual dengan akun nyata. `tests/test_http_e2e.py` bawaan sudah usang terhadap autentikasi API token (gagal juga pada kode sebelum perubahan ini) dan tidak diubah.
++
++---
++
+ ## [Unreleased] — Qwen Backend: Diagnostik Prompt Page (I/O), Pembaruan Selector UI qwen-chat-v2, dan Optimasi Latency CONTINUE
+ 
+ > **Pembaruan Backend Qwen.** NEW! Penambahan tool diagnostik mandiri untuk halaman percakapan prompt (`debug_prompt_qwen.py`) yang menguji alur I/O secara end-to-end pada **NEW mode** dan **CONTINUE mode**, identifikasi migrasi antarmuka Qwen Web ke sistem komponen `qwen-chat-v2`, pembaruan selector I/O, serta optimasi latensi respon mode CONTINUE yang memulihkan kecepatan respon dari ~8 detik kembali ke ~5 detik.
+diff --git a/GROK_BACKEND.md b/GROK_BACKEND.md
+index 96ff0b8..dcaa338 100644
+--- a/GROK_BACKEND.md
++++ b/GROK_BACKEND.md
+@@ -324,9 +324,15 @@ method doesn't exist in `GrokScraper`.
+ 
+ ## 8. Known limitations / v1.1 roadmap
+ 
+-- No `think_mode` / model picker — chat-only, default UI model.
+-- Tool/function calling is accepted in the request but not executed
+-  against the Grok UI.
++- No `think_mode` / model picker — default UI model.
++- Function calling uses the shared protocol in `scrapers/tool_protocol.py`
++  (same as DeepSeek/Qwen): the prompt is wrapped in `[SYSTEM CONTEXT]` /
++  `[USER REQUEST]`, normal replies are plain text, and a function call is an
++  `@@PAF-CALL:<name>@@ … @@PAF-END@@` block parsed from the **raw** page text.
++  The UI-cleaning regexes in `_clean_response_text()` are deliberately NOT
++  applied to tool calls (they drop blank lines and trim indentation, which
++  would corrupt argument values). Not yet verified against a live account:
++  how grok.com renders a fenced block in `innerText`.
+ - Attachments support is generic/best-effort and unverified against a
+   live account (the reference scraper doesn't cover attachments).
+ - `rate_limited` text patterns in `config/grok.py` are best-effort
+diff --git a/PublicForward/ForVPS/vps_server.py b/PublicForward/ForVPS/vps_server.py
+index de2477c..803181e 100644
+--- a/PublicForward/ForVPS/vps_server.py
++++ b/PublicForward/ForVPS/vps_server.py
+@@ -872,10 +872,23 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
+                 "messages": messages_payload,
+             }
+         elif backend == "grok":
+-            # v1: chat-only, no think_mode/model_tab/deep_think/web_search.
++            # No think_mode/model_tab/deep_think/web_search (Grok UI has none).
+             # Uses the deepseek-style envelope/result shape (ok/text/account/
+             # conversation_url) — same shape the retired ChatGPT worker used,
+             # REUSED unchanged for Grok (see GROK_BACKEND.md).
++            # Function calling follows the shared protocol (same as DeepSeek):
++            # `tools` on every request, `tool_messages` on the Turn-2 request
++            # that returns function results.
++            tool_messages = [
++                {
++                    "role":         m.role,
++                    "tool_call_id": m.tool_call_id,
++                    "name":         m.name,
++                    "content":      m.content if isinstance(m.content, str)
++                                    else json.dumps(m.content, ensure_ascii=False),
++                }
++                for m in req.messages if m.role == "tool"
++            ] or None
+             task_fields = {
+                 "prompt": req.last_user_message(),
+                 "mode": mode,
+@@ -884,6 +897,8 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
+                 "attachments": attachments,
+                 "messages": messages_payload,
+                 "max_tokens": req.max_tokens,
++                "tools": tools_payload,
++                "tool_messages": tool_messages,
+             }
+         else:  # backend == "qwen"
+             # think_mode passed through as-is; the Qwen worker derives its own
+diff --git a/README.md b/README.md
+index f529de9..936f848 100644
+--- a/README.md
++++ b/README.md
+@@ -108,7 +108,7 @@ ids for accounts currently connected via a worker.
+ `think_mode`:
+ - **deepseek** → resolved to `(model_tab, deep_think, web_search)` via aliases.
+ - **qwen** → passed through as-is (`auto`|`thinking`|`fast`).
+-- **grok** → not supported in v1 — chat-only, default model in the UI.
++- **grok** → not supported — no model picker / think toggle, default model in the UI (function calling via `tools` is supported, see `API_USAGE.md` §9).
+ 
+ ## Running
+ 
+diff --git a/browser_pool_deepseek.py b/browser_pool_deepseek.py
+index c891b79..a759613 100644
+--- a/browser_pool_deepseek.py
++++ b/browser_pool_deepseek.py
+@@ -607,6 +607,9 @@ class BrowserPool:
+         conversation_url: Optional[str] = None,
+         preferred_account: Optional[str] = None,
+         acquire_timeout: float = 120.0,
++        tools: Optional[list[dict]] = None,
++        max_tokens: Optional[int] = None,
++        system_prompt: Optional[str] = None,
+     ) -> dict:
+         """
+         Turn 2: inject tool results into an existing CONTINUE conversation.
+@@ -679,6 +682,9 @@ class BrowserPool:
+             result = await slot.scraper.scrape_with_tool_result(
+                 tool_messages=tool_messages,
+                 next_user_msg=next_user_msg,
++                tools=tools,
++                max_tokens=max_tokens,
++                system_prompt=system_prompt,
+             )
+ 
+             t_scrape_elapsed = time.monotonic() - t_scrape_start
+diff --git a/browser_pool_grok.py b/browser_pool_grok.py
+index f3e90f4..bc0a04f 100644
+--- a/browser_pool_grok.py
++++ b/browser_pool_grok.py
+@@ -299,13 +299,25 @@ class BrowserPool:
+         continue_url: str | None = None,
+         preferred_account: str | None = None,
+         acquire_timeout: float = 120.0,
++        tools: list | None = None,
++        max_tokens: int | None = None,
++        tool_messages: list | None = None,
++        next_user_msg: str | None = None,
+     ) -> dict:
+         """Acquire a slot (pinned to preferred_account when given), scrape,
+         release. On rate-limit in mode='new', rotate account and retry once.
++
++        tools / max_tokens / tool_messages / next_user_msg carry the shared
++        function-calling protocol context (see scrapers/tool_protocol.py).
+         """
++        proto = dict(
++            tools=tools, max_tokens=max_tokens,
++            tool_messages=tool_messages, next_user_msg=next_user_msg,
++        )
+         async with self.acquire(preferred_account, timeout=acquire_timeout) as slot:
+             result = await slot.scraper.scrape(
+                 prompt, mode=mode, attachments=attachments, continue_url=continue_url,
++                **proto,
+             )
+ 
+             if not result.get("ok") and mode == "new":
+@@ -318,6 +330,7 @@ class BrowserPool:
+                     if rotated:
+                         result = await slot.scraper.scrape(
+                             prompt, mode=mode, attachments=attachments, continue_url=continue_url,
++                            **proto,
+                         )
+             elif not result.get("ok") and mode == "continue":
+                 # Session terikat akun — rotasi akan kehilangan konteks percakapan.
+diff --git a/config/deepseek.py b/config/deepseek.py
+index b2a9267..f49989f 100644
+--- a/config/deepseek.py
++++ b/config/deepseek.py
+@@ -354,28 +354,21 @@ AUTH_CONFIG: dict = {
+ 
+ 
+ # --------------------------------------------------------------------------- #
+-# JSON API mode (prompt wrapping + structured response)
++# API mode (prompt wrapping + function-calling protocol)
++#
++# The [SYSTEM CONTEXT]/[USER REQUEST] wrapper and the reply parser are shared by
++# every backend in scrapers/tool_protocol.py:
++#   * plain chat   -> plain-text answer (no JSON envelope)
++#   * tools        -> plain text, or an @@PAF-CALL:<name>@@ ... @@PAF-END@@ block
++#                     with raw argument values (converted to OpenAI tool_calls
++#                     in code, so the model never has to escape JSON)
++# The key keeps its historical name (JSON_API_CONFIG) for compatibility.
+ # --------------------------------------------------------------------------- #
+ JSON_API_CONFIG: dict = {
++    # True  -> wrap prompts and parse replies with the shared protocol.
++    # False -> send the raw prompt and use the original lenient plain-text path.
+     "enabled": True,
+-    # Max in-session corrective retries when the response is not valid JSON.
++    # Max in-session corrective retries when a function-call block is unusable
++    # (or the reply is empty) before the outer retry/rotate loop takes over.
+     "max_corrective_retries": 2,
+-    # Base [SYSTEM CONTEXT] instruction used for plain chat (no tools).
+-    "chat_system_instruction": (
+-        "You are operating as a JSON API endpoint, NOT a conversational "
+-        "assistant.\n"
+-        "Respond with ONE single line of VALID JSON only — no markdown, no "
+-        "code fences, no explanations, and no text outside the JSON.\n"
+-        "\n"
+-        "RESPONSE FORMAT (use EXACTLY this schema):\n"
+-        '{"status":"success","choices":[{"index":0,"message":{"role":'
+-        '"assistant","content":"<your full answer as a string>"},'
+-        '"finish_reason":"stop"}]}\n'
+-        "\n"
+-        "RULES:\n"
+-        "- content MUST be a JSON string. Escape any double quotes as \\\" and "
+-        "newlines as \\n.\n"
+-        "- finish_reason MUST be \"stop\".\n"
+-        "- Output ONE line only. Do NOT add any field outside the schema above."
+-    ),
+ }
+diff --git a/public_deepseek.py b/public_deepseek.py
+index 32997fb..e14a3cd 100644
+--- a/public_deepseek.py
++++ b/public_deepseek.py
+@@ -699,6 +699,9 @@ class LocalWorker:
+                     next_user_msg=next_user,
+                     conversation_url=conversation_url,
+                     preferred_account=preferred_account,
++                    tools=tools,
++                    max_tokens=max_tokens,
++                    system_prompt=system_prompt,
+                 )
+             else:
+                 result = await self.pool.run_task(
+diff --git a/public_grok.py b/public_grok.py
+index 76dc8cb..35d74b9 100644
+--- a/public_grok.py
++++ b/public_grok.py
+@@ -6,8 +6,9 @@ public_deepseek.py's Session persistence, envelope shape, and interactive
+ CLI, exactly as the retired ChatGPT worker did.
+ 
+ Deviations from public_deepseek.py (v1 scope):
+-  • NO model_tab / deep_think / web_search / tool_messages (chat-only, no
+-    think_mode — see config/grok.py).
++  • NO model_tab / deep_think / web_search (no think_mode — see
++    config/grok.py). Function calling IS supported through the shared
++    protocol in scrapers/tool_protocol.py (`tools` + `tool_messages`).
+   • NO automated login — grok.com is SSO-only. Sessions come from
+     login_grok.py (manual) or import_grok_cookies.py (cookie import),
+     run once per account before starting this worker.
+@@ -405,6 +406,26 @@ class LocalWorker:
+         session_id = request.get("session_id")
+         preferred_account = request.get("preferred_account")
+ 
++        # Function-calling protocol context (scrapers/tool_protocol.py).
++        tools = request.get("tools")
++        max_tokens = request.get("max_tokens")
++        tool_messages = request.get("tool_messages")
++        next_user_msg = None
++        if mode == "continue" and tool_messages:
++            # Turn 2: the user message (if any) that follows the last tool result.
++            messages = request.get("messages") or []
++            last_tool_idx = max(
++                (i for i, m in enumerate(messages) if m.get("role") == "tool"),
++                default=-1,
++            )
++            msgs_after = messages[last_tool_idx + 1:] if last_tool_idx >= 0 else []
++            next_user_msg = next(
++                (m["content"] for m in msgs_after
++                 if m.get("role") == "user" and isinstance(m.get("content"), str)
++                 and m.get("content")),
++                None,
++            )
++
+         attachments = None
+         if request.get("attachments"):
+             attachments = [
+@@ -443,6 +464,10 @@ class LocalWorker:
+                 attachments=attachments,
+                 continue_url=continue_url,
+                 preferred_account=preferred_account,
++                tools=tools,
++                max_tokens=max_tokens,
++                tool_messages=tool_messages if mode == "continue" else None,
++                next_user_msg=next_user_msg,
+             )
+             return result
+         except Exception as exc:
+diff --git a/scrapers/base_deepseek.py b/scrapers/base_deepseek.py
+index f9c634e..7f61d1b 100644
+--- a/scrapers/base_deepseek.py
++++ b/scrapers/base_deepseek.py
+@@ -42,6 +42,7 @@ from config import (
+     PROFILES_DIR,
+     ROTATION_CONFIG,
+ )
++from scrapers import tool_protocol as tp
+ from scrapers.utils import (
+     AuthStore,
+     cookie_editor_json_to_playwright,
+@@ -1491,50 +1492,45 @@ class BaseAIChatScraper(ABC):
+                     continue
+ 
+                 # ── Response handling ───────────────────────────────────────
+-                # JSON API mode (parity w/ PAF-ModelQwen): DeepSeek was asked
+-                # (via the [SYSTEM CONTEXT] wrapper built in send_prompt) to
+-                # reply with a JSON envelope. Validate it; if invalid, send a
+-                # corrective-feedback prompt in the SAME conversation up to
+-                # max_corrective_retries before letting the outer retry/rotate
+-                # loop take over. When disabled, fall back to lenient plain-text
+-                # validation (original DeepSeek behaviour).
++                # Shared protocol (scrapers/tool_protocol.py), same for every
++                # backend: a normal reply is PLAIN TEXT (nothing to validate);
++                # a function call is an @@PAF-CALL:<name>@@ … @@PAF-END@@ block
++                # with raw argument values, converted to OpenAI ``tool_calls``
++                # in code. Only a broken call block / empty reply triggers an
++                # in-session corrective prompt (up to max_corrective_retries)
++                # before the outer retry/rotate loop takes over. Legacy JSON
++                # envelopes (older sessions) are still understood.
++                # When JSON_API_CONFIG["enabled"] is False the prompt is not
++                # wrapped and the original lenient plain-text path is used.
+                 from config import JSON_API_CONFIG
+-                _json_mode = (
+-                    JSON_API_CONFIG.get("enabled", False)
+-                    and hasattr(self, "_validate_deepseek_json_response")
+-                )
++                _protocol_mode = JSON_API_CONFIG.get("enabled", False)
+ 
+                 finish_reason = "stop"
+                 tool_calls_list = None
++                _req_tools = merged_kwargs.get("tools")
++
++                if _protocol_mode:
++                    def _parse(txt: str) -> "tp.ParsedOutput":
++                        return tp.parse_model_output(
++                            txt,
++                            tools=_req_tools,
++                            legacy_validator=getattr(
++                                self, "_validate_deepseek_json_response", None
++                            ),
++                        )
+ 
+-                if _json_mode:
+-                    is_valid, parsed, verr = self._validate_deepseek_json_response(text)
+-                    max_corr = JSON_API_CONFIG.get("max_corrective_retries", 2)
++                    out = _parse(text)
++                    max_corr = JSON_API_CONFIG.get(
++                        "max_corrective_retries", tp.MAX_CORRECTIVE_RETRIES
++                    )
+                     corr = 0
+-                    while not is_valid and corr < max_corr:
++                    while out.kind == tp.KIND_INVALID and corr < max_corr:
+                         corr += 1
+                         log.warning(
+-                            "JSON response invalid (corrective %d/%d): %s | raw[:200]=%s",
+-                            corr, max_corr, verr, (text or "")[:200],
++                            "Response invalid (corrective %d/%d): %s | raw[:200]=%s",
++                            corr, max_corr, out.error, (text or "")[:200],
+                         )
+-                        if '"tool_calls"' in (text or ""):
+-                            corrective_prompt = (
+-                                "Your previous reply was not valid JSON. Reply with "
+-                                "ONE single line of JSON only, no other text, using "
+-                                "EXACTLY this schema:\n"
+-                                '{"status":"tool_calls","tool_calls":[{"id":'
+-                                '"call_<unique_id>","type":"function","function":'
+-                                '{"name":"<function_name>","arguments":{<args_as_object>}}}]}'
+-                            )
+-                        else:
+-                            corrective_prompt = (
+-                                "Your previous reply was not valid JSON. Reply with "
+-                                "ONE single line of JSON only, no other text, using "
+-                                "EXACTLY this schema:\n"
+-                                '{"status":"success","choices":[{"index":0,"message":'
+-                                '{"role":"assistant","content":"<your full answer>"},'
+-                                '"finish_reason":"stop"}]}'
+-                            )
++                        corrective_prompt = tp.corrective_prompt_for(out)
+                         await asyncio.sleep(ROTATION_CONFIG["retry_delay"])
+                         try:
+                             # Capture pre-send text for virtual-list change detection.
+@@ -1559,35 +1555,26 @@ class BaseAIChatScraper(ABC):
+                         except Exception as corr_exc:  # noqa: BLE001
+                             log.warning("Corrective send failed: %s", corr_exc)
+                             break
+-                        is_valid, parsed, verr = self._validate_deepseek_json_response(text)
++                        out = _parse(text)
+ 
+-                    if not is_valid:
+-                        last_error = f"invalid_json_response: {verr}"
++                    if out.kind == tp.KIND_INVALID:
++                        last_error = f"invalid_response: {out.error}"
+                         log.error(
+-                            "JSON response still invalid after %d corrective tries", corr
++                            "Response still invalid after %d corrective tries", corr
+                         )
+                         retries += 1
+                         await asyncio.sleep(ROTATION_CONFIG["retry_delay"])
+                         continue
+ 
+-                    if parsed.get("status") == "error":
+-                        err_obj = parsed.get("error", {}) or {}
+-                        last_error = err_obj.get("message") or "model returned error envelope"
+-                        log.warning("Model returned error envelope: %s", last_error)
+-                        retries += 1
+-                        await asyncio.sleep(ROTATION_CONFIG["retry_delay"])
+-                        continue
+-
+-                    if parsed.get("status") == "tool_calls":
+-                        tool_calls_list = parsed.get("tool_calls", [])
++                    if out.kind == tp.KIND_TOOL_CALLS:
++                        tool_calls_list = out.tool_calls
+                         finish_reason = "tool_calls"
+                         cleaned = ""
+                         log.info(
+-                            "JSON response: tool_calls (%d call(s))", len(tool_calls_list)
++                            "Response: tool_calls (%d call(s))", len(tool_calls_list)
+                         )
+                     else:
+-                        cleaned = parsed["choices"][0]["message"]["content"]
+-                        finish_reason = parsed["choices"][0].get("finish_reason", "stop")
++                        cleaned = out.text
+                 else:
+                     ok, cleaned = self._validate_response(text)
+                     if not ok:
+diff --git a/scrapers/base_qwen.py b/scrapers/base_qwen.py
+index d028ec0..90519d3 100644
+--- a/scrapers/base_qwen.py
++++ b/scrapers/base_qwen.py
+@@ -54,6 +54,7 @@ from config import (
+     QWEN_AUTH_CONFIG,
+     ROTATION_CONFIG,
+ )
++from scrapers import tool_protocol as tp
+ from scrapers.utils import (
+     AuthStore,
+     contains_any,
+@@ -1080,23 +1081,24 @@ class BaseAIChatScraper(ABC):
+                     await asyncio.sleep(ROTATE_DELAY_S)
+                     continue
+ 
+-                # ── Response validation + retry logic (poin 3) ──────────────────
+-                is_valid, parsed, validation_err = self._validate_qwen_response(response_text)
++                # ── Response parsing + retry logic ──────────────────────────────
++                # Protokol baru (scrapers/tool_protocol.py): jawaban = teks biasa
++                # (tidak ada yang perlu divalidasi); pemanggilan fungsi = blok
++                # @@PAF-CALL:…@@ … @@PAF-END@@ dengan argumen mentah. Hanya blok
++                # pemanggilan yang rusak / jawaban kosong yang memicu koreksi.
++                # Envelope JSON lama tetap dipahami (session lama).
++                _tools = getattr(self, "_tools", None)
++
++                def _parse(text: str) -> "tp.ParsedOutput":
++                    return tp.parse_model_output(
++                        text, tools=_tools,
++                        legacy_validator=self._validate_qwen_response,
++                    )
+ 
+-                if is_valid:
+-                    # Tandai di log kalau response asli sebenarnya broken JSON dan
+-                    # baru valid setelah _repair_unescaped_quotes() menyelamatkannya
+-                    # (mis. Qwen lupa escape tanda kutip di dalam `content`).
+-                    try:
+-                        json.loads(response_text)
+-                    except json.JSONDecodeError:
+-                        self.logger.info(
+-                            "Response diselamatkan oleh repair-fallback (unescaped quotes) "
+-                            "pada attempt %d – tidak perlu retry/rotasi akun",
+-                            attempt,
+-                        )
++                out = _parse(response_text)
+ 
+-                if not is_valid:
++                if out.kind == tp.KIND_INVALID:
++                    validation_err = out.error
+                     self.logger.warning(
+                         "Response tidak valid (attempt %d): %s | raw[:200]=%s",
+                         attempt, validation_err, response_text[:200],
+@@ -1127,28 +1129,7 @@ class BaseAIChatScraper(ABC):
+                         continue
+ 
+                     # Kirim corrective feedback dalam session yang SAMA
+-                    # Deteksi mode berdasarkan raw response: jika mengandung
+-                    # "tool_calls" berarti Qwen mencoba call tool tapi JSON-nya
+-                    # malformed → minta ulang format tool_calls, bukan success.
+-                    if '"tool_calls"' in response_text or '"status":"tool_calls"' in response_text:
+-                        corrective_prompt = (
+-                            "Response JSON kamu tidak valid karena ada karakter yang tidak di-escape "
+-                            "di dalam string (misalnya tanda kutip di dalam command). "
+-                            "Tolong ulangi response tool_calls kamu dengan memastikan semua "
+-                            "karakter spesial di dalam string value di-escape dengan benar "
+-                            "(gunakan \\\" untuk tanda kutip, \\n untuk newline). "
+-                            "Balas HANYA dengan JSON ini tanpa teks lain:\n"
+-                            '{"status":"tool_calls","tool_calls":[{"id":"call_<unique_id>","type":"function",'
+-                            '"function":{"name":"<tool_name>","arguments":{<args_as_valid_json_object>}}}]}'
+-                        )
+-                    else:
+-                        corrective_prompt = (
+-                            "Tolong ulangi response kamu dalam format JSON berikut, "
+-                            "tanpa teks lain di luar JSON:\n"
+-                            '{"status":"success","choices":[{"index":0,'
+-                            '"message":{"role":"assistant","content":"<isi jawaban kamu>"},'
+-                            '"finish_reason":"stop"}]}'
+-                        )
++                    corrective_prompt = tp.corrective_prompt_for(out)
+                     self.logger.info(
+                         "Mengirim corrective feedback (retry %d/%d) dalam session yang sama",
+                         total_retries, HARD_CAP_RETRIES,
+@@ -1168,32 +1149,20 @@ class BaseAIChatScraper(ABC):
+                         attempt -= 1
+                         continue
+ 
+-                    is_valid2, parsed2, validation_err2 = self._validate_qwen_response(response_text)
+-                    if not is_valid2:
++                    out2 = _parse(response_text)
++                    if out2.kind == tp.KIND_INVALID:
+                         self.logger.warning(
+-                            "Corrective response juga tidak valid: %s", validation_err2
++                            "Corrective response juga tidak valid: %s", out2.error
+                         )
+                         attempt -= 1
+                         continue
+-                    try:
+-                        json.loads(response_text)
+-                    except json.JSONDecodeError:
+-                        self.logger.info(
+-                            "Corrective response diselamatkan oleh repair-fallback "
+-                            "(unescaped quotes) pada attempt %d", attempt,
+-                        )
+-
+-                    is_valid = True
+-                    parsed = parsed2
++                    out = out2
+                     self.logger.info("Corrective berhasil – response valid setelah feedback")
+                 # ─────────────────────────────────────────────────────────────────
+ 
+-                # ─────────────────────────────────────────────────────────────────
+-
+-                # ── Extract content atau tool_calls dari parsed JSON ──────────────────
+-                # Jika status "tool_calls" → Qwen minta panggil tool, return sekarang.
+-                if parsed.get("status") == "tool_calls":
+-                    tool_calls_list = parsed.get("tool_calls", [])
++                # ── Hasil: tool_calls (Qwen minta fungsi) atau jawaban final ──────────
++                if out.kind == tp.KIND_TOOL_CALLS:
++                    tool_calls_list = out.tool_calls
+                     self.logger.info(
+                         "Qwen response: tool_calls (%d call(s))", len(tool_calls_list)
+                     )
+@@ -1205,7 +1174,7 @@ class BaseAIChatScraper(ABC):
+                         "usage":         {},
+                         "x_metadata":    {},
+                     }
+-                content_str = parsed["choices"][0]["message"]["content"]
++                content_str = out.text
+ 
+                 # ── tiktoken usage (poin 5) ──────────────────────────────────────
+                 prompt_tokens     = _count_tokens(prompt)
+diff --git a/scrapers/deepseek_scraper.py b/scrapers/deepseek_scraper.py
+index cf46022..acf5b08 100644
+--- a/scrapers/deepseek_scraper.py
++++ b/scrapers/deepseek_scraper.py
+@@ -25,6 +25,7 @@ import json
+ import os
+ 
+ from config import AUTH_CONFIG, DEEPSEEK_CONFIG, BROWSER_CONFIG, ROTATION_CONFIG
++from scrapers import tool_protocol as tp
+ from scrapers.base_deepseek import BaseAIChatScraper
+ from scrapers.utils import get_logger
+ 
+@@ -699,9 +700,13 @@ class DeepSeekScraper(BaseAIChatScraper):
+         # max_tokens, and any client system prompt. Corrective-feedback sends
+         # pass wrap_as_user_request=False (the message is already an
+         # instruction, not a new user request) so they are sent verbatim.
+-        self._tools = tools
+-        self._max_tokens = max_tokens
+-        self._system_prompt = system_prompt
++        # Verbatim sends (corrective feedback / tool results,
++        # wrap_as_user_request=False) must NOT overwrite the per-request context
++        # that the response parser still needs.
++        if wrap_as_user_request:
++            self._tools = tools
++            self._max_tokens = max_tokens
++            self._system_prompt = system_prompt
+         self._last_prompt = prompt
+ 
+         from config import JSON_API_CONFIG  # keep base import-light
+@@ -796,140 +801,130 @@ class DeepSeekScraper(BaseAIChatScraper):
+         next_user_msg: Optional[str] = None,
+     ) -> str:
+         """
+-        Build prompt for Turn 2 (inject tool result into existing DeepSeek conversation).
+-
+-        Format sent to DeepSeek (CONTINUE mode):
+-            [TOOL RESULT]
+-            {"tool_call_id":"call_001","name":"write_file","result":{"success":true}}
+-
+-            [USER REQUEST]
+-            {"continue":true,"model":"account1"}
+-
+-        If next_user_msg is provided (user sends a new message after tool result):
+-            [USER REQUEST]
+-            {"prompt":"now run it","model":"account1"}
++        Build prompt for Turn 2 (inject function results into the existing
++        DeepSeek conversation). Shared protocol: scrapers/tool_protocol.py.
++        Function calls stay allowed on this turn (the model may chain calls).
+         """
+-        account_name = self.account or "deepseek"
+-        parts = ["[TOOL RESULT]"]
+-
+-        for tm in tool_messages:
+-            entry = {
+-                "tool_call_id": tm.get("tool_call_id"),
+-                "name":         tm.get("name"),
+-                "result":       tm.get("content"),
+-            }
+-            parts.append(json.dumps(entry, ensure_ascii=False))
+-
+-        user_request: dict = {"model": account_name}
+-        if next_user_msg:
+-            user_request["prompt"] = next_user_msg
+-        else:
+-            user_request["continue"] = True   # signal: no new user message
+-        if self._max_tokens is not None:
+-            user_request["max_tokens"] = self._max_tokens
+-
+-        parts += ["", "[USER REQUEST]", json.dumps(user_request, ensure_ascii=False)]
+-        return "\n".join(parts)
++        return tp.build_tool_result_prompt(
++            tool_messages, next_user_msg,
++            tools=self._tools,
++            client_system=self._system_prompt,
++            max_tokens=self._max_tokens,
++        )
+ 
+     async def scrape_with_tool_result(
+         self,
+         tool_messages: list[dict],
+         next_user_msg: Optional[str] = None,
++        tools: Optional[list[dict]] = None,
++        max_tokens: Optional[int] = None,
++        system_prompt: Optional[str] = None,
+     ) -> dict:
+         """
+-        Send tool result to DeepSeek in CONTINUE session (Turn 2).
+-        Called by public.py after the client executes a tool locally.
++        Send function results to DeepSeek in the CONTINUE session (Turn 2).
++        Called by public_deepseek.py after the client executed a function.
+ 
+         Args:
+             tool_messages: list of {role:tool, tool_call_id, name, content} dicts
+-            next_user_msg: optional next user message after tool result
++            next_user_msg: optional next user message after the tool result
++            tools / max_tokens / system_prompt: request context re-sent by the
++                client (used to rebuild the function list, validate function
++                names and coerce argument types).
+ 
+         Returns:
+-            dict with finish_reason and possibly tool_calls (if DeepSeek requests
+-            another tool) or response (stop). No corrective loop — if the
+-            response is invalid JSON, returns error immediately (same as Qwen).
++            dict with finish_reason and tool_calls (if DeepSeek requests another
++            function) or text/response (stop). If the reply contains a broken
++            function-call block, a short corrective prompt is sent in the SAME
++            conversation (up to tp.MAX_CORRECTIVE_RETRIES) before giving up.
+         """
+         from config import DEEPSEEK_CONFIG
+-        from datetime import datetime
++
++        # Keep per-request context in locals: send_prompt() must not be able to
++        # clobber it between the builder and the parser below.
++        if tools is not None:
++            self._tools = tools
++        if max_tokens is not None:
++            self._max_tokens = max_tokens
++        if system_prompt is not None:
++            self._system_prompt = system_prompt
++        req_tools = self._tools
+ 
+         prompt = self._build_tool_result_prompt(tool_messages, next_user_msg)
+ 
+-        # ── Send + wait for response (same pattern as scrape()) ──────────── #
+-        # send_prompt() returns a selector string, NOT the response text.
+-        # We must call wait_for_response() separately to get the actual text.
+-        # For CONTINUE mode: capture pre_send_text BEFORE sending so the
+-        # text-change detection knows when the new response arrives.
+-        # ──────────────────────────────────────────────────────────────────── #
+         if self.page is None:
+             await self.launch_browser(self.account)
+ 
+-        pre_send_text = await self._capture_pre_send_text()
+-        initial_response_count = await self._count_response_elements()
++        t = DEEPSEEK_CONFIG["timeouts"]
+ 
+-        # wrap_as_user_request=False: prompt is already a fully structured
+-        # [TOOL RESULT]/[USER REQUEST] envelope — do NOT re-wrap it.
+-        # mode="continue" required: tool result must go to the same session.
+-        await self.send_prompt(
+-            prompt, mode="continue", wrap_as_user_request=False
+-        )
++        async def _send_and_wait(message: str) -> str:
++            # send_prompt() returns a selector string, NOT the response text.
++            # CONTINUE mode: capture the pre-send baseline first so the
++            # text-change detection knows when the new response arrives.
++            pre_send_text = await self._capture_pre_send_text()
++            initial_response_count = await self._count_response_elements()
++            # wrap_as_user_request=False: the message is already fully
++            # structured — do NOT re-wrap it. mode="continue": same session.
++            await self.send_prompt(message, mode="continue", wrap_as_user_request=False)
++            return await self.wait_for_response(
++                response_selectors=self._response_selectors(),
++                timeout=t["response_wait"],
++                stability_secs=t["stability_check"],
++                stability_polls=t["stability_polls"],
++                poll_interval=t["poll_interval"],
++                initial_response_count=initial_response_count,
++                pre_send_text=pre_send_text,
++            )
+ 
+-        t = DEEPSEEK_CONFIG["timeouts"]
+-        text = await self.wait_for_response(
+-            response_selectors=self._response_selectors(),
+-            timeout=t["response_wait"],
+-            stability_secs=t["stability_check"],
+-            stability_polls=t["stability_polls"],
+-            poll_interval=t["poll_interval"],
+-            initial_response_count=initial_response_count,
+-            pre_send_text=pre_send_text,
+-        )
++        def _parse(text: str) -> "tp.ParsedOutput":
++            return tp.parse_model_output(
++                text, tools=req_tools, expect_calls=True,
++                legacy_validator=self._validate_deepseek_json_response,
++            )
+ 
+-        # Validate response — no corrective loop (Qwen pattern).
+-        is_valid, parsed, err = self._validate_deepseek_json_response(text)
+-        if is_valid and parsed:
+-            status = parsed.get("status")
+-            if status == "tool_calls":
+-                return {
+-                    "ok":            True,
+-                    "success":       True,
+-                    "finish_reason": "tool_calls",
+-                    "mode":          "continue",
+-                    "account":       self.account,
+-                    "tool_calls":    parsed.get("tool_calls", []),
+-                }
+-            if status == "success":
+-                content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
+-                return {
+-                    "ok":            True,
+-                    "success":       True,
+-                    "finish_reason": "stop",
+-                    "mode":          "continue",
+-                    "account":       self.account,
+-                    "text":          content,
+-                    "response":      content,
+-                }
+-            if status == "error":
+-                err_obj = parsed.get("error", {}) or {}
+-                return {
+-                    "ok":      False,
+-                    "success": False,
+-                    "mode":    "continue",
+-                    "account": self.account,
+-                    "error":   err_obj.get("message") or "model error envelope",
+-                }
+-        # Invalid JSON — return error immediately, no retry (Qwen pattern)
++        text = await _send_and_wait(prompt)
++        out = _parse(text)
++        corrections = 0
++        while out.kind == tp.KIND_INVALID and corrections < tp.MAX_CORRECTIVE_RETRIES:
++            corrections += 1
++            log.warning(
++                "tool-result reply invalid (corrective %d/%d): %s | raw[:200]=%s",
++                corrections, tp.MAX_CORRECTIVE_RETRIES, out.error, (text or "")[:200],
++            )
++            text = await _send_and_wait(tp.corrective_prompt_for(out))
++            out = _parse(text)
++
++        if out.kind == tp.KIND_TOOL_CALLS:
++            return {
++                "ok":            True,
++                "success":       True,
++                "finish_reason": "tool_calls",
++                "mode":          "continue",
++                "account":       self.account,
++                "tool_calls":    out.tool_calls,
++            }
++        if out.kind == tp.KIND_FINAL:
++            return {
++                "ok":            True,
++                "success":       True,
++                "finish_reason": "stop",
++                "mode":          "continue",
++                "account":       self.account,
++                "text":          out.text,
++                "response":      out.text,
++            }
+         log.warning(
+-            "tool-result JSON invalid: %s | raw[:200]=%s",
+-            err, (text or "")[:200],
++            "tool-result reply still invalid: %s | raw[:200]=%s",
++            out.error, (text or "")[:200],
+         )
+         return {
+             "ok":      False,
+             "success": False,
+             "mode":    "continue",
+             "account": self.account,
+-            "error":   f"Invalid response after tool result: {err}",
++            "error":   f"Invalid response after tool result: {out.error}",
+             "raw":     text,
+         }
++
+     # ------------------------------------------------------------------ #
+     # Attachments — CDP clipboard inject + Ctrl+V (NOT <input type=file>)
+     # ------------------------------------------------------------------ #
+@@ -1141,88 +1136,27 @@ class DeepSeekScraper(BaseAIChatScraper):
+         """
+         Wrap a user prompt into the [SYSTEM CONTEXT] / [USER REQUEST] envelope.
+ 
+-        Plain chat (no tools):
+-            [SYSTEM CONTEXT]
+-            You are operating as a JSON API endpoint ...
+-            (schema for {"status":"success","choices":[...]})
+-
+-            [USER REQUEST]
+-            {"prompt": "...", "model": "<account>"}
+-
+-        Tool calling (tools present):
+-            [SYSTEM CONTEXT]
+-            You are a pure JSON API endpoint ...
+-            AVAILABLE FUNCTIONS: [ ... ]
+-            (schema for tool_calls OR success)
+-
+-            [USER REQUEST]
+-            {"prompt": "...", "model": "<account>", "max_tokens": N}
+-
+-        The wrapper is what makes DeepSeek emit a parseable envelope instead of
+-        free-form markdown. Mirrors qwen_scraper._build_wrapped_prompt.
++        Shared protocol (scrapers/tool_protocol.py), identical for every backend:
++          * Plain chat      → the model answers in plain text (no JSON).
++          * With ``tools``  → plain text unless a function is needed, in which
++                              case the model writes an @@PAF-CALL:<name>@@ …
++                              @@PAF-END@@ block with RAW argument values; the
++                              OpenAI ``tool_calls`` JSON is built in code.
++        A client-supplied system prompt (``system`` messages) is appended to
++        [SYSTEM CONTEXT] verbatim.
++
++        The word "tool" is avoided in the instructions; DeepSeek's own tool
++        registry reacts to it, so "function" is used instead.
+         """
+-        from config import JSON_API_CONFIG
+-
+-        account_name = self.account or "deepseek"
+-        user_request: dict = {"prompt": prompt, "model": account_name}
+-        if self._max_tokens is not None:
+-            user_request["max_tokens"] = self._max_tokens
+-
+-        parts: list[str] = ["[SYSTEM CONTEXT]"]
+-
+-        # Optional client-supplied system prompt is prepended verbatim.
+-        if self._system_prompt:
+-            parts += [self._system_prompt.strip(), ""]
+-
+-        if self._tools:
+-            # ── Tool-calling mode ───────────────────────────────────────
+-            # Avoid the literal word that triggers DeepSeek's internal tool
+-            # registry; describe them as client-side "functions" instead.
+-            tool_names = [
+-                t.get("function", {}).get("name", "")
+-                for t in self._tools
+-                if t.get("function", {}).get("name")
+-            ]
+-            parts += [
+-                "You are a pure JSON API endpoint. You do NOT have any built-in",
+-                "capabilities (no web search, no code execution, no file access,",
+-                "no image generation). You are a stateless text-in / JSON-out",
+-                "processor.",
+-                "",
+-                "The client system has its own external executor that can run",
+-                "the following named functions on your behalf:",
+-                "",
+-                "AVAILABLE FUNCTIONS (client-side, executed externally):",
+-                json.dumps(self._tools, ensure_ascii=False, indent=2),
+-                "",
+-                f"These are the ONLY function names you may request: {tool_names}",
+-                "Do NOT invent or use any other function name.",
+-                "",
+-                "RESPONSE FORMAT — choose exactly ONE, ONE line of JSON only:",
+-                "",
+-                "A) If you need the client to execute a function before you can answer:",
+-                '{"status":"tool_calls","tool_calls":[{"id":"call_<unique_id>",'
+-                '"type":"function","function":{"name":"<function_name>",'
+-                '"arguments":{<args_as_object>}}}]}',
+-                "",
+-                "B) If you have enough information to give a final answer:",
+-                '{"status":"success","choices":[{"index":0,"message":{"role":'
+-                '"assistant","content":"<full_answer>"},"finish_reason":"stop"}]}',
+-                "",
+-                "RULES:",
+-                "- Output ONLY raw JSON. No markdown, no explanation, no extra text.",
+-                "- arguments MUST be a JSON object (dict), NOT a string.",
+-                "- id MUST be unique per call, format: call_<number_or_letters>.",
+-                "- Do NOT add any field outside the schemas above.",
+-                f"- Only use function names from this list: {tool_names}.",
+-            ]
+-        else:
+-            # ── Plain chat mode ─────────────────────────────────────────
+-            parts.append(JSON_API_CONFIG["chat_system_instruction"])
+-
+-        parts += ["", "[USER REQUEST]", json.dumps(user_request, ensure_ascii=False)]
+-        return "\n".join(parts)
++        return tp.build_wrapped_prompt(
++            prompt,
++            tools=self._tools,
++            client_system=self._system_prompt,
++            max_tokens=self._max_tokens,
++        )
+ 
++    # NOTE: kept ONLY as the repair hook for legacy JSON envelopes
++    # (conversations that started under the old JSON protocol).
+     def _validate_deepseek_json_response(
+         self, raw: str
+     ) -> "tuple[bool, dict | None, str]":
+diff --git a/scrapers/grok_scraper.py b/scrapers/grok_scraper.py
+index f6bee35..a924d78 100644
+--- a/scrapers/grok_scraper.py
++++ b/scrapers/grok_scraper.py
+@@ -50,6 +50,7 @@ from typing import Any
+ from playwright.async_api import Page
+ 
+ from config import GROK_AUTH_CONFIG, GROK_CONFIG
++from scrapers import tool_protocol as tp
+ from scrapers.base_grok import BaseAIChatScraper, _count_tokens
+ 
+ SEL = GROK_CONFIG["selectors"]
+@@ -61,6 +62,10 @@ class GrokScraper(BaseAIChatScraper):
+         # Set once a NEW chat has actually been opened / a CONTINUE goto has
+         # landed on a conversation — mirrors DeepSeek/ChatGPT's pattern.
+         self._conversation_started: bool = False
++        # Per-request protocol context (set by scrape()): the function list the
++        # client declared and the advisory max_tokens hint.
++        self._tools: list | None = None
++        self._max_tokens: int | None = None
+ 
+     # ── Small selector-list helpers (pola existing) ─────────────────── #
+ 
+@@ -466,9 +471,28 @@ class GrokScraper(BaseAIChatScraper):
+         mode: str = "new",
+         attachments: list | None = None,
+         continue_url: str | None = None,
++        tools: list | None = None,
++        max_tokens: int | None = None,
++        tool_messages: list | None = None,
++        next_user_msg: str | None = None,
+         **kwargs,
+     ) -> dict:
++        """Run one chat turn.
++
++        Shared protocol (scrapers/tool_protocol.py), same as DeepSeek/Qwen:
++          * the prompt is wrapped in [SYSTEM CONTEXT]/[USER REQUEST];
++          * a normal reply is plain text (cleaned of Grok UI chrome);
++          * a function call is an @@PAF-CALL:<name>@@ … @@PAF-END@@ block,
++            parsed from the RAW text (the UI-cleaning regexes would corrupt
++            argument values: they drop blank lines and trim indentation) and
++            returned as OpenAI ``tool_calls``;
++          * tool_messages (+ optional next_user_msg) = Turn 2: hand function
++            results back to the model in the same conversation (mode must be
++            "continue").
++        """
+         t0 = time.monotonic()
++        self._tools = tools
++        self._max_tokens = max_tokens
+         try:
+             ok = await self.ensure_authenticated()
+             if not ok:
+@@ -482,12 +506,63 @@ class GrokScraper(BaseAIChatScraper):
+                     "status": 401,
+                 }
+ 
++            if tool_messages:
++                outgoing = tp.build_tool_result_prompt(
++                    tool_messages, next_user_msg, tools=tools, max_tokens=max_tokens,
++                )
++            else:
++                outgoing = tp.build_wrapped_prompt(
++                    prompt, tools=tools, max_tokens=max_tokens,
++                )
++
++            def _parse(txt: str) -> "tp.ParsedOutput":
++                return tp.parse_model_output(
++                    txt, tools=tools, expect_calls=bool(tool_messages),
++                )
++
+             response = await self.send_prompt(
+-                prompt, mode=mode, attachments=attachments, continue_url=continue_url,
++                outgoing, mode=mode, attachments=attachments, continue_url=continue_url,
+             )
+-            final_text = await self._extract_response(prompt) or response
+-            canvas_blocks = await self._extract_canvas_blocks()
+-            code_blocks = self.extract_code_blocks(final_text) or None
++            out = _parse(response)
++
++            # Broken function-call block / empty reply → short correction in the
++            # SAME conversation. Needs a real /c/<id> URL to re-enter the thread.
++            corrections = 0
++            while out.kind == tp.KIND_INVALID and corrections < tp.MAX_CORRECTIVE_RETRIES:
++                conv_url = self._page.url if self._page else None
++                if not conv_url or "/c/" not in conv_url:
++                    break
++                corrections += 1
++                self.logger.warning(
++                    "Reply invalid (corrective %d/%d): %s | raw[:200]=%r",
++                    corrections, tp.MAX_CORRECTIVE_RETRIES, out.error, (response or "")[:200],
++                )
++                response = await self.send_prompt(
++                    tp.corrective_prompt_for(out), mode="continue", continue_url=conv_url,
++                )
++                out = _parse(response)
++
++            if out.kind == tp.KIND_INVALID:
++                return {
++                    "ok": False,
++                    "error": f"invalid_response: {out.error}",
++                    "account": self.account,
++                    "raw": (response or "")[:2000],
++                }
++
++            tool_calls = None
++            if out.kind == tp.KIND_TOOL_CALLS:
++                tool_calls = out.tool_calls
++                final_text = ""
++                canvas_blocks: list = []
++                code_blocks = None
++            else:
++                if out.legacy:
++                    final_text = out.text
++                else:
++                    final_text = await self._extract_response(outgoing) or out.text
++                canvas_blocks = await self._extract_canvas_blocks()
++                code_blocks = self.extract_code_blocks(final_text) or None
+ 
+             current_url = self._page.url if self._page else None
+             conversation_id = None
+@@ -496,21 +571,26 @@ class GrokScraper(BaseAIChatScraper):
+                 if m:
+                     conversation_id = m.group(1)
+ 
++            prompt_tokens = _count_tokens(outgoing)
++            completion_tokens = _count_tokens(final_text or response or "")
+             result = {
+                 "ok": True,
++                "finish_reason": "tool_calls" if tool_calls else "stop",
+                 "text": final_text,
+                 "code_blocks": code_blocks,
+                 "canvas": canvas_blocks or None,
+                 "conversation_id": conversation_id,
+                 "usage": {
+-                    "prompt_tokens": _count_tokens(prompt),
+-                    "completion_tokens": _count_tokens(final_text),
++                    "prompt_tokens": prompt_tokens,
++                    "completion_tokens": completion_tokens,
+                 },
+                 "account": self.account,
+                 "conversation_url": current_url,
+                 "mode": mode,
+                 "elapsed": time.monotonic() - t0,
+             }
++            if tool_calls:
++                result["tool_calls"] = tool_calls
+             if canvas_blocks:
+                 try:
+                     self.save_code_files(
+diff --git a/scrapers/qwen_scraper.py b/scrapers/qwen_scraper.py
+index c196768..ca91a68 100644
+--- a/scrapers/qwen_scraper.py
++++ b/scrapers/qwen_scraper.py
+@@ -13,6 +13,7 @@ from pathlib import Path
+ from typing import Literal
+ 
+ from config import QWEN_AUTH_CONFIG, QWEN_CONFIG, ROTATION_CONFIG
++from scrapers import tool_protocol as tp
+ from scrapers.base_qwen import BaseAIChatScraper
+ from scrapers.utils import contains_any, discover_cookie_files
+ 
+@@ -2049,87 +2050,20 @@ class QwenScraper(BaseAIChatScraper):
+         """
+         Bungkus prompt user ke format [SYSTEM CONTEXT] / [USER REQUEST].
+ 
+-        Mode tanpa tools (chat biasa):
+-            [SYSTEM CONTEXT]
+-            You are operating in API mode. Respond ONLY in JSON format as specified.
++        Protokol dibagi bersama semua backend (lihat scrapers/tool_protocol.py):
+ 
+-            [USER REQUEST]
+-            {"prompt": "...", "model": "account1"}
++        * Chat biasa (tanpa tools) → model menjawab TEKS BIASA. Tidak ada JSON.
++        * Dengan tools → model menjawab teks biasa, kecuali perlu memanggil
++          fungsi: ia menulis blok bertanda ``@@PAF-CALL:<nama>@@ ... @@PAF-END@@``
++          dengan nilai argumen mentah (tanpa escaping). JSON ``tool_calls``
++          disusun oleh kode (``json.dumps``), bukan oleh model.
+ 
+-        Mode dengan tools (LLM API + tool calling):
+-            [SYSTEM CONTEXT]
+-            You are a strict JSON LLM API endpoint.
+-
+-            Available tools:
+-            [{"type":"function","function":{"name":"write_file",...}}, ...]
+-
+-            RESPONSE FORMAT RULES:
+-            Rule 1 — Jika perlu memanggil tool:
+-            {"status":"tool_calls","tool_calls":[{"id":"call_<id>","type":"function",
+-             "function":{"name":"<name>","arguments":{...}}}]}
+-
+-            Rule 2 — Jika sudah punya jawaban final:
+-            {"status":"success","choices":[{"index":0,"message":{"role":"assistant",
+-             "content":"<jawaban>"},"finish_reason":"stop"}]}
+-
+-            [USER REQUEST]
+-            {"prompt": "...", "model": "account1", "max_tokens": 2000}
++        PENTING: kata "tool" dihindari di instruksi karena men-trigger mekanisme
++        tool calling internal Qwen UI → dipakai istilah "function".
+         """
+-        account_name = (
+-            self.account or (self._current_cookie_file.stem if self._current_cookie_file else "qwen")
++        return tp.build_wrapped_prompt(
++            prompt, tools=self._tools, max_tokens=self._max_tokens
+         )
+-        user_request: dict = {"prompt": prompt, "model": account_name}
+-        if self._max_tokens is not None:
+-            user_request["max_tokens"] = self._max_tokens
+-
+-        parts = ["[SYSTEM CONTEXT]"]
+-
+-        if self._tools:
+-            # ── Mode: LLM API dengan tool calling ────────────────────────────
+-            # PENTING: hindari kata "tool" di instruksi karena men-trigger
+-            # mekanisme tool calling internal Qwen UI → gunakan "function/command".
+-            tool_names = [
+-                t.get("function", {}).get("name", "")
+-                for t in self._tools
+-                if t.get("function", {}).get("name")
+-            ]
+-            parts += [
+-                "You are a pure JSON API endpoint. You do NOT have any built-in",
+-                "capabilities (no web search, no code execution, no file access,",
+-                "no image generation). You are a stateless text-in/JSON-out processor.",
+-                "",
+-                "The client system has its own external executor that can run the",
+-                "following named functions on your behalf:",
+-                "",
+-                "AVAILABLE FUNCTIONS (client-side, executed externally):",
+-                json.dumps(self._tools, ensure_ascii=False, indent=2),
+-                "",
+-                f"These are the ONLY function names you may request: {tool_names}",
+-                "Do NOT invent or use any other function name.",
+-                "",
+-                "RESPONSE FORMAT — choose exactly ONE:",
+-                "",
+-                "A) If you need the client to execute a function before you can answer:",
+-                '{"status":"tool_calls","tool_calls":[{"id":"call_<unique_id>","type":"function","function":{"name":"<function_name>","arguments":{<args_as_object>}}}]}',
+-                "",
+-                "B) If you have enough information to give a final answer:",
+-                '{"status":"success","choices":[{"index":0,"message":{"role":"assistant","content":"<jawaban_lengkap>"},"finish_reason":"stop"}]}',
+-                "",
+-                "RULES:",
+-                "- Output ONLY raw JSON. No markdown, no explanation, no extra text.",
+-                "- arguments MUST be a JSON object (dict), NOT a string.",
+-                "- id MUST be unique per call, format: call_<number_or_letters>.",
+-                "- Do NOT add any field outside the schemas above.",
+-                f"- Only use function names from this list: {tool_names}",
+-            ]
+-        else:
+-            # ── Mode: chat biasa tanpa tool calling ──────────────────────────
+-            parts.append(
+-                "You are operating in API mode. Respond ONLY in JSON format as specified."
+-            )
+-
+-        parts += ["", "[USER REQUEST]", json.dumps(user_request, ensure_ascii=False)]
+-        return "\n".join(parts)
+ 
+     def _build_tool_result_prompt(
+         self,
+@@ -2137,42 +2071,13 @@ class QwenScraper(BaseAIChatScraper):
+         next_user_msg: str | None = None,
+     ) -> str:
+         """
+-        Bangun prompt untuk Turn 2 (inject tool result ke conversation Qwen yang sama).
+-
+-        Format yang dikirim ke Qwen (CONTINUE mode):
+-            [TOOL RESULT]
+-            {"tool_call_id":"call_001","name":"write_file","result":{"success":true}}
+-
+-            [USER REQUEST]
+-            {"continue":true,"model":"account1"}
+-
+-        Jika ada next_user_msg (user kirim pesan baru setelah tool result):
+-            [USER REQUEST]
+-            {"prompt":"sekarang jalankan","model":"account1"}
++        Bangun prompt untuk Turn 2 (inject hasil fungsi ke conversation Qwen
++        yang sama). Pemanggilan fungsi tetap diizinkan (model boleh merantai).
+         """
+-        account_name = (
+-            self.account or (self._current_cookie_file.stem if self._current_cookie_file else "qwen")
++        return tp.build_tool_result_prompt(
++            tool_messages, next_user_msg,
++            tools=self._tools, max_tokens=self._max_tokens,
+         )
+-        parts = ["[TOOL RESULT]"]
+-
+-        for tm in tool_messages:
+-            entry = {
+-                "tool_call_id": tm.get("tool_call_id"),
+-                "name": tm.get("name"),
+-                "result": tm.get("content"),
+-            }
+-            parts.append(json.dumps(entry, ensure_ascii=False))
+-
+-        user_request: dict = {"model": account_name}
+-        if next_user_msg:
+-            user_request["prompt"] = next_user_msg
+-        else:
+-            user_request["continue"] = True   # sinyal: tidak ada user message baru
+-        if self._max_tokens is not None:
+-            user_request["max_tokens"] = self._max_tokens
+-
+-        parts += ["", "[USER REQUEST]", json.dumps(user_request, ensure_ascii=False)]
+-        return "\n".join(parts)
+ 
+     async def scrape_with_tool_result(
+         self,
+@@ -2180,39 +2085,61 @@ class QwenScraper(BaseAIChatScraper):
+         next_user_msg: str | None = None,
+     ) -> dict:
+         """
+-        Kirim tool result ke Qwen dalam CONTINUE session (Turn 2).
+-        Dipanggil oleh newpublic_BETA.py setelah CLI mengeksekusi tool via MCP.
++        Kirim hasil fungsi ke Qwen dalam CONTINUE session (Turn 2).
++        Dipanggil oleh public_qwen.py setelah klien mengeksekusi fungsi lokal.
+ 
+         Args:
+             tool_messages: list of {role:tool, tool_call_id, name, content} dicts
+             next_user_msg: pesan user berikutnya (opsional), jika ada setelah tool result
+ 
+         Returns:
+-            dict result dari base_scraper.scrape() dengan finish_reason dan
+-            kemungkinan tool_calls (jika Qwen minta tool lagi) atau response (stop).
++            dict dengan finish_reason dan tool_calls (jika Qwen minta fungsi lagi)
++            atau response (stop). Jika blok pemanggilan rusak, dikirim koreksi
++            singkat dalam session yang sama (maks tp.MAX_CORRECTIVE_RETRIES).
+         """
++        from scrapers.base_qwen import BaseAIChatScraper
++
+         prompt = self._build_tool_result_prompt(tool_messages, next_user_msg)
+         # wrap_as_user_request=False karena prompt sudah berformat lengkap
+         # ([TOOL RESULT] / [USER REQUEST]) — tidak perlu dibungkus lagi.
+-        # mode="continue" wajib: tool result harus dikirim ke session yang sama,
+-        # bukan membuka chat baru.
++        # mode="continue" wajib: hasil harus dikirim ke session yang sama.
+         response_text = await self.send_prompt(
+             prompt, mode="continue", wrap_as_user_request=False
+         )
+-        # send_prompt mengembalikan str; bungkus ke dict agar caller bisa .get()
+-        from scrapers.base_qwen import BaseAIChatScraper
+-        is_valid, parsed, err = BaseAIChatScraper._validate_qwen_response(response_text)
+-        if is_valid and parsed:
+-            status = parsed.get("status")
+-            if status == "tool_calls":
+-                return {
+-                    "success": True,
+-                    "finish_reason": "tool_calls",
+-                    "tool_calls": parsed.get("tool_calls", []),
+-                }
+-            content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
+-            return {"success": True, "finish_reason": "stop", "response": content}
+-        return {"success": False, "error": f"Invalid response after tool result: {err}", "raw": response_text}
++
++        def _parse(text: str) -> "tp.ParsedOutput":
++            return tp.parse_model_output(
++                text, tools=self._tools, expect_calls=True,
++                legacy_validator=BaseAIChatScraper._validate_qwen_response,
++            )
++
++        out = _parse(response_text)
++        corrections = 0
++        while out.kind == tp.KIND_INVALID and corrections < tp.MAX_CORRECTIVE_RETRIES:
++            corrections += 1
++            self.logger.warning(
++                "tool-result reply invalid (corrective %d/%d): %s",
++                corrections, tp.MAX_CORRECTIVE_RETRIES, out.error,
++            )
++            response_text = await self.send_prompt(
++                tp.build_corrective_prompt(out.error),
++                mode="continue", wrap_as_user_request=False,
++            )
++            out = _parse(response_text)
++
++        if out.kind == tp.KIND_TOOL_CALLS:
++            return {
++                "success": True,
++                "finish_reason": "tool_calls",
++                "tool_calls": out.tool_calls,
++            }
++        if out.kind == tp.KIND_FINAL:
++            return {"success": True, "finish_reason": "stop", "response": out.text}
++        return {
++            "success": False,
++            "error": f"Invalid response after tool result: {out.error}",
++            "raw": response_text,
++        }
+ 
+     async def send_prompt(
+         self,
+@@ -2226,9 +2153,9 @@ class QwenScraper(BaseAIChatScraper):
+         self._last_prompt = prompt
+ 
+         # Bungkus prompt asli user dengan [SYSTEM CONTEXT]/[USER REQUEST].
+-        # Corrective retry feedback (dari base_scraper._validate_qwen_response
+-        # retry loop) dikirim dengan wrap_as_user_request=False karena pesan
+-        # itu sendiri sudah berupa instruksi sistem, bukan request user baru.
++        # Corrective feedback (retry loop di base_qwen.scrape / tool-result)
++        # dikirim dengan wrap_as_user_request=False karena pesan itu sendiri
++        # sudah berupa instruksi sistem, bukan request user baru.
+         outgoing_prompt = self._build_wrapped_prompt(prompt) if wrap_as_user_request else prompt
+ 
+         effective_think = think_mode or self._think_mode
+diff --git a/scrapers/tool_protocol.py b/scrapers/tool_protocol.py
+new file mode 100644
+index 0000000..d70d2d1
+--- /dev/null
++++ b/scrapers/tool_protocol.py
+@@ -0,0 +1,601 @@
++"""
++scrapers/tool_protocol.py — shared prompt/response protocol for ALL backends
++(DeepSeek, Qwen, Grok).
++
++Why this exists
++---------------
++The backends are browser automation, not native APIs, so two things must be
++emulated through the prompt:
++
++  1. A stable "API mode" system context ([SYSTEM CONTEXT] / [USER REQUEST]).
++  2. OpenAI-style function ("tool") calling.
++
++The old design forced EVERY reply into a JSON envelope, which made the model
++responsible for JSON-escaping long answers (quotes, newlines, code) — the
++main source of "invalid JSON" failures, retries and account rotations.
++
++New design
++----------
++* Plain chat            → the model answers in plain text. Nothing to validate.
++* Function calling      → the model answers in plain text UNLESS it needs the
++                          client to run a function, in which case it emits a
++                          marker block with RAW (unescaped) argument values:
++
++      @@PAF-CALL:write_file@@
++      @@PAF-ARG:path@@
++      main.py
++      @@PAF-ARG:content@@
++      print("raw", 'text')
++      @@PAF-END@@
++
++  This module (not the model) builds the OpenAI ``tool_calls`` JSON with
++  ``json.dumps()``, so escaping can never be wrong.
++
++Marker design notes
++-------------------
++* Markers contain no ``<``/``>`` (a markdown renderer may treat angle
++  brackets as HTML and hide them from ``innerText``) and no markdown-special
++  characters (``_``, ``*``, ``#``, backticks).
++* The model is asked to wrap the block in a 4-backtick fenced code block:
++  rendered markdown preserves newlines/indentation inside ``<pre>``, while a
++  plain paragraph would collapse them.  The parser works with or without the
++  fence and ignores any UI chrome (language label, "Copy") before the block.
++* Legacy JSON envelopes (``{"status": "success" | "tool_calls", ...}``) are
++  still understood, so conversations that began under the old protocol keep
++  working.
++
++This module is pure Python (no browser / network deps) and fully unit-tested
++offline (``tests/test_tool_protocol.py``).
++"""
++from __future__ import annotations
++
++import json
++import re
++import uuid
++from dataclasses import dataclass, field
++from typing import Any, Callable, Optional
++
++# --------------------------------------------------------------------------- #
++# Marker syntax
++# --------------------------------------------------------------------------- #
++CALL_PREFIX = "@@PAF-CALL:"
++ARG_PREFIX = "@@PAF-ARG:"
++END_MARKER = "@@PAF-END@@"
++
++_CALL_RE = re.compile(r"@@PAF-CALL:([^@\s]+)@@")
++_ARG_RE = re.compile(r"@@PAF-ARG:([^@\s]+)@@")
++# Any marker-ish token (used to detect a malformed / truncated block).
++_ANY_MARKER_RE = re.compile(r"@@PAF-(?:CALL:[^@\s]*|ARG:[^@\s]*|END)@@")
++
++_FENCE_LINE_RE = re.compile(r"^\s*(`{3,}|~{3,})[^\n]*$")
++
++# Legacy envelope: {"status":"success"|"tool_calls"|"error", ...}
++_LEGACY_START_RE = re.compile(r'^\{\s*"status"\s*:\s*"(success|tool_calls|error)"')
++
++# In-session corrective retries when a function-call block is unusable.
++MAX_CORRECTIVE_RETRIES = 2
++
++KIND_FINAL = "final"
++KIND_TOOL_CALLS = "tool_calls"
++KIND_INVALID = "invalid"
++
++
++# --------------------------------------------------------------------------- #
++# Result type
++# --------------------------------------------------------------------------- #
++@dataclass
++class ParsedOutput:
++    """Outcome of parsing one raw model reply.
++
++    kind:
++      "final"       → ``text`` is the answer (plain text, as the model wrote it)
++      "tool_calls"  → ``tool_calls`` is an OpenAI-format list
++      "invalid"     → the reply tried to be a function call (or a legacy
++                      envelope) but is unusable; ``error`` says why.  Callers
++                      should send ``build_corrective_prompt(error)`` and retry.
++    """
++    kind: str
++    text: str = ""
++    tool_calls: list = field(default_factory=list)
++    error: str = ""
++    legacy: bool = False  # True when parsed from a legacy JSON envelope
++
++    @property
++    def ok(self) -> bool:
++        return self.kind != KIND_INVALID
++
++
++# --------------------------------------------------------------------------- #
++# Prompt builders
++# --------------------------------------------------------------------------- #
++_BASE_RULE = (
++    "You are operating in API mode. Answer the request directly in plain "
++    "text (markdown is allowed). Do NOT wrap your answer in JSON."
++)
++
++_CALL_FORMAT = (
++    "@@PAF-CALL:<function_name>@@\n"
++    "@@PAF-ARG:<argument_name>@@\n"
++    "<raw value of that argument>\n"
++    "@@PAF-ARG:<another_argument_name>@@\n"
++    "<raw value of that argument>\n"
++    "@@PAF-END@@"
++)
++
++_CALL_EXAMPLE = (
++    "@@PAF-CALL:example_function@@\n"
++    "@@PAF-ARG:path@@\n"
++    "notes/todo.txt\n"
++    "@@PAF-ARG:content@@\n"
++    'He said "hello" and left.\n'
++    "Second line, with a \\ backslash and 'quotes'.\n"
++    "@@PAF-END@@"
++)
++
++
++def tool_names(tools: Optional[list]) -> list[str]:
++    """Function names declared in an OpenAI ``tools`` list."""
++    names: list[str] = []
++    for t in tools or []:
++        fn = t.get("function", {}) if isinstance(t, dict) else {}
++        n = fn.get("name")
++        if n:
++            names.append(n)
++    return names
++
++
++def _call_format_rules() -> list[str]:
++    return [
++        "WHEN YOU NEED THE CLIENT TO RUN A FUNCTION, reply with the block "
++        "below and NOTHING else (no text before or after it). Put the whole "
++        "block inside ONE fenced code block made with FOUR backticks, so it "
++        "is displayed exactly as written:",
++        "",
++        "````",
++        _CALL_FORMAT,
++        "````",
++        "",
++        "Example of the format (illustration only — NOT an available function):",
++        "",
++        "````",
++        _CALL_EXAMPLE,
++        "````",
++        "",
++        "RULES FOR FUNCTION CALLS:",
++        "- Write every argument value RAW, exactly as it should be used. Do "
++        "NOT add quotes around it and do NOT escape quotes, backslashes or "
++        "newlines. Multi-line values (code, files, long text) are fine.",
++        "- Booleans: true / false. Numbers: digits only. For an object or "
++        "array argument, write compact JSON.",
++        "- A function without arguments is just the CALL line followed by "
++        "the END line.",
++        "- To call several functions, put several CALL…END blocks one after "
++        "another inside the same fenced block.",
++        "- If you do NOT need a function, answer normally in plain text and "
++        "do not use any @@PAF markers.",
++    ]
++
++
++def build_system_context(
++    *,
++    tools: Optional[list] = None,
++    expect_calls: bool = False,
++    client_system: Optional[str] = None,
++    max_tokens: Optional[int] = None,
++) -> str:
++    """Build the [SYSTEM CONTEXT] section.
++
++    tools          → full function-calling context (function list + format).
++    expect_calls   → no function list available (e.g. a tool-result turn where
++                     the client did not resend ``tools``) but calls are still
++                     allowed: emit only the call-format reminder.
++    client_system  → optional client-supplied system prompt, appended verbatim.
++    """
++    parts: list[str] = ["[SYSTEM CONTEXT]"]
++
++    if tools:
++        names = tool_names(tools)
++        parts += [
++            _BASE_RULE,
++            "",
++            "You do NOT have any built-in capabilities (no web search, no "
++            "code execution, no file access, no image generation). The "
++            "client has its own external executor that can run the named "
++            "functions below on your behalf.",
++            "",
++            "AVAILABLE FUNCTIONS (client-side, executed externally):",
++            json.dumps(tools, ensure_ascii=False, indent=2),
++            "",
++            f"You may ONLY request these function names: {names}. Do NOT "
++            "invent or use any other function name.",
++            "",
++        ]
++        parts += _call_format_rules()
++    elif expect_calls:
++        parts += [
++            _BASE_RULE,
++            "",
++            "The client may run functions you were given earlier in this "
++            "conversation. Use only those function names.",
++            "",
++        ]
++        parts += _call_format_rules()
++    else:
++        parts.append(_BASE_RULE)
++
++    if max_tokens is not None:
++        parts += ["", f"Keep your answer within roughly {int(max_tokens)} tokens."]
++
++    if client_system and client_system.strip():
++        parts += ["", client_system.strip()]
++
++    return "\n".join(parts)
++
++
++def build_wrapped_prompt(
++    prompt: str,
++    *,
++    tools: Optional[list] = None,
++    client_system: Optional[str] = None,
++    max_tokens: Optional[int] = None,
++) -> str:
++    """[SYSTEM CONTEXT] + [USER REQUEST] envelope for a normal user turn.
++
++    The context is sent on EVERY turn (it is short for plain chat): clients may
++    change ``tools`` between requests, and sessions that began under the old
++    JSON protocol would otherwise never see the new rules.
++    """
++    ctx = build_system_context(
++        tools=tools, client_system=client_system, max_tokens=max_tokens
++    )
++    return f"{ctx}\n\n[USER REQUEST]\n{prompt}"
++
++
++def build_tool_result_prompt(
++    tool_messages: list[dict],
++    next_user_msg: Optional[str] = None,
++    *,
++    tools: Optional[list] = None,
++    client_system: Optional[str] = None,
++    max_tokens: Optional[int] = None,
++) -> str:
++    """Prompt that hands function results back to the model (CONTINUE turn).
++
++    tool_messages: list of ``{tool_call_id, name, content}`` dicts.
++    Function calls remain allowed on this turn (the model may chain calls).
++    """
++    ctx = build_system_context(
++        tools=tools,
++        expect_calls=True,
++        client_system=client_system,
++        max_tokens=max_tokens,
++    )
++    parts: list[str] = [ctx, ""]
++    for tm in tool_messages:
++        content = tm.get("content")
++        if not isinstance(content, str):
++            content = json.dumps(content, ensure_ascii=False)
++        parts += [
++            "[TOOL RESULT]",
++            f"tool_call_id: {tm.get('tool_call_id') or ''}",
++            f"function: {tm.get('name') or ''}",
++            "content:",
++            content,
++            "[END TOOL RESULT]",
++            "",
++        ]
++    parts.append("[USER REQUEST]")
++    parts.append(
++        next_user_msg
++        if next_user_msg
++        else "Continue, using the function result(s) above. Answer the "
++        "original request, or request another function if you still need one."
++    )
++    return "\n".join(parts)
++
++
++def build_corrective_prompt(error: str = "") -> str:
++    """Short in-session correction when a function-call block was unusable."""
++    why = f" Problem: {error}." if error else ""
++    return (
++        "Your previous reply contained a function-call block that could not "
++        f"be parsed.{why}\n"
++        "Reply again with ONLY the corrected block, inside ONE fenced code "
++        "block made with FOUR backticks, in exactly this format (raw values, "
++        "no escaping):\n\n````\n" + _CALL_FORMAT + "\n````\n\n"
++        "If you do not actually need a function, answer in plain text "
++        "without any @@PAF markers."
++    )
++
++
++def corrective_prompt_for(out: "ParsedOutput") -> str:
++    """Pick the right in-session correction for an INVALID ``ParsedOutput``."""
++    err = out.error or ""
++    if err == "empty response" or err.startswith("model returned an error"):
++        return (
++            "Your previous reply was empty or unusable. Please answer the "
++            "last request again in plain text."
++        )
++    return build_corrective_prompt(err)
++
++
++# --------------------------------------------------------------------------- #
++# Parsing
++# --------------------------------------------------------------------------- #
++def _new_call_id() -> str:
++    return "call_" + uuid.uuid4().hex[:12]
++
++
++def _clean_value(raw: str) -> str:
++    """Strip the single newline that separates a marker from its value, keep
++    everything else (indentation, inner blank lines) untouched."""
++    v = raw
++    if v.startswith("\r\n"):
++        v = v[2:]
++    elif v.startswith("\n"):
++        v = v[1:]
++    v = v.rstrip("\r\n")
++    # A closing code fence can sit right before the END marker if the model
++    # closed the fence early; drop a trailing fence-only line.
++    lines = v.split("\n")
++    if lines and _FENCE_LINE_RE.match(lines[-1]) and len(lines) > 1:
++        # only when the fence has no matching opener inside the value
++        fence_count = sum(1 for ln in lines if _FENCE_LINE_RE.match(ln))
++        if fence_count % 2 == 1:
++            lines = lines[:-1]
++            v = "\n".join(lines).rstrip("\r\n")
++    return v
++
++
++def _schema_props(tools: Optional[list], name: str) -> dict:
++    for t in tools or []:
++        fn = t.get("function", {}) if isinstance(t, dict) else {}
++        if fn.get("name") == name:
++            params = fn.get("parameters") or {}
++            props = params.get("properties") if isinstance(params, dict) else None
++            return props if isinstance(props, dict) else {}
++    return {}
++
++
++def _declared_type(prop: Any) -> Optional[str]:
++    if not isinstance(prop, dict):
++        return None
++    t = prop.get("type")
++    if isinstance(t, list):
++        t = next((x for x in t if x != "null"), None)
++    return t if isinstance(t, str) else None
++
++
++def _coerce(value: str, declared: Optional[str]) -> Any:
++    """Convert a raw string to the type the function schema declares."""
++    if declared in (None, "string"):
++        return value
++    s = value.strip()
++    try:
++        if declared in ("integer", "number"):
++            try:
++                return int(s)
++            except ValueError:
++                f = float(s)
++                if declared == "integer" and f.is_integer():
++                    return int(f)
++                return f
++        if declared == "boolean":
++            low = s.lower()
++            if low in ("true", "yes", "1"):
++                return True
++            if low in ("false", "no", "0"):
++                return False
++            return value
++        if declared in ("object", "array"):
++            return json.loads(s)
++        if declared == "null":
++            return None
++    except (ValueError, json.JSONDecodeError):
++        return value
++    return value
++
++
++def _parse_call_blocks(
++    text: str, tools: Optional[list]
++) -> "tuple[list, str]":
++    """Parse every @@PAF-CALL … @@PAF-END@@ block. Returns (calls, error)."""
++    calls: list = []
++    pos = 0
++    allowed = tool_names(tools)
++
++    while True:
++        m = _CALL_RE.search(text, pos)
++        if not m:
++            break
++        fn_name = m.group(1)
++        end_idx = text.find(END_MARKER, m.end())
++        if end_idx == -1:
++            return [], (
++                f"function-call block for '{fn_name}' is not terminated "
++                f"(missing {END_MARKER})"
++            )
++        body = text[m.end():end_idx]
++        pos = end_idx + len(END_MARKER)
++
++        if allowed and fn_name not in allowed:
++            return [], f"unknown function '{fn_name}'; allowed: {allowed}"
++
++        props = _schema_props(tools, fn_name)
++        args: dict = {}
++        arg_matches = list(_ARG_RE.finditer(body))
++        if arg_matches:
++            for i, am in enumerate(arg_matches):
++                start = am.end()
++                stop = arg_matches[i + 1].start() if i + 1 < len(arg_matches) else len(body)
++                value = _clean_value(body[start:stop])
++                args[am.group(1)] = _coerce(value, _declared_type(props.get(am.group(1))))
++        else:
++            # Tolerate a bare JSON object as the body: {"city": "Jakarta"}
++            stripped = _strip_fence_lines(body).strip()
++            if stripped:
++                try:
++                    obj = json.loads(stripped)
++                except json.JSONDecodeError:
++                    return [], (
++                        f"function-call block for '{fn_name}' has a body "
++                        "but no @@PAF-ARG:<name>@@ markers"
++                    )
++                if not isinstance(obj, dict):
++                    return [], f"arguments for '{fn_name}' are not an object"
++                args = obj
++
++        calls.append(
++            {
++                "id": _new_call_id(),
++                "type": "function",
++                "function": {
++                    "name": fn_name,
++                    "arguments": json.dumps(args, ensure_ascii=False),
++                },
++            }
++        )
++
++    if not calls:
++        return [], "no complete function-call block found"
++    return calls, ""
++
++
++def _strip_fence_lines(text: str) -> str:
++    return "\n".join(
++        ln for ln in text.split("\n") if not _FENCE_LINE_RE.match(ln)
++    )
++
++
++def _strip_json_fences(text: str) -> str:
++    t = text.strip()
++    if t.startswith("```"):
++        nl = t.find("\n")
++        if nl != -1:
++            t = t[nl + 1:]
++        if t.rstrip().endswith("```"):
++            t = t.rstrip()[:-3]
++    return t.strip()
++
++
++def _normalize_legacy_tool_calls(tcs: list) -> list:
++    """Legacy envelope → OpenAI shape (arguments as JSON string, ids set)."""
++    out = []
++    for tc in tcs:
++        if not isinstance(tc, dict):
++            continue
++        fn = tc.get("function")
++        if not isinstance(fn, dict):
++            continue
++        args = fn.get("arguments")
++        if isinstance(args, dict):
++            fn["arguments"] = json.dumps(args, ensure_ascii=False)
++        elif args is None:
++            fn["arguments"] = "{}"
++        tc.setdefault("type", "function")
++        if not tc.get("id"):
++            tc["id"] = _new_call_id()
++        out.append(tc)
++    return out
++
++
++def _parse_legacy(
++    text: str,
++    tools_enabled: bool,
++    legacy_validator: Optional[Callable[[str], "tuple[bool, Optional[dict], str]"]],
++) -> Optional[ParsedOutput]:
++    """Understand the old JSON envelope. Returns None if ``text`` is not one."""
++    candidate = _strip_json_fences(text)
++    if not _LEGACY_START_RE.match(candidate):
++        return None
++
++    data: Optional[dict] = None
++    err = ""
++    try:
++        parsed = json.loads(candidate)
++        data = parsed if isinstance(parsed, dict) else None
++    except json.JSONDecodeError as exc:
++        err = str(exc)
++        if legacy_validator is not None:
++            try:
++                ok, parsed_dict, verr = legacy_validator(text)
++            except Exception as exc2:  # noqa: BLE001
++                ok, parsed_dict, verr = False, None, str(exc2)
++            if ok and isinstance(parsed_dict, dict):
++                data = parsed_dict
++            else:
++                err = verr or err
++
++    if data is None:
++        # Broken legacy JSON. A broken tool_calls envelope is retryable; a
++        # broken "success" envelope is returned as-is rather than failing chat.
++        if tools_enabled and '"tool_calls"' in candidate:
++            return ParsedOutput(
++                KIND_INVALID,
++                error=f"legacy JSON envelope could not be parsed: {err}",
++                legacy=True,
++            )
++        return ParsedOutput(KIND_FINAL, text=text.strip(), legacy=True)
++
++    status = data.get("status")
++    if status == "tool_calls":
++        tcs = data.get("tool_calls")
++        if isinstance(tcs, list) and tcs:
++            norm = _normalize_legacy_tool_calls(tcs)
++            if norm:
++                return ParsedOutput(KIND_TOOL_CALLS, tool_calls=norm, legacy=True)
++        return ParsedOutput(
++            KIND_INVALID, error="status=tool_calls but tool_calls missing/empty",
++            legacy=True,
++        )
++    if status == "success":
++        choices = data.get("choices")
++        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
++            msg = choices[0].get("message")
++            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
++                return ParsedOutput(KIND_FINAL, text=msg["content"], legacy=True)
++        # Looks like a user-requested JSON that merely has status=success.
++        return None
++    if status == "error":
++        err_obj = data.get("error") or {}
++        msg = err_obj.get("message") if isinstance(err_obj, dict) else None
++        return ParsedOutput(
++            KIND_INVALID,
++            error=msg or "model returned an error envelope",
++            legacy=True,
++        )
++    return None
++
++
++def parse_model_output(
++    raw: str,
++    *,
++    tools: Optional[list] = None,
++    expect_calls: bool = False,
++    legacy_validator: Optional[Callable[[str], "tuple[bool, Optional[dict], str]"]] = None,
++) -> ParsedOutput:
++    """Classify a raw model reply.
++
++    tools / expect_calls  → whether @@PAF-CALL blocks are interpreted at all.
++                            With neither, markers in the text are just text.
++    legacy_validator      → optional ``raw -> (ok, dict, err)`` used to repair a
++                            broken legacy JSON envelope (DeepSeek/Qwen helpers).
++    """
++    if raw is None or not raw.strip():
++        return ParsedOutput(KIND_INVALID, error="empty response")
++
++    text = raw.strip()
++    calls_enabled = bool(tools) or expect_calls
++
++    if calls_enabled:
++        if _ANY_MARKER_RE.search(text):
++            calls, err = _parse_call_blocks(text, tools)
++            if calls:
++                return ParsedOutput(KIND_TOOL_CALLS, tool_calls=calls)
++            return ParsedOutput(KIND_INVALID, error=err)
++
++    legacy = _parse_legacy(text, calls_enabled, legacy_validator)
++    if legacy is not None:
++        return legacy
++
++    return ParsedOutput(KIND_FINAL, text=text)
+diff --git a/tests/test_grok_tools_e2e.py b/tests/test_grok_tools_e2e.py
+new file mode 100644
+index 0000000..f3110c6
+--- /dev/null
++++ b/tests/test_grok_tools_e2e.py
+@@ -0,0 +1,142 @@
++"""
++Loopback e2e: Grok function calling through the REAL gateway (uvicorn +
++vps_server) with a fake Grok worker over WebSocket.
++
++Verifies the gateway now forwards `tools` and (on the Turn-2 request)
++`tool_messages` to the Grok worker, and maps a worker `tool_calls` result to an
++OpenAI-style response (`finish_reason: "tool_calls"`, `content: null`).
++
++Run: python3 tests/test_grok_tools_e2e.py
++"""
++import asyncio
++import json
++import os
++import sys
++import threading
++import time
++
++API_TOKEN = "paf_test_token_for_grok_tools_e2e_0123456789"
++os.environ["PAF_API_TOKEN"] = API_TOKEN  # must be set BEFORE importing vps_server
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "PublicForward", "ForVPS"))
++
++import httpx  # noqa: E402
++import uvicorn  # noqa: E402
++import websockets  # noqa: E402
++import vps_server as V  # noqa: E402
++
++HOST, PORT = "127.0.0.1", 8098
++BASE_HTTP = f"http://{HOST}:{PORT}"
++BASE_WS = f"ws://{HOST}:{PORT}/ws/worker"
++AUTH = {"Authorization": f"Bearer {API_TOKEN}"}
++
++TOOLS = [{"type": "function", "function": {
++    "name": "write_file", "description": "Write a file",
++    "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}}]
++
++TOOL_CALLS = [{"id": "call_abc123", "type": "function",
++               "function": {"name": "write_file",
++                            "arguments": json.dumps({"path": "a.txt", "content": 'He said "hi"\nline2'})}}]
++
++
++def fields_of(task: dict) -> dict:
++    """The task fields may sit at the top level or under a sub-key."""
++    for key in ("request", "payload", "fields", "task_fields"):
++        if isinstance(task.get(key), dict):
++            return {**task, **task[key]}
++    return task
++
++
++async def main() -> None:
++    async with websockets.connect(BASE_WS) as ws:
++        await ws.send(json.dumps({"type": "register", "backend": "grok", "token": "change-me",
++                                  "hostname": "w", "max_concurrent": 1, "accounts": ["account1"]}))
++        ack = json.loads(await ws.recv())
++        assert ack["type"] == "registered", ack
++
++        async with httpx.AsyncClient(base_url=BASE_HTTP, timeout=30, headers=AUTH) as client:
++            # ── Turn A: client declares tools, model requests a function ──
++            post = asyncio.create_task(client.post("/v1/chat/completions", json={
++                "model": "grok",
++                "messages": [{"role": "user", "content": "tulis file a.txt"}],
++                "tools": TOOLS,
++            }))
++            task = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
++            f = fields_of(task)
++            assert f.get("tools") and f["tools"][0]["function"]["name"] == "write_file", f"tools not forwarded: {task}"
++            assert not f.get("tool_messages"), f
++            assert f.get("mode") == "new", f
++            tid = task.get("task_id") or task.get("request_id")
++            await ws.send(json.dumps({"type": "result", "task_id": tid, "result": {
++                "ok": True, "finish_reason": "tool_calls", "text": "", "tool_calls": TOOL_CALLS,
++                "account": "account1", "conversation_url": "https://grok.com/c/abc",
++                "usage": {"prompt_tokens": 10, "completion_tokens": 5}}}))
++            r = await post
++            assert r.status_code == 200, (r.status_code, r.text)
++            body = r.json()
++            choice = body["choices"][0]
++            assert choice["finish_reason"] == "tool_calls", body
++            assert choice["message"]["content"] is None, body
++            assert choice["message"]["tool_calls"] == TOOL_CALLS, body
++            sid = r.headers["x-session-id"]
++            print("ok   Turn A: tools forwarded; response is finish_reason=tool_calls with OpenAI tool_calls")
++
++            # ── Turn B: client returns the function result in the same session ──
++            post = asyncio.create_task(client.post(
++                "/v1/chat/completions",
++                headers={**AUTH, "X-Session-ID": sid},
++                json={
++                    "model": "grok",
++                    "messages": [
++                        {"role": "user", "content": "tulis file a.txt"},
++                        {"role": "assistant", "content": None, "tool_calls": TOOL_CALLS},
++                        {"role": "tool", "tool_call_id": "call_abc123", "name": "write_file",
++                         "content": json.dumps({"ok": True})},
++                    ],
++                    "tools": TOOLS,
++                }))
++            task = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
++            f = fields_of(task)
++            assert f.get("mode") == "continue", f
++            tm = f.get("tool_messages")
++            assert tm and tm[0]["tool_call_id"] == "call_abc123" and tm[0]["name"] == "write_file" \
++                and json.loads(tm[0]["content"]) == {"ok": True}, f"tool_messages not forwarded: {f}"
++            assert f.get("tools"), f
++            tid = task.get("task_id") or task.get("request_id")
++            await ws.send(json.dumps({"type": "result", "task_id": tid, "result": {
++                "ok": True, "finish_reason": "stop", "text": "File a.txt sudah ditulis.",
++                "account": "account1", "conversation_url": "https://grok.com/c/abc",
++                "usage": {"prompt_tokens": 12, "completion_tokens": 6}}}))
++            r = await post
++            assert r.status_code == 200, (r.status_code, r.text)
++            choice = r.json()["choices"][0]
++            assert choice["finish_reason"] == "stop" and choice["message"]["content"] == "File a.txt sudah ditulis.", r.text
++            print("ok   Turn B: tool_messages forwarded in CONTINUE mode; final answer is finish_reason=stop")
++
++            # ── Plain chat (no tools) is unaffected ──
++            post = asyncio.create_task(client.post("/v1/chat/completions", json={
++                "model": "grok", "messages": [{"role": "user", "content": "halo"}]}))
++            task = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
++            f = fields_of(task)
++            assert not f.get("tools") and not f.get("tool_messages"), f
++            tid = task.get("task_id") or task.get("request_id")
++            await ws.send(json.dumps({"type": "result", "task_id": tid, "result": {
++                "ok": True, "text": "halo juga", "account": "account1",
++                "conversation_url": "https://grok.com/c/xyz", "usage": {}}}))
++            r = await post
++            choice = r.json()["choices"][0]
++            assert choice["finish_reason"] == "stop" and choice["message"]["content"] == "halo juga", r.text
++            print("ok   plain chat unaffected (no tools / tool_messages sent)")
++
++    print("\nGROK TOOLS E2E PASSED")
++
++
++if __name__ == "__main__":
++    config = uvicorn.Config(V.app, host=HOST, port=PORT, log_level="error")
++    server = uvicorn.Server(config)
++    th = threading.Thread(target=server.run, daemon=True)
++    th.start()
++    for _ in range(100):
++        if server.started:
++            break
++        time.sleep(0.1)
++    asyncio.run(main())
+diff --git a/tests/test_protocol_scrapers.py b/tests/test_protocol_scrapers.py
+new file mode 100644
+index 0000000..2b6852b
+--- /dev/null
++++ b/tests/test_protocol_scrapers.py
+@@ -0,0 +1,337 @@
++"""
++Offline integration tests: the REAL scrape() / scrape_with_tool_result() loops of
++the Grok, DeepSeek and Qwen scrapers, with the browser replaced by scripted
++stubs (no Playwright launch, no network). Verifies that every backend:
++
++  * wraps prompts with the shared [SYSTEM CONTEXT]/[USER REQUEST] envelope,
++  * returns plain-text answers untouched (no JSON requirement),
++  * turns @@PAF-CALL blocks into OpenAI tool_calls with byte-exact arguments,
++  * sends a short corrective prompt for broken blocks, then gives up cleanly,
++  * hands tool results back in a CONTINUE turn.
++
++NOTE: this cannot prove how the live sites render the model's output; it proves
++the plumbing around it. See tests/_manual_* for live checks.
++
++Run: python3 tests/test_protocol_scrapers.py
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++# Make retry sleeps instant.
++_real_sleep = asyncio.sleep
++
++
++async def _fast_sleep(_delay, *a, **k):
++    await _real_sleep(0)
++
++
++asyncio.sleep = _fast_sleep  # type: ignore[assignment]
++
++from scrapers import tool_protocol as tp  # noqa: E402
++from scrapers.deepseek_scraper import DeepSeekScraper  # noqa: E402
++from scrapers.grok_scraper import GrokScraper  # noqa: E402
++from scrapers.qwen_scraper import QwenScraper  # noqa: E402
++
++TOOLS = [
++    {"type": "function", "function": {
++        "name": "write_file", "description": "Write a file",
++        "parameters": {"type": "object", "properties": {
++            "path": {"type": "string"}, "content": {"type": "string"},
++            "retries": {"type": "integer"}}}}},
++]
++
++NASTY = 'say "hi" and \'bye\'\n    indented\\path C:\\x\n\n{"k": 1}\n# heading-like\n- bullet-like'
++GOOD_BLOCK = (
++    "````\n@@PAF-CALL:write_file@@\n@@PAF-ARG:path@@\na.py\n"
++    "@@PAF-ARG:content@@\n" + NASTY + "\n@@PAF-ARG:retries@@\n3\n@@PAF-END@@\n````"
++)
++BROKEN_BLOCK = "@@PAF-CALL:write_file@@\n@@PAF-ARG:path@@\na.py\n"  # no END
++
++_passed = 0
++
++
++def check(name: str, cond: bool, detail: str = "") -> None:
++    global _passed
++    if not cond:
++        print(f"FAIL: {name} {detail}")
++        raise SystemExit(1)
++    _passed += 1
++    print(f"ok   {name}")
++
++
++def run(coro):
++    return asyncio.get_event_loop_policy().new_event_loop().run_until_complete(coro)
++
++
++def args_of(tc):
++    return json.loads(tc["function"]["arguments"])
++
++
++async def _noop(*a, **k):
++    return None
++
++
++# =========================================================================== #
++# GROK
++# =========================================================================== #
++class _Page:
++    url = "https://grok.com/c/abc-123"
++
++
++def make_grok(replies: list[str]):
++    g = GrokScraper.__new__(GrokScraper)
++    g.account = "acc1"
++    g._tools = None
++    g._max_tokens = None
++    g.logger = logging.getLogger("grok-test")
++    g._page = _Page()
++    g.sent = []
++    g.cleaned_calls = 0
++
++    async def ensure_authenticated():
++        return True
++
++    async def send_prompt(prompt, mode="new", **kw):
++        g.sent.append((prompt, mode, kw))
++        return replies.pop(0)
++
++    async def _extract_response(prompt):
++        g.cleaned_calls += 1
++        return "CLEANED:" + "plain"
++
++    async def _extract_canvas_blocks():
++        return []
++
++    g.ensure_authenticated = ensure_authenticated
++    g.send_prompt = send_prompt
++    g._extract_response = _extract_response
++    g._extract_canvas_blocks = _extract_canvas_blocks
++    g.save_to_json = lambda r: None
++    g.take_debug_screenshot = _noop
++    return g
++
++
++g = make_grok(["Halo dunia"])
++r = run(g.scrape("apa kabar?"))
++check("grok: plain chat ok", r["ok"] and r["finish_reason"] == "stop" and "tool_calls" not in r)
++check("grok: plain chat text goes through the UI cleaner", r["text"] == "CLEANED:plain" and g.cleaned_calls == 1)
++check("grok: prompt wrapped with SYSTEM CONTEXT / USER REQUEST",
++      g.sent[0][0].startswith("[SYSTEM CONTEXT]") and "[USER REQUEST]\napa kabar?" in g.sent[0][0]
++      and "JSON" in g.sent[0][0] and '"status"' not in g.sent[0][0])
++check("grok: usage counted on the outgoing prompt", r["usage"]["prompt_tokens"] > 5)
++
++g = make_grok([GOOD_BLOCK])
++
++
++async def _boom(prompt):
++    raise AssertionError("UI cleaner must NOT run on a tool call (it would corrupt arguments)")
++
++
++g._extract_response = _boom
++r = run(g.scrape("tulis file", tools=TOOLS))
++check("grok: tool call -> finish_reason tool_calls", r["ok"] and r["finish_reason"] == "tool_calls" and r["text"] == "")
++a = args_of(r["tool_calls"][0])
++check("grok: arguments byte-exact (quotes/backslashes/blank lines/markdown)", a["content"] == NASTY, repr(a))
++check("grok: schema coercion int", a["retries"] == 3 and a["path"] == "a.py")
++check("grok: tools listed in prompt", "write_file" in g.sent[0][0] and "@@PAF-CALL:" in g.sent[0][0])
++
++g = make_grok([BROKEN_BLOCK, GOOD_BLOCK])
++g._extract_response = _boom
++r = run(g.scrape("tulis file", tools=TOOLS))
++check("grok: corrective retry recovers", r["ok"] and r["finish_reason"] == "tool_calls" and len(g.sent) == 2)
++check("grok: corrective is sent as CONTINUE on the same /c/ URL",
++      g.sent[1][1] == "continue" and g.sent[1][2].get("continue_url") == _Page.url
++      and "could not be parsed" in g.sent[1][0] and "[SYSTEM CONTEXT]" not in g.sent[1][0])
++
++g = make_grok([BROKEN_BLOCK, BROKEN_BLOCK, BROKEN_BLOCK])
++r = run(g.scrape("tulis file", tools=TOOLS))
++check("grok: gives up after MAX_CORRECTIVE_RETRIES", (not r["ok"]) and "invalid_response" in r["error"]
++      and len(g.sent) == 1 + tp.MAX_CORRECTIVE_RETRIES)
++
++g = make_grok(["Hasilnya 29C, cerah."])
++msgs = [{"role": "tool", "tool_call_id": "call_1", "name": "write_file", "content": '{"ok": true}'}]
++r = run(g.scrape("x", mode="continue", continue_url=_Page.url, tools=TOOLS, tool_messages=msgs))
++check("grok: tool-result turn is a CONTINUE with [TOOL RESULT]",
++      g.sent[0][1] == "continue" and "[TOOL RESULT]" in g.sent[0][0] and "tool_call_id: call_1" in g.sent[0][0])
++check("grok: tool-result turn yields final answer", r["ok"] and r["finish_reason"] == "stop")
++
++legacy = json.dumps({"status": "success", "choices": [{"index": 0, "message": {"role": "assistant", "content": "jawaban lama"}}]})
++g = make_grok([legacy])
++r = run(g.scrape("x"))
++check("grok: legacy JSON envelope from an old session is unwrapped", r["ok"] and r["text"] == "jawaban lama")
++
++# =========================================================================== #
++# DEEPSEEK
++# =========================================================================== #
++def make_deepseek(replies: list[str]):
++    d = DeepSeekScraper.__new__(DeepSeekScraper)
++    d.account = "ds1"
++    d._tools = None
++    d._max_tokens = None
++    d._system_prompt = None
++    d._last_prompt = None
++    d.page = object()
++    d._account_index = 0
++    d._browser_restarts = 0
++    d.sent = []
++
++    async def launch_browser(*a, **k): return None
++    async def _is_page_crashed(): return False
++    async def ensure_authenticated(): return True
++    async def _capture_pre_send_text(): return ""
++    async def _count_response_elements(): return {}
++    async def is_rate_limited(): return False
++
++    async def send_prompt(prompt, mode="new", **kw):
++        d.sent.append((prompt, mode, kw))
++        return "sel"
++
++    async def wait_for_response(**kw):
++        return replies.pop(0)
++
++    d.launch_browser = launch_browser
++    d._is_page_crashed = _is_page_crashed
++    d.ensure_authenticated = ensure_authenticated
++    d._capture_pre_send_text = _capture_pre_send_text
++    d._count_response_elements = _count_response_elements
++    d.is_rate_limited = is_rate_limited
++    d.send_prompt = send_prompt
++    d.wait_for_response = wait_for_response
++    d._response_selectors = lambda: ["x"]
++    d.take_debug_screenshot = _noop
++    d._profile_dir_for = lambda a: "/tmp/p"
++    return d
++
++
++d = make_deepseek([])
++d._tools = TOOLS
++d._system_prompt = "Jawab singkat."
++p = d._build_wrapped_prompt("halo")
++check("deepseek: wrapper uses shared protocol + client system prompt",
++      "[SYSTEM CONTEXT]" in p and "@@PAF-CALL:" in p and "Jawab singkat." in p and p.endswith("[USER REQUEST]\nhalo"))
++
++d = make_deepseek(["Jawaban biasa dengan \"kutip\" dan\nbaris baru."])
++r = run(d.scrape("halo", mode="new"))
++check("deepseek: plain chat ok, text untouched",
++      r["ok"] and r["text"] == 'Jawaban biasa dengan "kutip" dan\nbaris baru.' and r["finish_reason"] == "stop" and len(d.sent) == 1)
++
++d = make_deepseek([GOOD_BLOCK])
++r = run(d.scrape("tulis", mode="new", tools=TOOLS))
++check("deepseek: tool call parsed", r["ok"] and r["finish_reason"] == "tool_calls" and r["text"] == "")
++check("deepseek: arguments byte-exact", args_of(r["tool_calls"][0])["content"] == NASTY)
++
++d = make_deepseek([BROKEN_BLOCK, GOOD_BLOCK])
++r = run(d.scrape("tulis", mode="new", tools=TOOLS))
++check("deepseek: corrective retry recovers",
++      r["ok"] and r["finish_reason"] == "tool_calls" and len(d.sent) == 2
++      and d.sent[1][1] == "continue" and d.sent[1][2].get("wrap_as_user_request") is False)
++
++d = make_deepseek([""] + ["Setelah dikoreksi: halo"])
++r = run(d.scrape("halo", mode="new"))
++check("deepseek: empty reply -> neutral corrective, then ok",
++      r["ok"] and r["text"].startswith("Setelah dikoreksi") and "empty or unusable" in d.sent[1][0])
++
++d = make_deepseek([GOOD_BLOCK])
++msgs = [{"role": "tool", "tool_call_id": "call_1", "name": "write_file", "content": "done"}]
++d = make_deepseek(["Selesai, file ditulis."])
++r = run(d.scrape_with_tool_result(msgs, None, tools=TOOLS))
++check("deepseek: tool-result turn -> final text", r["ok"] and r["finish_reason"] == "stop" and r["text"] == "Selesai, file ditulis.")
++check("deepseek: tool-result prompt is CONTINUE + verbatim",
++      d.sent[0][1] == "continue" and d.sent[0][2].get("wrap_as_user_request") is False and "[TOOL RESULT]" in d.sent[0][0])
++
++d = make_deepseek([BROKEN_BLOCK, "@@PAF-CALL:write_file@@\n@@PAF-ARG:path@@\nb.py\n@@PAF-ARG:retries@@\n2\n@@PAF-END@@"])
++r = run(d.scrape_with_tool_result(msgs, None, tools=TOOLS))
++check("deepseek: tool-result turn can chain another call (with corrective)",
++      r["ok"] and r["finish_reason"] == "tool_calls" and args_of(r["tool_calls"][0])["retries"] == 2 and len(d.sent) == 2)
++
++d = make_deepseek([BROKEN_BLOCK] * 3)
++r = run(d.scrape_with_tool_result(msgs, None, tools=TOOLS))
++check("deepseek: tool-result turn gives up cleanly", (not r["ok"]) and "Invalid response after tool result" in r["error"])
++
++# =========================================================================== #
++# QWEN
++# =========================================================================== #
++def make_qwen(replies: list[str]):
++    q = QwenScraper.__new__(QwenScraper)
++    q.account = None
++    q._tools = None
++    q._max_tokens = None
++    q._think_mode = None
++    q._persistent_mode = True
++    q._cookie_files = []
++    q._cookie_index = 0
++    q.cookies_path = None
++    q.logger = logging.getLogger("qwen-test")
++    q.sent = []
++
++    async def _is_page_crashed(): return False
++    async def is_session_expired(): return False
++
++    async def send_prompt(prompt, mode="new", **kw):
++        q.sent.append((prompt, mode, kw))
++        return replies.pop(0)
++
++    q._is_page_crashed = _is_page_crashed
++    q.is_session_expired = is_session_expired
++    q.send_prompt = send_prompt
++    q._extra_send_kwargs = lambda: {}
++    q.take_debug_screenshot = _noop
++    return q
++
++
++q = make_qwen([])
++q._tools = TOOLS
++p = q._build_wrapped_prompt("halo")
++check("qwen: wrapper uses shared protocol", "[SYSTEM CONTEXT]" in p and "@@PAF-CALL:" in p and p.endswith("[USER REQUEST]\nhalo"))
++q._tools = None
++p = q._build_wrapped_prompt("halo")
++check("qwen: plain wrapper has no JSON demand", "Do NOT wrap your answer in JSON" in p and '"status"' not in p)
++
++q = make_qwen(["Ini jawaban biasa.\n```python\nprint(\"x\")\n```"])
++r = run(q.scrape("halo", mode="new"))
++check("qwen: plain chat ok, untouched", r["success"] and r["response"] == 'Ini jawaban biasa.\n```python\nprint("x")\n```'
++      and r["finish_reason"] == "stop" and len(q.sent) == 1)
++
++q = make_qwen([GOOD_BLOCK])
++q._tools = TOOLS
++r = run(q.scrape("tulis", mode="new"))
++check("qwen: tool call parsed", r["success"] and r["finish_reason"] == "tool_calls" and r["response"] is None)
++check("qwen: arguments byte-exact + JSON string (OpenAI shape)",
++      args_of(r["tool_calls"][0])["content"] == NASTY and isinstance(r["tool_calls"][0]["function"]["arguments"], str))
++
++q = make_qwen([BROKEN_BLOCK, GOOD_BLOCK])
++q._tools = TOOLS
++r = run(q.scrape("tulis", mode="new"))
++check("qwen: corrective retry recovers in the same session",
++      r["success"] and r["finish_reason"] == "tool_calls" and len(q.sent) == 2
++      and q.sent[1][1] == "continue" and q.sent[1][2].get("wrap_as_user_request") is False)
++
++q = make_qwen([legacy])
++r = run(q.scrape("x", mode="new"))
++check("qwen: legacy JSON envelope unwrapped", r["success"] and r["response"] == "jawaban lama")
++
++msgs = [{"role": "tool", "tool_call_id": "call_1", "name": "write_file", "content": "done"}]
++q = make_qwen(["Selesai."])
++q._tools = TOOLS
++r = run(q.scrape_with_tool_result(msgs))
++check("qwen: tool-result turn -> final", r["success"] and r["finish_reason"] == "stop" and r["response"] == "Selesai."
++      and q.sent[0][1] == "continue" and "[TOOL RESULT]" in q.sent[0][0])
++
++q = make_qwen([BROKEN_BLOCK, GOOD_BLOCK])
++q._tools = TOOLS
++r = run(q.scrape_with_tool_result(msgs))
++check("qwen: tool-result turn corrective -> chained call", r["success"] and r["finish_reason"] == "tool_calls")
++
++q = make_qwen([BROKEN_BLOCK] * 3)
++q._tools = TOOLS
++r = run(q.scrape_with_tool_result(msgs))
++check("qwen: tool-result turn gives up cleanly", (not r["success"]) and "Invalid response after tool result" in r["error"])
++
++print(f"\nALL {_passed} CHECKS PASSED")
+diff --git a/tests/test_tool_protocol.py b/tests/test_tool_protocol.py
+new file mode 100644
+index 0000000..8d78af1
+--- /dev/null
++++ b/tests/test_tool_protocol.py
+@@ -0,0 +1,194 @@
++"""
++Offline tests for scrapers/tool_protocol.py (no browser, no network).
++
++Run: python3 tests/test_tool_protocol.py
++"""
++from __future__ import annotations
++
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++# Import the module file directly so the test does not need playwright etc.
++import importlib.util
++
++_spec = importlib.util.spec_from_file_location(
++    "tool_protocol",
++    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
++                 "scrapers", "tool_protocol.py"),
++)
++tp = importlib.util.module_from_spec(_spec)
++sys.modules["tool_protocol"] = tp
++_spec.loader.exec_module(tp)
++
++TOOLS = [
++    {"type": "function", "function": {
++        "name": "write_file",
++        "description": "Write a file",
++        "parameters": {"type": "object", "properties": {
++            "path": {"type": "string"},
++            "content": {"type": "string"},
++            "overwrite": {"type": "boolean"},
++            "retries": {"type": "integer"},
++            "options": {"type": "object"},
++        }}}},
++    {"type": "function", "function": {
++        "name": "get_time", "description": "time", "parameters": {"type": "object", "properties": {}}}},
++]
++
++_passed = 0
++
++
++def check(name: str, cond: bool, detail: str = "") -> None:
++    global _passed
++    if not cond:
++        print(f"FAIL: {name} {detail}")
++        raise SystemExit(1)
++    _passed += 1
++    print(f"ok   {name}")
++
++
++# --------------------------------------------------------------------------- #
++# Plain chat
++# --------------------------------------------------------------------------- #
++out = tp.parse_model_output("Halo! Ini jawaban biasa.", tools=None)
++check("plain chat is final text", out.kind == "final" and out.text == "Halo! Ini jawaban biasa.")
++
++code_answer = 'Gunakan:\n```python\nprint("hi \\n there")\n```\nSelesai, "kutip" dan \\ backslash.'
++out = tp.parse_model_output(code_answer)
++check("plain chat keeps quotes/backslash/code untouched", out.kind == "final" and out.text == code_answer)
++
++out = tp.parse_model_output("   \n  ")
++check("empty reply is invalid", out.kind == "invalid" and "empty" in out.error)
++
++out = tp.parse_model_output("Sebut format @@PAF-CALL:x@@ ... @@PAF-END@@ sebagai teks", tools=None)
++check("markers are plain text when calls are not enabled", out.kind == "final")
++
++# --------------------------------------------------------------------------- #
++# Tool calls — the cases that used to break JSON
++# --------------------------------------------------------------------------- #
++nasty = 'line1 "quoted" and \'single\'\n    indented\\path C:\\Users\\x\n\n{"json": "inside"}\n# not a heading\n- not a bullet'
++block = (
++    "````\n@@PAF-CALL:write_file@@\n@@PAF-ARG:path@@\nsrc/main.py\n"
++    "@@PAF-ARG:content@@\n" + nasty + "\n@@PAF-END@@\n````"
++)
++out = tp.parse_model_output(block, tools=TOOLS)
++check("fenced call parses", out.kind == "tool_calls" and len(out.tool_calls) == 1, str(out))
++tc = out.tool_calls[0]
++args = json.loads(tc["function"]["arguments"])
++check("openai shape", tc["type"] == "function" and tc["id"].startswith("call_")
++      and isinstance(tc["function"]["arguments"], str))
++check("path arg", args["path"] == "src/main.py")
++check("content arg is byte-exact (quotes, backslashes, blank lines, markdown)", args["content"] == nasty, repr(args["content"]))
++
++unfenced = "@@PAF-CALL:write_file@@\n@@PAF-ARG:path@@\na.txt\n@@PAF-ARG:content@@\nhello\n@@PAF-END@@"
++out = tp.parse_model_output(unfenced, tools=TOOLS)
++check("unfenced call parses", out.kind == "tool_calls"
++      and json.loads(out.tool_calls[0]["function"]["arguments"]) == {"path": "a.txt", "content": "hello"})
++
++chrome = "text\nCopy code\n" + unfenced
++out = tp.parse_model_output(chrome, tools=TOOLS)
++check("UI chrome / preamble before the block is ignored", out.kind == "tool_calls")
++
++out = tp.parse_model_output("@@PAF-CALL:get_time@@\n@@PAF-END@@", tools=TOOLS)
++check("no-arg call -> {}", out.kind == "tool_calls" and out.tool_calls[0]["function"]["arguments"] == "{}")
++
++two = unfenced + "\n" + "@@PAF-CALL:get_time@@\n@@PAF-END@@"
++out = tp.parse_model_output(two, tools=TOOLS)
++check("multiple calls", out.kind == "tool_calls" and len(out.tool_calls) == 2
++      and out.tool_calls[1]["function"]["name"] == "get_time")
++check("call ids are unique", out.tool_calls[0]["id"] != out.tool_calls[1]["id"])
++
++typed = ("@@PAF-CALL:write_file@@\n@@PAF-ARG:path@@\nx\n@@PAF-ARG:overwrite@@\nTrue\n"
++         "@@PAF-ARG:retries@@\n3\n@@PAF-ARG:options@@\n{\"a\": [1, 2]}\n@@PAF-END@@")
++out = tp.parse_model_output(typed, tools=TOOLS)
++a = json.loads(out.tool_calls[0]["function"]["arguments"])
++check("schema-based coercion (bool/int/object)", a["overwrite"] is True and a["retries"] == 3 and a["options"] == {"a": [1, 2]}, str(a))
++
++bare_json = '@@PAF-CALL:write_file@@\n{"path": "p", "content": "c"}\n@@PAF-END@@'
++out = tp.parse_model_output(bare_json, tools=TOOLS)
++check("bare JSON body tolerated", out.kind == "tool_calls"
++      and json.loads(out.tool_calls[0]["function"]["arguments"]) == {"path": "p", "content": "c"})
++
++# Content that itself contains a fenced code block (outer fence uses 4 backticks).
++inner = "````\n@@PAF-CALL:write_file@@\n@@PAF-ARG:content@@\n```python\nprint(1)\n```\n@@PAF-END@@\n````"
++out = tp.parse_model_output(inner, tools=TOOLS)
++check("content with inner ``` fence survives",
++      json.loads(out.tool_calls[0]["function"]["arguments"])["content"] == "```python\nprint(1)\n```")
++
++# --------------------------------------------------------------------------- #
++# Invalid blocks -> retryable
++# --------------------------------------------------------------------------- #
++out = tp.parse_model_output("@@PAF-CALL:write_file@@\n@@PAF-ARG:path@@\nx\n", tools=TOOLS)
++check("unterminated block is invalid", out.kind == "invalid" and "not terminated" in out.error)
++
++out = tp.parse_model_output("@@PAF-CALL:delete_everything@@\n@@PAF-END@@", tools=TOOLS)
++check("unknown function is invalid", out.kind == "invalid" and "unknown function" in out.error)
++
++out = tp.parse_model_output("@@PAF-CALL:write_file@@\nsome prose without args\n@@PAF-END@@", tools=TOOLS)
++check("body without ARG markers is invalid", out.kind == "invalid")
++
++# expect_calls (tool-result turn, tools not resent): no name validation
++out = tp.parse_model_output("@@PAF-CALL:whatever@@\n@@PAF-END@@", tools=None, expect_calls=True)
++check("expect_calls parses without a tools list", out.kind == "tool_calls")
++
++# --------------------------------------------------------------------------- #
++# Legacy JSON envelopes (sessions started under the old protocol)
++# --------------------------------------------------------------------------- #
++legacy_ok = json.dumps({"status": "success", "choices": [{"index": 0, "message": {"role": "assistant", "content": "jawaban lama"}, "finish_reason": "stop"}]})
++out = tp.parse_model_output(legacy_ok)
++check("legacy success envelope unwrapped", out.kind == "final" and out.text == "jawaban lama" and out.legacy)
++
++fenced_legacy = "```json\n" + legacy_ok + "\n```"
++out = tp.parse_model_output(fenced_legacy)
++check("fenced legacy envelope unwrapped", out.kind == "final" and out.text == "jawaban lama")
++
++legacy_tc = json.dumps({"status": "tool_calls", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_time", "arguments": {"tz": "UTC"}}}]})
++out = tp.parse_model_output(legacy_tc, tools=TOOLS)
++check("legacy tool_calls normalised (arguments -> JSON string)",
++      out.kind == "tool_calls" and out.tool_calls[0]["function"]["arguments"] == '{"tz": "UTC"}')
++
++user_json = '{"status": "success", "data": [1, 2, 3]}'
++out = tp.parse_model_output(user_json)
++check("user-requested JSON with status=success is NOT unwrapped", out.kind == "final" and out.text == user_json)
++
++broken_success = '{"status":"success","choices":[{"message":{"content":"abc "oops" def'
++out = tp.parse_model_output(broken_success)
++check("broken legacy success never fails plain chat", out.kind == "final")
++
++broken_tc = '{"status":"tool_calls","tool_calls":[{"function":{"name":"get_time","arguments":{"x":"a "b" c"}}'
++out = tp.parse_model_output(broken_tc, tools=TOOLS)
++check("broken legacy tool_calls is retryable", out.kind == "invalid" and out.legacy)
++
++# legacy_validator hook is used to repair
++def fake_validator(raw):
++    return True, {"status": "success", "choices": [{"message": {"content": "repaired"}}]}, ""
++out = tp.parse_model_output(broken_success, legacy_validator=fake_validator)
++check("legacy_validator repair hook", out.kind == "final" and out.text == "repaired")
++
++# --------------------------------------------------------------------------- #
++# Prompt builders
++# --------------------------------------------------------------------------- #
++p = tp.build_wrapped_prompt("Apa kabar?")
++check("plain wrapper keeps [SYSTEM CONTEXT]/[USER REQUEST]", p.startswith("[SYSTEM CONTEXT]") and "[USER REQUEST]\nApa kabar?" in p)
++check("plain wrapper no longer demands JSON", "Do NOT wrap your answer in JSON" in p and '"status"' not in p and "@@PAF" not in p)
++
++p = tp.build_wrapped_prompt("x", max_tokens=500, client_system="Jawab singkat.")
++check("max_tokens + client system included", "roughly 500 tokens" in p and "Jawab singkat." in p)
++
++p = tp.build_wrapped_prompt("cek waktu", tools=TOOLS)
++check("tools wrapper lists functions + format", "get_time" in p and "@@PAF-CALL:" in p and "@@PAF-END@@" in p and "FOUR backticks" in p)
++check("tools wrapper avoids the word 'tool' in instructions", "tool" not in p.split("AVAILABLE FUNCTIONS")[0].lower().replace("tools", ""))
++
++p = tp.build_tool_result_prompt([{"tool_call_id": "call_1", "name": "get_time", "content": '{"t": "10:00"}'}], None, tools=TOOLS)
++check("tool-result prompt", "[TOOL RESULT]" in p and "tool_call_id: call_1" in p and '{"t": "10:00"}' in p and "[USER REQUEST]" in p)
++
++p = tp.build_tool_result_prompt([{"tool_call_id": "c", "name": "n", "content": "x"}], "lanjut", tools=None)
++check("tool-result prompt without tools still explains call format", "@@PAF-CALL:" in p and p.rstrip().endswith("lanjut"))
++
++c = tp.build_corrective_prompt("not terminated")
++check("corrective prompt is short and states the format", "not terminated" in c and "@@PAF-END@@" in c and len(c) < 900)
++
++print(f"\nALL {_passed} CHECKS PASSED")

@@ -699,6 +699,9 @@ class LocalWorker:
                     next_user_msg=next_user,
                     conversation_url=conversation_url,
                     preferred_account=preferred_account,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    system_prompt=system_prompt,
                 )
             else:
                 result = await self.pool.run_task(

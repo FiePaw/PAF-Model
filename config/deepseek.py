@@ -354,28 +354,21 @@ AUTH_CONFIG: dict = {
 
 
 # --------------------------------------------------------------------------- #
-# JSON API mode (prompt wrapping + structured response)
+# API mode (prompt wrapping + function-calling protocol)
+#
+# The [SYSTEM CONTEXT]/[USER REQUEST] wrapper and the reply parser are shared by
+# every backend in scrapers/tool_protocol.py:
+#   * plain chat   -> plain-text answer (no JSON envelope)
+#   * tools        -> plain text, or an @@PAF-CALL:<name>@@ ... @@PAF-END@@ block
+#                     with raw argument values (converted to OpenAI tool_calls
+#                     in code, so the model never has to escape JSON)
+# The key keeps its historical name (JSON_API_CONFIG) for compatibility.
 # --------------------------------------------------------------------------- #
 JSON_API_CONFIG: dict = {
+    # True  -> wrap prompts and parse replies with the shared protocol.
+    # False -> send the raw prompt and use the original lenient plain-text path.
     "enabled": True,
-    # Max in-session corrective retries when the response is not valid JSON.
+    # Max in-session corrective retries when a function-call block is unusable
+    # (or the reply is empty) before the outer retry/rotate loop takes over.
     "max_corrective_retries": 2,
-    # Base [SYSTEM CONTEXT] instruction used for plain chat (no tools).
-    "chat_system_instruction": (
-        "You are operating as a JSON API endpoint, NOT a conversational "
-        "assistant.\n"
-        "Respond with ONE single line of VALID JSON only — no markdown, no "
-        "code fences, no explanations, and no text outside the JSON.\n"
-        "\n"
-        "RESPONSE FORMAT (use EXACTLY this schema):\n"
-        '{"status":"success","choices":[{"index":0,"message":{"role":'
-        '"assistant","content":"<your full answer as a string>"},'
-        '"finish_reason":"stop"}]}\n'
-        "\n"
-        "RULES:\n"
-        "- content MUST be a JSON string. Escape any double quotes as \\\" and "
-        "newlines as \\n.\n"
-        "- finish_reason MUST be \"stop\".\n"
-        "- Output ONE line only. Do NOT add any field outside the schema above."
-    ),
 }

@@ -6,8 +6,9 @@ public_deepseek.py's Session persistence, envelope shape, and interactive
 CLI, exactly as the retired ChatGPT worker did.
 
 Deviations from public_deepseek.py (v1 scope):
-  • NO model_tab / deep_think / web_search / tool_messages (chat-only, no
-    think_mode — see config/grok.py).
+  • NO model_tab / deep_think / web_search (no think_mode — see
+    config/grok.py). Function calling IS supported through the shared
+    protocol in scrapers/tool_protocol.py (`tools` + `tool_messages`).
   • NO automated login — grok.com is SSO-only. Sessions come from
     login_grok.py (manual) or import_grok_cookies.py (cookie import),
     run once per account before starting this worker.
@@ -405,6 +406,26 @@ class LocalWorker:
         session_id = request.get("session_id")
         preferred_account = request.get("preferred_account")
 
+        # Function-calling protocol context (scrapers/tool_protocol.py).
+        tools = request.get("tools")
+        max_tokens = request.get("max_tokens")
+        tool_messages = request.get("tool_messages")
+        next_user_msg = None
+        if mode == "continue" and tool_messages:
+            # Turn 2: the user message (if any) that follows the last tool result.
+            messages = request.get("messages") or []
+            last_tool_idx = max(
+                (i for i, m in enumerate(messages) if m.get("role") == "tool"),
+                default=-1,
+            )
+            msgs_after = messages[last_tool_idx + 1:] if last_tool_idx >= 0 else []
+            next_user_msg = next(
+                (m["content"] for m in msgs_after
+                 if m.get("role") == "user" and isinstance(m.get("content"), str)
+                 and m.get("content")),
+                None,
+            )
+
         attachments = None
         if request.get("attachments"):
             attachments = [
@@ -443,6 +464,10 @@ class LocalWorker:
                 attachments=attachments,
                 continue_url=continue_url,
                 preferred_account=preferred_account,
+                tools=tools,
+                max_tokens=max_tokens,
+                tool_messages=tool_messages if mode == "continue" else None,
+                next_user_msg=next_user_msg,
             )
             return result
         except Exception as exc:

@@ -5,6 +5,43 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — Semua Backend: Protokol API Mode Bersama (Teks Biasa + Tool Calling Berbasis Penanda) dan Tool Calling untuk Grok
+
+> **Perubahan lintas backend (DeepSeek, Qwen, Grok).** Sebelumnya setiap balasan dipaksa berbentuk envelope JSON sehingga model harus meng-escape sendiri tanda kutip, backslash, newline, dan kode di dalam string JSON — sumber utama error "invalid JSON", retry, dan rotasi akun. Kini jawaban biasa berupa **teks polos**, dan hanya pemanggilan fungsi yang memakai blok bertanda berisi nilai argumen **mentah**; JSON `tool_calls` disusun oleh kode (`json.dumps`), bukan oleh model. System prompt `[SYSTEM CONTEXT]` / `[USER REQUEST]` tetap dipertahankan.
+
+### 1. Modul Protokol Bersama (`scrapers/tool_protocol.py`)
+- **File baru** tanpa dependensi browser/jaringan, dipakai ketiga backend: pembangun prompt (`build_wrapped_prompt`, `build_tool_result_prompt`, `build_corrective_prompt`) dan parser balasan (`parse_model_output`).
+- **Chat biasa (tanpa `tools`):** jawaban = teks polos, tidak ada yang divalidasi.
+- **Dengan `tools`:** jawaban teks polos, kecuali model perlu memanggil fungsi → blok:
+  `@@PAF-CALL:<fungsi>@@` / `@@PAF-ARG:<argumen>@@ <nilai mentah>` / `@@PAF-END@@`. Penanda sengaja tanpa `<`/`>` dan tanpa karakter khusus markdown agar selamat dari renderer; model diminta membungkus blok dalam fenced code block 4-backtick agar baris baru dan indentasi tetap utuh pada `innerText`. Parser tetap bekerja dengan/tanpa fence dan mengabaikan teks UI sebelum blok.
+- **Konversi tipe** nilai argumen mengikuti skema `parameters` (`integer`, `number`, `boolean`, `object`, `array`). `function.arguments` kini **selalu string JSON** (sesuai spesifikasi OpenAI dan `API_USAGE.md`); sebelumnya Qwen mengembalikan objek.
+- **Self-healing:** blok pemanggilan yang rusak (tidak ditutup, nama fungsi tidak dikenal, dst.) atau balasan kosong memicu satu pesan koreksi singkat di session yang sama (maks. 2×). Jawaban teks biasa tidak pernah di-retry karena format.
+- **Kompatibel mundur:** envelope JSON lama (`{"status":"success"|"tool_calls",...}`) tetap dipahami, sehingga session yang dimulai sebelum update ini tetap berjalan. Envelope sukses yang rusak tidak pernah menggagalkan chat biasa; hanya `tool_calls` lama yang rusak yang di-retry.
+- `[SYSTEM CONTEXT]` dikirim pada **setiap** turn (singkat untuk chat biasa) karena klien boleh mengganti `tools` antar request dan session lama masih berisi instruksi JSON.
+
+### 2. Qwen
+- `_build_wrapped_prompt()` / `_build_tool_result_prompt()` memakai modul bersama (kata "tool" tetap dihindari dalam instruksi; dipakai "function").
+- `base_qwen.scrape()`: validasi JSON diganti `parse_model_output()`; logika retry/rotasi akun/hard-cap tetap, namun pemicunya kini hanya blok pemanggilan rusak atau balasan kosong.
+- `scrape_with_tool_result()` kini punya putaran koreksi (sebelumnya langsung gagal).
+
+### 3. DeepSeek
+- Wrapper dan hasil-tool memakai modul bersama; client `system` message tetap ditambahkan ke `[SYSTEM CONTEXT]`.
+- **Perbaikan state:** `send_prompt()` tidak lagi menimpa `_tools`/`_max_tokens`/`_system_prompt` pada pengiriman verbatim (koreksi / hasil tool), sehingga validasi nama fungsi dan konversi tipe tetap berlaku.
+- `tools`/`max_tokens`/`system_prompt` kini diteruskan sampai Turn 2 (worker → pool → `scrape_with_tool_result`).
+- `JSON_API_CONFIG`: kunci `chat_system_instruction` dihapus (sumber instruksi tunggal kini `tool_protocol.py`); `enabled` dan `max_corrective_retries` dipertahankan.
+
+### 4. Grok — Tool Calling Kini Didukung
+- `GrokScraper.scrape()` menerima `tools`, `max_tokens`, `tool_messages`, `next_user_msg`; prompt dibungkus dan balasan di-parse dengan modul bersama.
+- Pemanggilan fungsi di-parse dari **teks mentah**; pembersih UI (`_clean_response_text`) sengaja tidak dijalankan pada tool call karena regex-nya membuang baris kosong dan memangkas indentasi sehingga merusak nilai argumen. Jawaban biasa tetap melalui pembersih seperti sebelumnya.
+- Gateway (`vps_server.py`) kini meneruskan `tools` dan `tool_messages` ke worker Grok; `browser_pool_grok.run_task()` dan `public_grok.py` meneruskannya ke scraper.
+
+### 5. Dokumentasi & Test
+- `API_USAGE.md` §9 ditulis ulang (protokol baru, Grok didukung), plus perbaikan §13.5, §14, §15; `README.md` dan `GROK_BACKEND.md` diperbarui.
+- Test offline baru: `tests/test_tool_protocol.py` (parser/builder), `tests/test_protocol_scrapers.py` (loop `scrape()` asli ketiga backend dengan browser stub), `tests/test_grok_tools_e2e.py` (gateway + worker palsu, dua giliran).
+- **Catatan:** test ini membuktikan plumbing di sekitar balasan model, bukan bagaimana situs live (chat.qwen.ai, chat.deepseek.com, grok.com) merender blok bertanda pada `innerText`. Perlu verifikasi manual dengan akun nyata. `tests/test_http_e2e.py` bawaan sudah usang terhadap autentikasi API token (gagal juga pada kode sebelum perubahan ini) dan tidak diubah.
+
+---
+
 ## [Unreleased] — Qwen Backend: Diagnostik Prompt Page (I/O), Pembaruan Selector UI qwen-chat-v2, dan Optimasi Latency CONTINUE
 
 > **Pembaruan Backend Qwen.** NEW! Penambahan tool diagnostik mandiri untuk halaman percakapan prompt (`debug_prompt_qwen.py`) yang menguji alur I/O secara end-to-end pada **NEW mode** dan **CONTINUE mode**, identifikasi migrasi antarmuka Qwen Web ke sistem komponen `qwen-chat-v2`, pembaruan selector I/O, serta optimasi latensi respon mode CONTINUE yang memulihkan kecepatan respon dari ~8 detik kembali ke ~5 detik.

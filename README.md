@@ -108,7 +108,7 @@ ids for accounts currently connected via a worker.
 `think_mode`:
 - **deepseek** → resolved to `(model_tab, deep_think, web_search)` via aliases.
 - **qwen** → passed through as-is (`auto`|`thinking`|`fast`).
-- **grok** → not supported in v1 — chat-only, default model in the UI.
+- **grok** → not supported — no model picker / think toggle, default model in the UI (function calling via `tools` is supported, see `API_USAGE.md` §9).
 
 ## Running
 

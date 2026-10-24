@@ -54,6 +54,7 @@ from config import (
     QWEN_AUTH_CONFIG,
     ROTATION_CONFIG,
 )
+from scrapers import tool_protocol as tp
 from scrapers.utils import (
     AuthStore,
     contains_any,
@@ -1080,23 +1081,24 @@ class BaseAIChatScraper(ABC):
                     await asyncio.sleep(ROTATE_DELAY_S)
                     continue
 
-                # ── Response validation + retry logic (poin 3) ──────────────────
-                is_valid, parsed, validation_err = self._validate_qwen_response(response_text)
+                # ── Response parsing + retry logic ──────────────────────────────
+                # Protokol baru (scrapers/tool_protocol.py): jawaban = teks biasa
+                # (tidak ada yang perlu divalidasi); pemanggilan fungsi = blok
+                # @@PAF-CALL:…@@ … @@PAF-END@@ dengan argumen mentah. Hanya blok
+                # pemanggilan yang rusak / jawaban kosong yang memicu koreksi.
+                # Envelope JSON lama tetap dipahami (session lama).
+                _tools = getattr(self, "_tools", None)
 
-                if is_valid:
-                    # Tandai di log kalau response asli sebenarnya broken JSON dan
-                    # baru valid setelah _repair_unescaped_quotes() menyelamatkannya
-                    # (mis. Qwen lupa escape tanda kutip di dalam `content`).
-                    try:
-                        json.loads(response_text)
-                    except json.JSONDecodeError:
-                        self.logger.info(
-                            "Response diselamatkan oleh repair-fallback (unescaped quotes) "
-                            "pada attempt %d – tidak perlu retry/rotasi akun",
-                            attempt,
-                        )
+                def _parse(text: str) -> "tp.ParsedOutput":
+                    return tp.parse_model_output(
+                        text, tools=_tools,
+                        legacy_validator=self._validate_qwen_response,
+                    )
 
-                if not is_valid:
+                out = _parse(response_text)
+
+                if out.kind == tp.KIND_INVALID:
+                    validation_err = out.error
                     self.logger.warning(
                         "Response tidak valid (attempt %d): %s | raw[:200]=%s",
                         attempt, validation_err, response_text[:200],
@@ -1127,28 +1129,7 @@ class BaseAIChatScraper(ABC):
                         continue
 
                     # Kirim corrective feedback dalam session yang SAMA
-                    # Deteksi mode berdasarkan raw response: jika mengandung
-                    # "tool_calls" berarti Qwen mencoba call tool tapi JSON-nya
-                    # malformed → minta ulang format tool_calls, bukan success.
-                    if '"tool_calls"' in response_text or '"status":"tool_calls"' in response_text:
-                        corrective_prompt = (
-                            "Response JSON kamu tidak valid karena ada karakter yang tidak di-escape "
-                            "di dalam string (misalnya tanda kutip di dalam command). "
-                            "Tolong ulangi response tool_calls kamu dengan memastikan semua "
-                            "karakter spesial di dalam string value di-escape dengan benar "
-                            "(gunakan \\\" untuk tanda kutip, \\n untuk newline). "
-                            "Balas HANYA dengan JSON ini tanpa teks lain:\n"
-                            '{"status":"tool_calls","tool_calls":[{"id":"call_<unique_id>","type":"function",'
-                            '"function":{"name":"<tool_name>","arguments":{<args_as_valid_json_object>}}}]}'
-                        )
-                    else:
-                        corrective_prompt = (
-                            "Tolong ulangi response kamu dalam format JSON berikut, "
-                            "tanpa teks lain di luar JSON:\n"
-                            '{"status":"success","choices":[{"index":0,'
-                            '"message":{"role":"assistant","content":"<isi jawaban kamu>"},'
-                            '"finish_reason":"stop"}]}'
-                        )
+                    corrective_prompt = tp.corrective_prompt_for(out)
                     self.logger.info(
                         "Mengirim corrective feedback (retry %d/%d) dalam session yang sama",
                         total_retries, HARD_CAP_RETRIES,
@@ -1168,32 +1149,20 @@ class BaseAIChatScraper(ABC):
                         attempt -= 1
                         continue
 
-                    is_valid2, parsed2, validation_err2 = self._validate_qwen_response(response_text)
-                    if not is_valid2:
+                    out2 = _parse(response_text)
+                    if out2.kind == tp.KIND_INVALID:
                         self.logger.warning(
-                            "Corrective response juga tidak valid: %s", validation_err2
+                            "Corrective response juga tidak valid: %s", out2.error
                         )
                         attempt -= 1
                         continue
-                    try:
-                        json.loads(response_text)
-                    except json.JSONDecodeError:
-                        self.logger.info(
-                            "Corrective response diselamatkan oleh repair-fallback "
-                            "(unescaped quotes) pada attempt %d", attempt,
-                        )
-
-                    is_valid = True
-                    parsed = parsed2
+                    out = out2
                     self.logger.info("Corrective berhasil – response valid setelah feedback")
                 # ─────────────────────────────────────────────────────────────────
 
-                # ─────────────────────────────────────────────────────────────────
-
-                # ── Extract content atau tool_calls dari parsed JSON ──────────────────
-                # Jika status "tool_calls" → Qwen minta panggil tool, return sekarang.
-                if parsed.get("status") == "tool_calls":
-                    tool_calls_list = parsed.get("tool_calls", [])
+                # ── Hasil: tool_calls (Qwen minta fungsi) atau jawaban final ──────────
+                if out.kind == tp.KIND_TOOL_CALLS:
+                    tool_calls_list = out.tool_calls
                     self.logger.info(
                         "Qwen response: tool_calls (%d call(s))", len(tool_calls_list)
                     )
@@ -1205,7 +1174,7 @@ class BaseAIChatScraper(ABC):
                         "usage":         {},
                         "x_metadata":    {},
                     }
-                content_str = parsed["choices"][0]["message"]["content"]
+                content_str = out.text
 
                 # ── tiktoken usage (poin 5) ──────────────────────────────────────
                 prompt_tokens     = _count_tokens(prompt)

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Literal
 
 from config import QWEN_AUTH_CONFIG, QWEN_CONFIG, ROTATION_CONFIG
+from scrapers import tool_protocol as tp
 from scrapers.base_qwen import BaseAIChatScraper
 from scrapers.utils import contains_any, discover_cookie_files
 
@@ -2049,87 +2050,20 @@ class QwenScraper(BaseAIChatScraper):
         """
         Bungkus prompt user ke format [SYSTEM CONTEXT] / [USER REQUEST].
 
-        Mode tanpa tools (chat biasa):
-            [SYSTEM CONTEXT]
-            You are operating in API mode. Respond ONLY in JSON format as specified.
+        Protokol dibagi bersama semua backend (lihat scrapers/tool_protocol.py):
 
-            [USER REQUEST]
-            {"prompt": "...", "model": "account1"}
+        * Chat biasa (tanpa tools) → model menjawab TEKS BIASA. Tidak ada JSON.
+        * Dengan tools → model menjawab teks biasa, kecuali perlu memanggil
+          fungsi: ia menulis blok bertanda ``@@PAF-CALL:<nama>@@ ... @@PAF-END@@``
+          dengan nilai argumen mentah (tanpa escaping). JSON ``tool_calls``
+          disusun oleh kode (``json.dumps``), bukan oleh model.
 
-        Mode dengan tools (LLM API + tool calling):
-            [SYSTEM CONTEXT]
-            You are a strict JSON LLM API endpoint.
-
-            Available tools:
-            [{"type":"function","function":{"name":"write_file",...}}, ...]
-
-            RESPONSE FORMAT RULES:
-            Rule 1 — Jika perlu memanggil tool:
-            {"status":"tool_calls","tool_calls":[{"id":"call_<id>","type":"function",
-             "function":{"name":"<name>","arguments":{...}}}]}
-
-            Rule 2 — Jika sudah punya jawaban final:
-            {"status":"success","choices":[{"index":0,"message":{"role":"assistant",
-             "content":"<jawaban>"},"finish_reason":"stop"}]}
-
-            [USER REQUEST]
-            {"prompt": "...", "model": "account1", "max_tokens": 2000}
+        PENTING: kata "tool" dihindari di instruksi karena men-trigger mekanisme
+        tool calling internal Qwen UI → dipakai istilah "function".
         """
-        account_name = (
-            self.account or (self._current_cookie_file.stem if self._current_cookie_file else "qwen")
+        return tp.build_wrapped_prompt(
+            prompt, tools=self._tools, max_tokens=self._max_tokens
         )
-        user_request: dict = {"prompt": prompt, "model": account_name}
-        if self._max_tokens is not None:
-            user_request["max_tokens"] = self._max_tokens
-
-        parts = ["[SYSTEM CONTEXT]"]
-
-        if self._tools:
-            # ── Mode: LLM API dengan tool calling ────────────────────────────
-            # PENTING: hindari kata "tool" di instruksi karena men-trigger
-            # mekanisme tool calling internal Qwen UI → gunakan "function/command".
-            tool_names = [
-                t.get("function", {}).get("name", "")
-                for t in self._tools
-                if t.get("function", {}).get("name")
-            ]
-            parts += [
-                "You are a pure JSON API endpoint. You do NOT have any built-in",
-                "capabilities (no web search, no code execution, no file access,",
-                "no image generation). You are a stateless text-in/JSON-out processor.",
-                "",
-                "The client system has its own external executor that can run the",
-                "following named functions on your behalf:",
-                "",
-                "AVAILABLE FUNCTIONS (client-side, executed externally):",
-                json.dumps(self._tools, ensure_ascii=False, indent=2),
-                "",
-                f"These are the ONLY function names you may request: {tool_names}",
-                "Do NOT invent or use any other function name.",
-                "",
-                "RESPONSE FORMAT — choose exactly ONE:",
-                "",
-                "A) If you need the client to execute a function before you can answer:",
-                '{"status":"tool_calls","tool_calls":[{"id":"call_<unique_id>","type":"function","function":{"name":"<function_name>","arguments":{<args_as_object>}}}]}',
-                "",
-                "B) If you have enough information to give a final answer:",
-                '{"status":"success","choices":[{"index":0,"message":{"role":"assistant","content":"<jawaban_lengkap>"},"finish_reason":"stop"}]}',
-                "",
-                "RULES:",
-                "- Output ONLY raw JSON. No markdown, no explanation, no extra text.",
-                "- arguments MUST be a JSON object (dict), NOT a string.",
-                "- id MUST be unique per call, format: call_<number_or_letters>.",
-                "- Do NOT add any field outside the schemas above.",
-                f"- Only use function names from this list: {tool_names}",
-            ]
-        else:
-            # ── Mode: chat biasa tanpa tool calling ──────────────────────────
-            parts.append(
-                "You are operating in API mode. Respond ONLY in JSON format as specified."
-            )
-
-        parts += ["", "[USER REQUEST]", json.dumps(user_request, ensure_ascii=False)]
-        return "\n".join(parts)
 
     def _build_tool_result_prompt(
         self,
@@ -2137,42 +2071,13 @@ class QwenScraper(BaseAIChatScraper):
         next_user_msg: str | None = None,
     ) -> str:
         """
-        Bangun prompt untuk Turn 2 (inject tool result ke conversation Qwen yang sama).
-
-        Format yang dikirim ke Qwen (CONTINUE mode):
-            [TOOL RESULT]
-            {"tool_call_id":"call_001","name":"write_file","result":{"success":true}}
-
-            [USER REQUEST]
-            {"continue":true,"model":"account1"}
-
-        Jika ada next_user_msg (user kirim pesan baru setelah tool result):
-            [USER REQUEST]
-            {"prompt":"sekarang jalankan","model":"account1"}
+        Bangun prompt untuk Turn 2 (inject hasil fungsi ke conversation Qwen
+        yang sama). Pemanggilan fungsi tetap diizinkan (model boleh merantai).
         """
-        account_name = (
-            self.account or (self._current_cookie_file.stem if self._current_cookie_file else "qwen")
+        return tp.build_tool_result_prompt(
+            tool_messages, next_user_msg,
+            tools=self._tools, max_tokens=self._max_tokens,
         )
-        parts = ["[TOOL RESULT]"]
-
-        for tm in tool_messages:
-            entry = {
-                "tool_call_id": tm.get("tool_call_id"),
-                "name": tm.get("name"),
-                "result": tm.get("content"),
-            }
-            parts.append(json.dumps(entry, ensure_ascii=False))
-
-        user_request: dict = {"model": account_name}
-        if next_user_msg:
-            user_request["prompt"] = next_user_msg
-        else:
-            user_request["continue"] = True   # sinyal: tidak ada user message baru
-        if self._max_tokens is not None:
-            user_request["max_tokens"] = self._max_tokens
-
-        parts += ["", "[USER REQUEST]", json.dumps(user_request, ensure_ascii=False)]
-        return "\n".join(parts)
 
     async def scrape_with_tool_result(
         self,
@@ -2180,39 +2085,61 @@ class QwenScraper(BaseAIChatScraper):
         next_user_msg: str | None = None,
     ) -> dict:
         """
-        Kirim tool result ke Qwen dalam CONTINUE session (Turn 2).
-        Dipanggil oleh newpublic_BETA.py setelah CLI mengeksekusi tool via MCP.
+        Kirim hasil fungsi ke Qwen dalam CONTINUE session (Turn 2).
+        Dipanggil oleh public_qwen.py setelah klien mengeksekusi fungsi lokal.
 
         Args:
             tool_messages: list of {role:tool, tool_call_id, name, content} dicts
             next_user_msg: pesan user berikutnya (opsional), jika ada setelah tool result
 
         Returns:
-            dict result dari base_scraper.scrape() dengan finish_reason dan
-            kemungkinan tool_calls (jika Qwen minta tool lagi) atau response (stop).
+            dict dengan finish_reason dan tool_calls (jika Qwen minta fungsi lagi)
+            atau response (stop). Jika blok pemanggilan rusak, dikirim koreksi
+            singkat dalam session yang sama (maks tp.MAX_CORRECTIVE_RETRIES).
         """
+        from scrapers.base_qwen import BaseAIChatScraper
+
         prompt = self._build_tool_result_prompt(tool_messages, next_user_msg)
         # wrap_as_user_request=False karena prompt sudah berformat lengkap
         # ([TOOL RESULT] / [USER REQUEST]) — tidak perlu dibungkus lagi.
-        # mode="continue" wajib: tool result harus dikirim ke session yang sama,
-        # bukan membuka chat baru.
+        # mode="continue" wajib: hasil harus dikirim ke session yang sama.
         response_text = await self.send_prompt(
             prompt, mode="continue", wrap_as_user_request=False
         )
-        # send_prompt mengembalikan str; bungkus ke dict agar caller bisa .get()
-        from scrapers.base_qwen import BaseAIChatScraper
-        is_valid, parsed, err = BaseAIChatScraper._validate_qwen_response(response_text)
-        if is_valid and parsed:
-            status = parsed.get("status")
-            if status == "tool_calls":
-                return {
-                    "success": True,
-                    "finish_reason": "tool_calls",
-                    "tool_calls": parsed.get("tool_calls", []),
-                }
-            content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
-            return {"success": True, "finish_reason": "stop", "response": content}
-        return {"success": False, "error": f"Invalid response after tool result: {err}", "raw": response_text}
+
+        def _parse(text: str) -> "tp.ParsedOutput":
+            return tp.parse_model_output(
+                text, tools=self._tools, expect_calls=True,
+                legacy_validator=BaseAIChatScraper._validate_qwen_response,
+            )
+
+        out = _parse(response_text)
+        corrections = 0
+        while out.kind == tp.KIND_INVALID and corrections < tp.MAX_CORRECTIVE_RETRIES:
+            corrections += 1
+            self.logger.warning(
+                "tool-result reply invalid (corrective %d/%d): %s",
+                corrections, tp.MAX_CORRECTIVE_RETRIES, out.error,
+            )
+            response_text = await self.send_prompt(
+                tp.build_corrective_prompt(out.error),
+                mode="continue", wrap_as_user_request=False,
+            )
+            out = _parse(response_text)
+
+        if out.kind == tp.KIND_TOOL_CALLS:
+            return {
+                "success": True,
+                "finish_reason": "tool_calls",
+                "tool_calls": out.tool_calls,
+            }
+        if out.kind == tp.KIND_FINAL:
+            return {"success": True, "finish_reason": "stop", "response": out.text}
+        return {
+            "success": False,
+            "error": f"Invalid response after tool result: {out.error}",
+            "raw": response_text,
+        }
 
     async def send_prompt(
         self,
@@ -2226,9 +2153,9 @@ class QwenScraper(BaseAIChatScraper):
         self._last_prompt = prompt
 
         # Bungkus prompt asli user dengan [SYSTEM CONTEXT]/[USER REQUEST].
-        # Corrective retry feedback (dari base_scraper._validate_qwen_response
-        # retry loop) dikirim dengan wrap_as_user_request=False karena pesan
-        # itu sendiri sudah berupa instruksi sistem, bukan request user baru.
+        # Corrective feedback (retry loop di base_qwen.scrape / tool-result)
+        # dikirim dengan wrap_as_user_request=False karena pesan itu sendiri
+        # sudah berupa instruksi sistem, bukan request user baru.
         outgoing_prompt = self._build_wrapped_prompt(prompt) if wrap_as_user_request else prompt
 
         effective_think = think_mode or self._think_mode
