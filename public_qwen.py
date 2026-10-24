@@ -394,6 +394,7 @@ class TaskProcessor:
         messages        = payload.get("messages", [])
         think_mode      = payload.get("think_mode")
         max_tokens      = payload.get("max_tokens")
+        system_prompt: str | None = payload.get("system_prompt") or None
         incoming_sid    = payload.get("session_id")
         raw_attachments: list[dict] = payload.get("attachments") or []
         payload_preferred_cookie: str | None = payload.get("preferred_cookie")
@@ -545,6 +546,11 @@ class TaskProcessor:
 
                     # Teruskan max_tokens per-request
                     scraper._max_tokens = max_tokens
+
+                    # System prompt per-request (None jika request tidak punya).
+                    # WAJIB di-reset tiap request: scraper dipakai ulang oleh pool,
+                    # jangan sampai system prompt request lama bocor ke request baru.
+                    scraper._system_prompt = system_prompt
 
                     # ── Tool calling: inject tools ke scraper ─────────────────
                     scraper._tools = tools  # None jika request tidak punya tools
@@ -809,14 +815,28 @@ class LocalWorker:
 
         # Pisah system message dari messages
         # CATATAN: tools tetap ada di payload["tools"], tidak disentuh di sini
-        system_messages = [m for m in messages if m.get("role") == "system"]
-        non_system_messages = [m for m in messages if m.get("role") != "system"]
+        # Gateway (vps_server._extract_system_prompt) sudah mengirim payload["system_prompt"];
+        # ekstraksi di sini hanya fallback untuk klien/gateway lama yang belum mengirimnya.
+        # Role "developer" diperlakukan sama dengan "system" (konvensi OpenAI terbaru).
+        _SYS_ROLES = ("system", "developer")
+        system_messages = [m for m in messages if m.get("role") in _SYS_ROLES]
+        non_system_messages = [m for m in messages if m.get("role") not in _SYS_ROLES]
+
+        def _msg_text(content) -> str:
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "\n".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type", "text") == "text" and p.get("text")
+                )
+            return ""
 
         if system_messages:
-            # Jika tools ada, system_prompt akan di-merge ke [SYSTEM CONTEXT] oleh scraper
-            payload["system_prompt"] = "\n".join(
-                m["content"] for m in system_messages if m.get("content")
-            )
+            if not payload.get("system_prompt"):
+                payload["system_prompt"] = "\n\n".join(
+                    t for t in (_msg_text(m.get("content")).strip() for m in system_messages) if t
+                ) or None
             payload["messages"] = non_system_messages
 
         # conversation_history: semua pesan kecuali yang terakhir (hanya untuk mode CONTINUE)

@@ -303,15 +303,17 @@ class BrowserPool:
         max_tokens: int | None = None,
         tool_messages: list | None = None,
         next_user_msg: str | None = None,
+        system_prompt: str | None = None,
     ) -> dict:
         """Acquire a slot (pinned to preferred_account when given), scrape,
         release. On rate-limit in mode='new', rotate account and retry once.
 
-        tools / max_tokens / tool_messages / next_user_msg carry the shared
-        function-calling protocol context (see scrapers/tool_protocol.py).
+        tools / max_tokens / system_prompt / tool_messages / next_user_msg carry
+        the shared function-calling + system-prompt protocol context (see
+        scrapers/tool_protocol.py).
         """
         proto = dict(
-            tools=tools, max_tokens=max_tokens,
+            tools=tools, max_tokens=max_tokens, system_prompt=system_prompt,
             tool_messages=tool_messages, next_user_msg=next_user_msg,
         )
         async with self.acquire(preferred_account, timeout=acquire_timeout) as slot:

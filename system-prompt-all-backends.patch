@@ -1,0 +1,341 @@
+diff --git a/API_USAGE.md b/API_USAGE.md
+index 7fec2e5..31246e3 100644
+--- a/API_USAGE.md
++++ b/API_USAGE.md
+@@ -289,7 +289,7 @@ Content-Type: `application/json`.
+ | Field | Type | Default | Notes |
+ |---|---|---|---|
+ | `model` | string | `"deepseek"` | **Required in practice.** See §6 — selects backend (+ optional account). |
+-| `messages` | array of `{role, content, name?, tool_calls?, tool_call_id?}` | — | **Required.** Standard OpenAI chat message list. `content` may be a string, a list of `{type:"text", text:...}` parts, or `null` (for `tool_calls` assistant messages). Only the **last `user`** message text is actually sent as the prompt to DeepSeek; for Qwen the same extraction applies (see §5.2). `system` messages are concatenated and forwarded (DeepSeek only, see below). `tool` role messages carry tool-execution results back in (see §9). |
++| `messages` | array of `{role, content, name?, tool_calls?, tool_call_id?}` | — | **Required.** Standard OpenAI chat message list. `content` may be a string, a list of `{type:"text", text:...}` parts, or `null` (for `tool_calls` assistant messages). Only the **last `user`** message text is actually sent as the prompt to DeepSeek; for Qwen the same extraction applies (see §5.2). `system`/`developer` messages are concatenated and forwarded to **all three backends** (see §5.2). `tool` role messages carry tool-execution results back in (see §9). |
+ | `stream` | bool | `false` | Accepted but **ignored** — no streaming is implemented. |
+ | `temperature` | float | `null` | Accepted for OpenAI-schema compatibility; **not forwarded** to either backend scraper (these are browser-automation backends, not raw model APIs — sampling parameters aren't controllable). |
+ | `max_tokens` | int | `null` | Forwarded to the worker (`task_fields["max_tokens"]`) but browser-based scraping has no hard token cap enforcement; treat as advisory. |
+@@ -320,11 +320,16 @@ follow-up in the same conversation, send the new `X-Session-ID` you got back
+ from turn 1 and just send the new `user` message — do not resend the whole
+ history, it will be ignored beyond the last user turn.
+ 
+-`system`-role messages: on **DeepSeek only**, all `system` message contents
+-are concatenated with `\n\n` and forwarded as `system_prompt`. Qwen does not
+-receive a distinct system prompt field from `messages` today (the example CLI
+-`example/chat_qwen.py --system "..."` wires this through a different, simpler
+-path — check that script if you need Qwen system prompts).
++`system`-role messages (**all backends: DeepSeek, Qwen, Grok**): every
++`system` **and** `developer` message (string content, or the joined `text`
++parts of a content list) is concatenated with `\n\n` by the gateway and
++forwarded to the worker as `system_prompt`. The worker embeds it in the
++`[SYSTEM CONTEXT]` block of the prompt it types into the chat UI — on **every**
++turn (new, continue and tool-result turns), because the browser conversation
++does not remember it as a real system role. If the request has no `system`
++message, nothing extra is added. The system prompt is per-request: it is not
++stored on the session, so resend it with each request (as with any OpenAI-style
++client) if you want it to keep applying.
+ 
+ ---
+ 
+@@ -575,7 +580,7 @@ Notes:
+ - The `[SYSTEM CONTEXT]` is sent on **every** turn (it is short for plain chat),
+   because clients may change `tools` between requests.
+ - A client-supplied `system` message is appended to `[SYSTEM CONTEXT]` on
+-  **DeepSeek only** (see §5.2); Qwen and Grok do not receive it.
++  **all backends** — DeepSeek, Qwen and Grok (see §5.2).
+ - `max_tokens` is passed to the model as an advisory length hint, not enforced.
+ - Resend `tools` on every request, as in the OpenAI API. On the Turn-B request
+   the worker can still parse a function call without them, but it can then
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f3735e3..19d97c4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,34 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+ 
+ ---
+ 
++## [Unreleased] — Semua Backend: System Prompt Terpadu (DeepSeek, Qwen, Grok)
++
++> **Perubahan lintas backend.** Sebelumnya pesan `system` dari klien hanya bekerja di **DeepSeek**. Di **Grok** pesan itu dibuang oleh gateway (tidak pernah dikirim ke worker), dan di **Qwen** worker mengisi `payload["system_prompt"]` tetapi tidak ada kode yang membacanya, sehingga hilang sebelum sampai ke prompt. Kini ketiga backend memperlakukan system prompt dengan cara yang sama.
++
++### 1. Gateway (`PublicForward/ForVPS/vps_server.py`)
++- **Fungsi baru `_extract_system_prompt()`** — satu sumber kebenaran untuk semua backend. Mengumpulkan semua pesan `system` **dan `developer`** (nama role baru di OpenAI) menjadi satu string (digabung `\n\n`), mendukung `content` berupa string maupun list bagian `{type:"text"}`, dan mengabaikan pesan kosong. Hasilnya `None` bila klien tidak mengirim system message.
++- `system_prompt` kini ikut di `task_fields` untuk **deepseek, grok, dan qwen** (sebelumnya hanya deepseek, dan hanya untuk `content` bertipe string).
++
++### 2. Grok
++- `public_grok.py` → `browser_pool_grok.run_task(system_prompt=…)` → `GrokScraper.scrape(system_prompt=…)` → `tool_protocol` (`client_system`). Berlaku di turn baru, continue, dan turn hasil-tool (Turn 2), termasuk saat rotasi akun + retry.
++
++### 3. Qwen
++- `QwenScraper._system_prompt` baru; `_build_wrapped_prompt()` dan `_build_tool_result_prompt()` meneruskannya sebagai `client_system`.
++- `public_qwen.py`: `process()` membaca `payload["system_prompt"]` dan menyetel `scraper._system_prompt` **di setiap request, termasuk `None`** — scraper dipakai ulang oleh pool, jadi tanpa reset system prompt request lama bisa bocor ke request berikutnya.
++- Ekstraksi di worker kini hanya fallback bila gateway lama belum mengirim `system_prompt`; role `developer` dan content list ikut ditangani.
++
++### 4. DeepSeek
++- Perilaku tidak berubah, hanya kini memakai fungsi ekstraksi bersama (jadi `developer` role dan content list juga didukung).
++
++### 5. Catatan perilaku
++- System prompt dikirim di blok `[SYSTEM CONTEXT]` pada **setiap turn** (UI chat tidak punya role system sungguhan) dan **tidak disimpan di session** — klien perlu mengirimnya ulang tiap request, seperti klien OpenAI pada umumnya.
++- Tugas media Qwen (`create_image`, `create_video`, `web_search`) tidak dibungkus `[SYSTEM CONTEXT]`, sehingga tidak terpengaruh.
++
++### 6. Dokumentasi
++- `API_USAGE.md` §5.1, §5.2, dan §9 diperbarui (sebelumnya menyatakan system message "DeepSeek only").
++
++---
++
+ ## [Unreleased] — Semua Backend: Protokol API Mode Bersama (Teks Biasa + Tool Calling Berbasis Penanda) dan Tool Calling untuk Grok
+ 
+ > **Perubahan lintas backend (DeepSeek, Qwen, Grok).** Sebelumnya setiap balasan dipaksa berbentuk envelope JSON sehingga model harus meng-escape sendiri tanda kutip, backslash, newline, dan kode di dalam string JSON — sumber utama error "invalid JSON", retry, dan rotasi akun. Kini jawaban biasa berupa **teks polos**, dan hanya pemanggilan fungsi yang memakai blok bertanda berisi nilai argumen **mentah**; JSON `tool_calls` disusun oleh kode (`json.dumps`), bukan oleh model. System prompt `[SYSTEM CONTEXT]` / `[USER REQUEST]` tetap dipertahankan.
+diff --git a/PublicForward/ForVPS/vps_server.py b/PublicForward/ForVPS/vps_server.py
+index 4a2caee..ae67674 100644
+--- a/PublicForward/ForVPS/vps_server.py
++++ b/PublicForward/ForVPS/vps_server.py
+@@ -214,6 +214,41 @@ def _make_id() -> str:
+     return f"chatcmpl-{uuid.uuid4().hex[:24]}"
+ 
+ 
++# Roles that carry instructions for the model rather than conversation turns.
++# "developer" is the newer OpenAI name for "system"; treat them identically.
++_SYSTEM_ROLES = frozenset({"system", "developer"})
++
++
++def _content_to_text(content: Any) -> str:
++    """Flatten an OpenAI message ``content`` (str | list of parts | None) to text."""
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        return "\n".join(
++            p.get("text", "")
++            for p in content
++            if isinstance(p, dict) and p.get("type", "text") == "text" and p.get("text")
++        )
++    return ""
++
++
++def _extract_system_prompt(messages: list["ChatMessage"]) -> Optional[str]:
++    """Collect every system/developer message into ONE system prompt.
++
++    Single source of truth for ALL backends (deepseek, qwen, grok): the gateway
++    extracts it once and forwards it as ``system_prompt`` in the task payload;
++    each worker hands it to ``scrapers/tool_protocol.py`` which embeds it in the
++    ``[SYSTEM CONTEXT]`` block of the prompt. Returns None when the client sent
++    no system message.
++    """
++    parts = [
++        _content_to_text(m.content).strip()
++        for m in messages
++        if m.role in _SYSTEM_ROLES
++    ]
++    return "\n\n".join(t for t in parts if t) or None
++
++
+ def _resolve_think_mode(req: ChatCompletionRequest) -> dict:
+     """Feature 8: Resolve think_mode to DeepSeek parameters."""
+     if req.think_mode:
+@@ -833,6 +868,8 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
+             ]
+         tools_payload = [t.model_dump() for t in req.tools] if req.tools else None
+         messages_payload = [m.model_dump(exclude_none=True) for m in req.messages]
++        # System prompt: extracted once, forwarded to EVERY backend.
++        system_prompt = _extract_system_prompt(req.messages)
+ 
+         # Kept for x_meta (DeepSeek only)
+         model_tab = deep_think = web_search = None
+@@ -851,10 +888,6 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
+             )
+             model_tab = model_tab or "instant"
+ 
+-            system_prompt = "\n\n".join(
+-                m.content for m in req.messages
+-                if m.role == "system" and isinstance(m.content, str) and m.content.strip()
+-            ) or None
+             tool_messages = [
+                 {
+                     "role":         m.role,
+@@ -907,6 +940,7 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
+                 "attachments": attachments,
+                 "messages": messages_payload,
+                 "max_tokens": req.max_tokens,
++                "system_prompt": system_prompt,
+                 "tools": tools_payload,
+                 "tool_messages": tool_messages,
+             }
+@@ -920,6 +954,7 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
+                 "think_mode": req.think_mode,
+                 "session_id": session_id,
+                 "max_tokens": req.max_tokens,
++                "system_prompt": system_prompt,
+                 "task_type": req.task_type or "chat",
+                 "tools": tools_payload,
+                 "tool_choice": req.tool_choice if req.tools else None,
+diff --git a/browser_pool_grok.py b/browser_pool_grok.py
+index bc0a04f..f1c5b7f 100644
+--- a/browser_pool_grok.py
++++ b/browser_pool_grok.py
+@@ -303,15 +303,17 @@ class BrowserPool:
+         max_tokens: int | None = None,
+         tool_messages: list | None = None,
+         next_user_msg: str | None = None,
++        system_prompt: str | None = None,
+     ) -> dict:
+         """Acquire a slot (pinned to preferred_account when given), scrape,
+         release. On rate-limit in mode='new', rotate account and retry once.
+ 
+-        tools / max_tokens / tool_messages / next_user_msg carry the shared
+-        function-calling protocol context (see scrapers/tool_protocol.py).
++        tools / max_tokens / system_prompt / tool_messages / next_user_msg carry
++        the shared function-calling + system-prompt protocol context (see
++        scrapers/tool_protocol.py).
+         """
+         proto = dict(
+-            tools=tools, max_tokens=max_tokens,
++            tools=tools, max_tokens=max_tokens, system_prompt=system_prompt,
+             tool_messages=tool_messages, next_user_msg=next_user_msg,
+         )
+         async with self.acquire(preferred_account, timeout=acquire_timeout) as slot:
+diff --git a/public_grok.py b/public_grok.py
+index 35d74b9..82511d2 100644
+--- a/public_grok.py
++++ b/public_grok.py
+@@ -409,6 +409,7 @@ class LocalWorker:
+         # Function-calling protocol context (scrapers/tool_protocol.py).
+         tools = request.get("tools")
+         max_tokens = request.get("max_tokens")
++        system_prompt = request.get("system_prompt")  # client system/developer messages
+         tool_messages = request.get("tool_messages")
+         next_user_msg = None
+         if mode == "continue" and tool_messages:
+@@ -466,6 +467,7 @@ class LocalWorker:
+                 preferred_account=preferred_account,
+                 tools=tools,
+                 max_tokens=max_tokens,
++                system_prompt=system_prompt,
+                 tool_messages=tool_messages if mode == "continue" else None,
+                 next_user_msg=next_user_msg,
+             )
+diff --git a/public_qwen.py b/public_qwen.py
+index 4664cdf..ed91fa5 100644
+--- a/public_qwen.py
++++ b/public_qwen.py
+@@ -394,6 +394,7 @@ class TaskProcessor:
+         messages        = payload.get("messages", [])
+         think_mode      = payload.get("think_mode")
+         max_tokens      = payload.get("max_tokens")
++        system_prompt: str | None = payload.get("system_prompt") or None
+         incoming_sid    = payload.get("session_id")
+         raw_attachments: list[dict] = payload.get("attachments") or []
+         payload_preferred_cookie: str | None = payload.get("preferred_cookie")
+@@ -546,6 +547,11 @@ class TaskProcessor:
+                     # Teruskan max_tokens per-request
+                     scraper._max_tokens = max_tokens
+ 
++                    # System prompt per-request (None jika request tidak punya).
++                    # WAJIB di-reset tiap request: scraper dipakai ulang oleh pool,
++                    # jangan sampai system prompt request lama bocor ke request baru.
++                    scraper._system_prompt = system_prompt
++
+                     # ── Tool calling: inject tools ke scraper ─────────────────
+                     scraper._tools = tools  # None jika request tidak punya tools
+ 
+@@ -809,14 +815,28 @@ class LocalWorker:
+ 
+         # Pisah system message dari messages
+         # CATATAN: tools tetap ada di payload["tools"], tidak disentuh di sini
+-        system_messages = [m for m in messages if m.get("role") == "system"]
+-        non_system_messages = [m for m in messages if m.get("role") != "system"]
++        # Gateway (vps_server._extract_system_prompt) sudah mengirim payload["system_prompt"];
++        # ekstraksi di sini hanya fallback untuk klien/gateway lama yang belum mengirimnya.
++        # Role "developer" diperlakukan sama dengan "system" (konvensi OpenAI terbaru).
++        _SYS_ROLES = ("system", "developer")
++        system_messages = [m for m in messages if m.get("role") in _SYS_ROLES]
++        non_system_messages = [m for m in messages if m.get("role") not in _SYS_ROLES]
++
++        def _msg_text(content) -> str:
++            if isinstance(content, str):
++                return content
++            if isinstance(content, list):
++                return "\n".join(
++                    p.get("text", "") for p in content
++                    if isinstance(p, dict) and p.get("type", "text") == "text" and p.get("text")
++                )
++            return ""
+ 
+         if system_messages:
+-            # Jika tools ada, system_prompt akan di-merge ke [SYSTEM CONTEXT] oleh scraper
+-            payload["system_prompt"] = "\n".join(
+-                m["content"] for m in system_messages if m.get("content")
+-            )
++            if not payload.get("system_prompt"):
++                payload["system_prompt"] = "\n\n".join(
++                    t for t in (_msg_text(m.get("content")).strip() for m in system_messages) if t
++                ) or None
+             payload["messages"] = non_system_messages
+ 
+         # conversation_history: semua pesan kecuali yang terakhir (hanya untuk mode CONTINUE)
+diff --git a/scrapers/grok_scraper.py b/scrapers/grok_scraper.py
+index a924d78..7bdd276 100644
+--- a/scrapers/grok_scraper.py
++++ b/scrapers/grok_scraper.py
+@@ -475,12 +475,15 @@ class GrokScraper(BaseAIChatScraper):
+         max_tokens: int | None = None,
+         tool_messages: list | None = None,
+         next_user_msg: str | None = None,
++        system_prompt: str | None = None,
+         **kwargs,
+     ) -> dict:
+         """Run one chat turn.
+ 
+         Shared protocol (scrapers/tool_protocol.py), same as DeepSeek/Qwen:
+-          * the prompt is wrapped in [SYSTEM CONTEXT]/[USER REQUEST];
++          * the prompt is wrapped in [SYSTEM CONTEXT]/[USER REQUEST]; a
++            client-supplied ``system_prompt`` is embedded in [SYSTEM CONTEXT]
++            on every turn (new, continue and tool-result turns);
+           * a normal reply is plain text (cleaned of Grok UI chrome);
+           * a function call is an @@PAF-CALL:<name>@@ … @@PAF-END@@ block,
+             parsed from the RAW text (the UI-cleaning regexes would corrupt
+@@ -508,11 +511,13 @@ class GrokScraper(BaseAIChatScraper):
+ 
+             if tool_messages:
+                 outgoing = tp.build_tool_result_prompt(
+-                    tool_messages, next_user_msg, tools=tools, max_tokens=max_tokens,
++                    tool_messages, next_user_msg, tools=tools,
++                    client_system=system_prompt, max_tokens=max_tokens,
+                 )
+             else:
+                 outgoing = tp.build_wrapped_prompt(
+-                    prompt, tools=tools, max_tokens=max_tokens,
++                    prompt, tools=tools, client_system=system_prompt,
++                    max_tokens=max_tokens,
+                 )
+ 
+             def _parse(txt: str) -> "tp.ParsedOutput":
+diff --git a/scrapers/qwen_scraper.py b/scrapers/qwen_scraper.py
+index ca91a68..cefc77f 100644
+--- a/scrapers/qwen_scraper.py
++++ b/scrapers/qwen_scraper.py
+@@ -191,6 +191,10 @@ class QwenScraper(BaseAIChatScraper):
+         # Jika None → mode chat biasa (tidak ada tool calling).
+         # Jika diisi → mode LLM API dengan tool calling.
+         self._tools: list[dict] | None = None
++        # system_prompt per-request: isi pesan role system/developer dari client,
++        # diisi dari luar (public_qwen.py) sebelum scrape()/send_prompt() dipanggil.
++        # Disisipkan ke blok [SYSTEM CONTEXT] di setiap turn (new/continue/tool-result).
++        self._system_prompt: str | None = None
+ 
+     # ── Context manager override ──────────────────────────────────────────────
+ 
+@@ -2062,7 +2066,8 @@ class QwenScraper(BaseAIChatScraper):
+         tool calling internal Qwen UI → dipakai istilah "function".
+         """
+         return tp.build_wrapped_prompt(
+-            prompt, tools=self._tools, max_tokens=self._max_tokens
++            prompt, tools=self._tools, client_system=self._system_prompt,
++            max_tokens=self._max_tokens,
+         )
+ 
+     def _build_tool_result_prompt(
+@@ -2076,7 +2081,8 @@ class QwenScraper(BaseAIChatScraper):
+         """
+         return tp.build_tool_result_prompt(
+             tool_messages, next_user_msg,
+-            tools=self._tools, max_tokens=self._max_tokens,
++            tools=self._tools, client_system=self._system_prompt,
++            max_tokens=self._max_tokens,
+         )
+ 
+     async def scrape_with_tool_result(

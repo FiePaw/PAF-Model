@@ -409,6 +409,7 @@ class LocalWorker:
         # Function-calling protocol context (scrapers/tool_protocol.py).
         tools = request.get("tools")
         max_tokens = request.get("max_tokens")
+        system_prompt = request.get("system_prompt")  # client system/developer messages
         tool_messages = request.get("tool_messages")
         next_user_msg = None
         if mode == "continue" and tool_messages:
@@ -466,6 +467,7 @@ class LocalWorker:
                 preferred_account=preferred_account,
                 tools=tools,
                 max_tokens=max_tokens,
+                system_prompt=system_prompt,
                 tool_messages=tool_messages if mode == "continue" else None,
                 next_user_msg=next_user_msg,
             )

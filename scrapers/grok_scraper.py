@@ -475,12 +475,15 @@ class GrokScraper(BaseAIChatScraper):
         max_tokens: int | None = None,
         tool_messages: list | None = None,
         next_user_msg: str | None = None,
+        system_prompt: str | None = None,
         **kwargs,
     ) -> dict:
         """Run one chat turn.
 
         Shared protocol (scrapers/tool_protocol.py), same as DeepSeek/Qwen:
-          * the prompt is wrapped in [SYSTEM CONTEXT]/[USER REQUEST];
+          * the prompt is wrapped in [SYSTEM CONTEXT]/[USER REQUEST]; a
+            client-supplied ``system_prompt`` is embedded in [SYSTEM CONTEXT]
+            on every turn (new, continue and tool-result turns);
           * a normal reply is plain text (cleaned of Grok UI chrome);
           * a function call is an @@PAF-CALL:<name>@@ … @@PAF-END@@ block,
             parsed from the RAW text (the UI-cleaning regexes would corrupt
@@ -508,11 +511,13 @@ class GrokScraper(BaseAIChatScraper):
 
             if tool_messages:
                 outgoing = tp.build_tool_result_prompt(
-                    tool_messages, next_user_msg, tools=tools, max_tokens=max_tokens,
+                    tool_messages, next_user_msg, tools=tools,
+                    client_system=system_prompt, max_tokens=max_tokens,
                 )
             else:
                 outgoing = tp.build_wrapped_prompt(
-                    prompt, tools=tools, max_tokens=max_tokens,
+                    prompt, tools=tools, client_system=system_prompt,
+                    max_tokens=max_tokens,
                 )
 
             def _parse(txt: str) -> "tp.ParsedOutput":

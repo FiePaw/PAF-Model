@@ -289,7 +289,7 @@ Content-Type: `application/json`.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `model` | string | `"deepseek"` | **Required in practice.** See §6 — selects backend (+ optional account). |
-| `messages` | array of `{role, content, name?, tool_calls?, tool_call_id?}` | — | **Required.** Standard OpenAI chat message list. `content` may be a string, a list of `{type:"text", text:...}` parts, or `null` (for `tool_calls` assistant messages). Only the **last `user`** message text is actually sent as the prompt to DeepSeek; for Qwen the same extraction applies (see §5.2). `system` messages are concatenated and forwarded (DeepSeek only, see below). `tool` role messages carry tool-execution results back in (see §9). |
+| `messages` | array of `{role, content, name?, tool_calls?, tool_call_id?}` | — | **Required.** Standard OpenAI chat message list. `content` may be a string, a list of `{type:"text", text:...}` parts, or `null` (for `tool_calls` assistant messages). Only the **last `user`** message text is actually sent as the prompt to DeepSeek; for Qwen the same extraction applies (see §5.2). `system`/`developer` messages are concatenated and forwarded to **all three backends** (see §5.2). `tool` role messages carry tool-execution results back in (see §9). |
 | `stream` | bool | `false` | Accepted but **ignored** — no streaming is implemented. |
 | `temperature` | float | `null` | Accepted for OpenAI-schema compatibility; **not forwarded** to either backend scraper (these are browser-automation backends, not raw model APIs — sampling parameters aren't controllable). |
 | `max_tokens` | int | `null` | Forwarded to the worker (`task_fields["max_tokens"]`) but browser-based scraping has no hard token cap enforcement; treat as advisory. |
@@ -320,11 +320,16 @@ follow-up in the same conversation, send the new `X-Session-ID` you got back
 from turn 1 and just send the new `user` message — do not resend the whole
 history, it will be ignored beyond the last user turn.
 
-`system`-role messages: on **DeepSeek only**, all `system` message contents
-are concatenated with `\n\n` and forwarded as `system_prompt`. Qwen does not
-receive a distinct system prompt field from `messages` today (the example CLI
-`example/chat_qwen.py --system "..."` wires this through a different, simpler
-path — check that script if you need Qwen system prompts).
+`system`-role messages (**all backends: DeepSeek, Qwen, Grok**): every
+`system` **and** `developer` message (string content, or the joined `text`
+parts of a content list) is concatenated with `\n\n` by the gateway and
+forwarded to the worker as `system_prompt`. The worker embeds it in the
+`[SYSTEM CONTEXT]` block of the prompt it types into the chat UI — on **every**
+turn (new, continue and tool-result turns), because the browser conversation
+does not remember it as a real system role. If the request has no `system`
+message, nothing extra is added. The system prompt is per-request: it is not
+stored on the session, so resend it with each request (as with any OpenAI-style
+client) if you want it to keep applying.
 
 ---
 
@@ -575,7 +580,7 @@ Notes:
 - The `[SYSTEM CONTEXT]` is sent on **every** turn (it is short for plain chat),
   because clients may change `tools` between requests.
 - A client-supplied `system` message is appended to `[SYSTEM CONTEXT]` on
-  **DeepSeek only** (see §5.2); Qwen and Grok do not receive it.
+  **all backends** — DeepSeek, Qwen and Grok (see §5.2).
 - `max_tokens` is passed to the model as an advisory length hint, not enforced.
 - Resend `tools` on every request, as in the OpenAI API. On the Turn-B request
   the worker can still parse a function call without them, but it can then

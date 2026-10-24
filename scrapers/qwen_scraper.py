@@ -191,6 +191,10 @@ class QwenScraper(BaseAIChatScraper):
         # Jika None → mode chat biasa (tidak ada tool calling).
         # Jika diisi → mode LLM API dengan tool calling.
         self._tools: list[dict] | None = None
+        # system_prompt per-request: isi pesan role system/developer dari client,
+        # diisi dari luar (public_qwen.py) sebelum scrape()/send_prompt() dipanggil.
+        # Disisipkan ke blok [SYSTEM CONTEXT] di setiap turn (new/continue/tool-result).
+        self._system_prompt: str | None = None
 
     # ── Context manager override ──────────────────────────────────────────────
 
@@ -2062,7 +2066,8 @@ class QwenScraper(BaseAIChatScraper):
         tool calling internal Qwen UI → dipakai istilah "function".
         """
         return tp.build_wrapped_prompt(
-            prompt, tools=self._tools, max_tokens=self._max_tokens
+            prompt, tools=self._tools, client_system=self._system_prompt,
+            max_tokens=self._max_tokens,
         )
 
     def _build_tool_result_prompt(
@@ -2076,7 +2081,8 @@ class QwenScraper(BaseAIChatScraper):
         """
         return tp.build_tool_result_prompt(
             tool_messages, next_user_msg,
-            tools=self._tools, max_tokens=self._max_tokens,
+            tools=self._tools, client_system=self._system_prompt,
+            max_tokens=self._max_tokens,
         )
 
     async def scrape_with_tool_result(

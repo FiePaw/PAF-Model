@@ -214,6 +214,41 @@ def _make_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
 
+# Roles that carry instructions for the model rather than conversation turns.
+# "developer" is the newer OpenAI name for "system"; treat them identically.
+_SYSTEM_ROLES = frozenset({"system", "developer"})
+
+
+def _content_to_text(content: Any) -> str:
+    """Flatten an OpenAI message ``content`` (str | list of parts | None) to text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type", "text") == "text" and p.get("text")
+        )
+    return ""
+
+
+def _extract_system_prompt(messages: list["ChatMessage"]) -> Optional[str]:
+    """Collect every system/developer message into ONE system prompt.
+
+    Single source of truth for ALL backends (deepseek, qwen, grok): the gateway
+    extracts it once and forwards it as ``system_prompt`` in the task payload;
+    each worker hands it to ``scrapers/tool_protocol.py`` which embeds it in the
+    ``[SYSTEM CONTEXT]`` block of the prompt. Returns None when the client sent
+    no system message.
+    """
+    parts = [
+        _content_to_text(m.content).strip()
+        for m in messages
+        if m.role in _SYSTEM_ROLES
+    ]
+    return "\n\n".join(t for t in parts if t) or None
+
+
 def _resolve_think_mode(req: ChatCompletionRequest) -> dict:
     """Feature 8: Resolve think_mode to DeepSeek parameters."""
     if req.think_mode:
@@ -833,6 +868,8 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             ]
         tools_payload = [t.model_dump() for t in req.tools] if req.tools else None
         messages_payload = [m.model_dump(exclude_none=True) for m in req.messages]
+        # System prompt: extracted once, forwarded to EVERY backend.
+        system_prompt = _extract_system_prompt(req.messages)
 
         # Kept for x_meta (DeepSeek only)
         model_tab = deep_think = web_search = None
@@ -851,10 +888,6 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             )
             model_tab = model_tab or "instant"
 
-            system_prompt = "\n\n".join(
-                m.content for m in req.messages
-                if m.role == "system" and isinstance(m.content, str) and m.content.strip()
-            ) or None
             tool_messages = [
                 {
                     "role":         m.role,
@@ -907,6 +940,7 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
                 "attachments": attachments,
                 "messages": messages_payload,
                 "max_tokens": req.max_tokens,
+                "system_prompt": system_prompt,
                 "tools": tools_payload,
                 "tool_messages": tool_messages,
             }
@@ -920,6 +954,7 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
                 "think_mode": req.think_mode,
                 "session_id": session_id,
                 "max_tokens": req.max_tokens,
+                "system_prompt": system_prompt,
                 "task_type": req.task_type or "chat",
                 "tools": tools_payload,
                 "tool_choice": req.tool_choice if req.tools else None,

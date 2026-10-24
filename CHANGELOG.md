@@ -5,6 +5,34 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — Semua Backend: System Prompt Terpadu (DeepSeek, Qwen, Grok)
+
+> **Perubahan lintas backend.** Sebelumnya pesan `system` dari klien hanya bekerja di **DeepSeek**. Di **Grok** pesan itu dibuang oleh gateway (tidak pernah dikirim ke worker), dan di **Qwen** worker mengisi `payload["system_prompt"]` tetapi tidak ada kode yang membacanya, sehingga hilang sebelum sampai ke prompt. Kini ketiga backend memperlakukan system prompt dengan cara yang sama.
+
+### 1. Gateway (`PublicForward/ForVPS/vps_server.py`)
+- **Fungsi baru `_extract_system_prompt()`** — satu sumber kebenaran untuk semua backend. Mengumpulkan semua pesan `system` **dan `developer`** (nama role baru di OpenAI) menjadi satu string (digabung `\n\n`), mendukung `content` berupa string maupun list bagian `{type:"text"}`, dan mengabaikan pesan kosong. Hasilnya `None` bila klien tidak mengirim system message.
+- `system_prompt` kini ikut di `task_fields` untuk **deepseek, grok, dan qwen** (sebelumnya hanya deepseek, dan hanya untuk `content` bertipe string).
+
+### 2. Grok
+- `public_grok.py` → `browser_pool_grok.run_task(system_prompt=…)` → `GrokScraper.scrape(system_prompt=…)` → `tool_protocol` (`client_system`). Berlaku di turn baru, continue, dan turn hasil-tool (Turn 2), termasuk saat rotasi akun + retry.
+
+### 3. Qwen
+- `QwenScraper._system_prompt` baru; `_build_wrapped_prompt()` dan `_build_tool_result_prompt()` meneruskannya sebagai `client_system`.
+- `public_qwen.py`: `process()` membaca `payload["system_prompt"]` dan menyetel `scraper._system_prompt` **di setiap request, termasuk `None`** — scraper dipakai ulang oleh pool, jadi tanpa reset system prompt request lama bisa bocor ke request berikutnya.
+- Ekstraksi di worker kini hanya fallback bila gateway lama belum mengirim `system_prompt`; role `developer` dan content list ikut ditangani.
+
+### 4. DeepSeek
+- Perilaku tidak berubah, hanya kini memakai fungsi ekstraksi bersama (jadi `developer` role dan content list juga didukung).
+
+### 5. Catatan perilaku
+- System prompt dikirim di blok `[SYSTEM CONTEXT]` pada **setiap turn** (UI chat tidak punya role system sungguhan) dan **tidak disimpan di session** — klien perlu mengirimnya ulang tiap request, seperti klien OpenAI pada umumnya.
+- Tugas media Qwen (`create_image`, `create_video`, `web_search`) tidak dibungkus `[SYSTEM CONTEXT]`, sehingga tidak terpengaruh.
+
+### 6. Dokumentasi
+- `API_USAGE.md` §5.1, §5.2, dan §9 diperbarui (sebelumnya menyatakan system message "DeepSeek only").
+
+---
+
 ## [Unreleased] — Semua Backend: Protokol API Mode Bersama (Teks Biasa + Tool Calling Berbasis Penanda) dan Tool Calling untuk Grok
 
 > **Perubahan lintas backend (DeepSeek, Qwen, Grok).** Sebelumnya setiap balasan dipaksa berbentuk envelope JSON sehingga model harus meng-escape sendiri tanda kutip, backslash, newline, dan kode di dalam string JSON — sumber utama error "invalid JSON", retry, dan rotasi akun. Kini jawaban biasa berupa **teks polos**, dan hanya pemanggilan fungsi yang memakai blok bertanda berisi nilai argumen **mentah**; JSON `tool_calls` disusun oleh kode (`json.dumps`), bukan oleh model. System prompt `[SYSTEM CONTEXT]` / `[USER REQUEST]` tetap dipertahankan.
